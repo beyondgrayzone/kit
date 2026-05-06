@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/models"
 )
 
