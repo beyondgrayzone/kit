@@ -3,7 +3,7 @@ package test
 import (
 	"testing"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 )
 
 // Test harness with a simple extension
@@ -177,11 +177,14 @@ func Init(api ext.API) {
 func TestHarness_FooterSetting(t *testing.T) {
 	src := `package main
 
-import "kit/ext"
+import (
+	"kit/ext"
+)
 
 func Init(api ext.API) {
 	api.OnSessionStart(func(_ ext.SessionStartEvent, ctx ext.Context) {
 		ctx.SetFooter(ext.HeaderFooterConfig{
+			ID:      "test-footer",
 			Content: ext.WidgetContent{Text: "Status: OK"},
 			Style:   ext.WidgetStyle{BorderColor: "#00ff00"},
 		})
@@ -199,11 +202,11 @@ func Init(api ext.API) {
 
 	AssertFooterSet(t, harness)
 
-	footer := harness.Context().GetFooter()
-	if footer == nil {
+	footers := harness.Context().GetFooters()
+	if len(footers) == 0 {
 		t.Fatal("expected footer to be set")
-		return
 	}
+	footer := footers[0]
 	if footer.Content.Text != "Status: OK" {
 		t.Errorf("expected footer text 'Status: OK', got %q", footer.Content.Text)
 	}

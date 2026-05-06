@@ -3,7 +3,7 @@ package test
 import (
 	"sync"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 )
 
 // MockContext records all interactions with the extension context.
@@ -23,10 +23,10 @@ type MockContext struct {
 	// Widget state
 	Widgets       map[string]extensions.WidgetConfig
 	RemovedIDs    []string
-	Header        *extensions.HeaderFooterConfig
-	Footer        *extensions.HeaderFooterConfig
-	HeaderRemoved bool
-	FooterRemoved bool
+	Headers       map[string]extensions.HeaderFooterConfig
+	Footers       map[string]extensions.HeaderFooterConfig
+	RemovedHeaderIDs []string
+	RemovedFooterIDs []string
 
 	// Context properties
 	SessionID   string
@@ -63,6 +63,8 @@ type MockContext struct {
 func NewMockContext() *MockContext {
 	return &MockContext{
 		Widgets:       make(map[string]extensions.WidgetConfig),
+		Headers:       make(map[string]extensions.HeaderFooterConfig),
+		Footers:       make(map[string]extensions.HeaderFooterConfig),
 		StatusEntries: make(map[string]extensions.StatusBarEntry),
 		Options:       make(map[string]string),
 		Interactive:   true,
@@ -178,27 +180,27 @@ func (m *MockContext) recordRemoveWidget(id string) {
 func (m *MockContext) recordSetHeader(config extensions.HeaderFooterConfig) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Header = &config
+	m.Headers[config.ID] = config
 }
 
-func (m *MockContext) recordRemoveHeader() {
+func (m *MockContext) recordRemoveHeader(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Header = nil
-	m.HeaderRemoved = true
+	delete(m.Headers, id)
+	m.RemovedHeaderIDs = append(m.RemovedHeaderIDs, id)
 }
 
 func (m *MockContext) recordSetFooter(config extensions.HeaderFooterConfig) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Footer = &config
+	m.Footers[config.ID] = config
 }
 
-func (m *MockContext) recordRemoveFooter() {
+func (m *MockContext) recordRemoveFooter(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Footer = nil
-	m.FooterRemoved = true
+	delete(m.Footers, id)
+	m.RemovedFooterIDs = append(m.RemovedFooterIDs, id)
 }
 
 func (m *MockContext) recordSetStatus(key string, text string, priority int) {
@@ -392,18 +394,26 @@ func (m *MockContext) HasWidget(id string) bool {
 	return ok
 }
 
-// GetHeader returns the recorded header configuration.
-func (m *MockContext) GetHeader() *extensions.HeaderFooterConfig {
+// GetHeaders returns all recorded headers.
+func (m *MockContext) GetHeaders() []extensions.HeaderFooterConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.Header
+	headers := make([]extensions.HeaderFooterConfig, 0, len(m.Headers))
+	for _, h := range m.Headers {
+		headers = append(headers, h)
+	}
+	return headers
 }
 
-// GetFooter returns the recorded footer configuration.
-func (m *MockContext) GetFooter() *extensions.HeaderFooterConfig {
+// GetFooters returns all recorded footers.
+func (m *MockContext) GetFooters() []extensions.HeaderFooterConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.Footer
+	footers := make([]extensions.HeaderFooterConfig, 0, len(m.Footers))
+	for _, f := range m.Footers {
+		footers = append(footers, f)
+	}
+	return footers
 }
 
 // GetStatus returns a recorded status entry by key.

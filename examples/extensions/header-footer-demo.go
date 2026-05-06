@@ -19,6 +19,7 @@ func Init(api ext.API) {
 	// Show a custom header with project context when the session starts.
 	api.OnSessionStart(func(_ ext.SessionStartEvent, ctx ext.Context) {
 		ctx.SetHeader(ext.HeaderFooterConfig{
+			ID: "hf-demo:header",
 			Content: ext.WidgetContent{
 				Text: fmt.Sprintf("Project: %s  |  Model: %s  |  %s",
 					ctx.CWD, ctx.Model, time.Now().Format("Jan 2, 15:04")),
@@ -26,15 +27,18 @@ func Init(api ext.API) {
 			Style: ext.WidgetStyle{
 				BorderColor: "#89b4fa",
 			},
+			Priority: 10,
 		})
 
 		ctx.SetFooter(ext.HeaderFooterConfig{
+			ID: "hf-demo:footer",
 			Content: ext.WidgetContent{
 				Text: "Ready  |  0 turns",
 			},
 			Style: ext.WidgetStyle{
 				BorderColor: "#a6e3a1",
 			},
+			Priority: 10,
 		})
 	})
 
@@ -47,6 +51,7 @@ func Init(api ext.API) {
 		}
 
 		ctx.SetFooter(ext.HeaderFooterConfig{
+			ID: "hf-demo:footer",
 			Content: ext.WidgetContent{
 				Text: fmt.Sprintf("Turns: %d  |  Last: %s  |  %s",
 					turnCount, ae.StopReason, time.Now().Format("15:04:05")),
@@ -54,6 +59,7 @@ func Init(api ext.API) {
 			Style: ext.WidgetStyle{
 				BorderColor: "#a6e3a1",
 			},
+			Priority: 10,
 		})
 	})
 
@@ -62,7 +68,7 @@ func Init(api ext.API) {
 		Name:        "header-off",
 		Description: "Remove the custom header",
 		Execute: func(_ string, ctx ext.Context) (string, error) {
-			ctx.RemoveHeader()
+			ctx.RemoveHeader("hf-demo:header")
 			return "Header removed.", nil
 		},
 	})
@@ -73,6 +79,7 @@ func Init(api ext.API) {
 		Description: "Restore the custom header",
 		Execute: func(_ string, ctx ext.Context) (string, error) {
 			ctx.SetHeader(ext.HeaderFooterConfig{
+				ID: "hf-demo:header",
 				Content: ext.WidgetContent{
 					Text: fmt.Sprintf("Project: %s  |  Model: %s  |  %s",
 						ctx.CWD, ctx.Model, time.Now().Format("Jan 2, 15:04")),
@@ -80,6 +87,7 @@ func Init(api ext.API) {
 				Style: ext.WidgetStyle{
 					BorderColor: "#89b4fa",
 				},
+				Priority: 10,
 			})
 			return "Header restored.", nil
 		},
@@ -90,7 +98,7 @@ func Init(api ext.API) {
 		Name:        "footer-off",
 		Description: "Remove the custom footer",
 		Execute: func(_ string, ctx ext.Context) (string, error) {
-			ctx.RemoveFooter()
+			ctx.RemoveFooter("hf-demo:footer")
 			return "Footer removed.", nil
 		},
 	})
@@ -101,12 +109,14 @@ func Init(api ext.API) {
 		Description: "Restore the custom footer",
 		Execute: func(_ string, ctx ext.Context) (string, error) {
 			ctx.SetFooter(ext.HeaderFooterConfig{
+				ID: "hf-demo:footer",
 				Content: ext.WidgetContent{
 					Text: fmt.Sprintf("Turns: %d  |  %s", turnCount, time.Now().Format("15:04:05")),
 				},
 				Style: ext.WidgetStyle{
 					BorderColor: "#a6e3a1",
 				},
+				Priority: 10,
 			})
 			return "Footer restored.", nil
 		},
@@ -114,7 +124,7 @@ func Init(api ext.API) {
 
 	// Clean up on shutdown.
 	api.OnSessionShutdown(func(_ ext.SessionShutdownEvent, ctx ext.Context) {
-		ctx.RemoveHeader()
-		ctx.RemoveFooter()
+		ctx.RemoveHeader("hf-demo:header")
+		ctx.RemoveFooter("hf-demo:footer")
 	})
 }

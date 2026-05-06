@@ -45,6 +45,15 @@ func WithNoBorder() renderingOption {
 	}
 }
 
+// WithAutoWidth returns a renderingOption that disables full-width rendering,
+// allowing the block to size to its content. This is useful for components
+// that will be composed horizontally.
+func WithAutoWidth() renderingOption {
+	return func(c *blockRenderer) {
+		c.fullWidth = false
+	}
+}
+
 // WithAlign returns a renderingOption that sets the horizontal alignment
 // of the block content within its container. The align parameter accepts
 // lipgloss.Left, lipgloss.Center, or lipgloss.Right positions.

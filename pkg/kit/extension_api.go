@@ -3,7 +3,7 @@ package kit
 import (
 	"fmt"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/session"
 )
@@ -23,11 +23,11 @@ type ExtensionAPI interface {
 
 	// Header/Footer
 	SetHeader(config extensions.HeaderFooterConfig)
-	RemoveHeader()
-	GetHeader() *extensions.HeaderFooterConfig
+	RemoveHeader(id string)
+	GetHeaders() []extensions.HeaderFooterConfig
 	SetFooter(config extensions.HeaderFooterConfig)
-	RemoveFooter()
-	GetFooter() *extensions.HeaderFooterConfig
+	RemoveFooter(id string)
+	GetFooters() []extensions.HeaderFooterConfig
 
 	// Editor
 	SetEditor(config extensions.EditorConfig)
@@ -140,17 +140,17 @@ func (e *extensionAPI) SetHeader(config extensions.HeaderFooterConfig) {
 	}
 }
 
-func (e *extensionAPI) RemoveHeader() {
+func (e *extensionAPI) RemoveHeader(id string) {
 	if e.kit.extRunner != nil {
-		e.kit.extRunner.RemoveHeader()
+		e.kit.extRunner.RemoveHeader(id)
 	}
 }
 
-func (e *extensionAPI) GetHeader() *extensions.HeaderFooterConfig {
+func (e *extensionAPI) GetHeaders() []extensions.HeaderFooterConfig {
 	if e.kit.extRunner == nil {
 		return nil
 	}
-	return e.kit.extRunner.GetHeader()
+	return e.kit.extRunner.GetHeaders()
 }
 
 func (e *extensionAPI) SetFooter(config extensions.HeaderFooterConfig) {
@@ -159,17 +159,17 @@ func (e *extensionAPI) SetFooter(config extensions.HeaderFooterConfig) {
 	}
 }
 
-func (e *extensionAPI) RemoveFooter() {
+func (e *extensionAPI) RemoveFooter(id string) {
 	if e.kit.extRunner != nil {
-		e.kit.extRunner.RemoveFooter()
+		e.kit.extRunner.RemoveFooter(id)
 	}
 }
 
-func (e *extensionAPI) GetFooter() *extensions.HeaderFooterConfig {
+func (e *extensionAPI) GetFooters() []extensions.HeaderFooterConfig {
 	if e.kit.extRunner == nil {
 		return nil
 	}
-	return e.kit.extRunner.GetFooter()
+	return e.kit.extRunner.GetFooters()
 }
 
 // Editor

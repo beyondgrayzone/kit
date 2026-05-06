@@ -377,12 +377,12 @@ type AppModelOptions struct {
 	// GetHeader returns the current custom header set by an extension, or
 	// nil if no header is active. Called during View() to render a
 	// persistent header above the stream region. May be nil.
-	GetHeader func() *WidgetData
+	GetHeaders func() []WidgetData
 
 	// GetFooter returns the current custom footer set by an extension, or
 	// nil if no footer is active. Called during View() to render a
 	// persistent footer below the status bar. May be nil.
-	GetFooter func() *WidgetData
+	GetFooters func() []WidgetData
 
 	// GetToolRenderer returns the extension-provided tool renderer for a
 	// specific tool name, or nil if no custom renderer is registered.
@@ -619,10 +619,10 @@ type AppModel struct {
 	getWidgets func(placement string) []WidgetData
 
 	// getHeader returns the current custom header. May be nil.
-	getHeader func() *WidgetData
+	getHeaders func() []WidgetData
 
 	// getFooter returns the current custom footer. May be nil.
-	getFooter func() *WidgetData
+	getFooters func() []WidgetData
 
 	// getEditorInterceptor returns the current editor interceptor. May be nil.
 	getEditorInterceptor func() *EditorInterceptor
@@ -753,6 +753,13 @@ type AppModel struct {
 	// on screen (after header). Mouse Y coordinates must be adjusted by this
 	// offset before being passed to the ScrollList.
 	scrollbackYOffset int
+
+	// inputYOffset is the Y coordinate where the input area starts on screen.
+	// Used to convert absolute mouse coordinates to input-relative coordinates.
+	inputYOffset int
+
+	// inputHeight is the height of the input area in terminal rows.
+	inputHeight int
 }
 
 // --------------------------------------------------------------------------
@@ -835,8 +842,8 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	m.getMCPPrompts = opts.GetMCPPrompts
 	m.expandMCPPrompt = opts.ExpandMCPPrompt
 	m.getWidgets = opts.GetWidgets
-	m.getHeader = opts.GetHeader
-	m.getFooter = opts.GetFooter
+	m.getHeaders = opts.GetHeaders
+	m.getFooters = opts.GetFooters
 	m.getEditorInterceptor = opts.GetEditorInterceptor
 	m.getUIVisibility = opts.GetUIVisibility
 	m.getStatusBarEntries = opts.GetStatusBarEntries
@@ -980,9 +987,9 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 	}
 
 	// Add the ASCII logo at the very top.
-	logo := style.KitBanner()
-	logoMsg := NewStyledMessageItem(generateMessageID(), "logo", logo, logo)
-	m.messages = append(m.messages, logoMsg)
+	// logo := style.KitBanner()
+	// logoMsg := NewStyledMessageItem(generateMessageID(), "logo", logo, logo)
+	// m.messages = append(m.messages, logoMsg)
 
 	// Build key-value pairs for startup info.
 	ty := createTypography(style.GetTheme())
@@ -1270,11 +1277,27 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Forward to InputComponent.
+		if ic, ok := m.input.(*InputComponent); ok {
+			ic.SetYOffset(m.inputYOffset)
+			// Check if click is within input area.
+			inputRelY := msg.Y - m.inputYOffset
+			if inputRelY >= 0 && inputRelY < m.inputHeight {
+				ic.HandleMouseDown(msg.X, msg.Y)
+			}
+		}
+
 	// ── Mouse motion/drag for character-level selection ──────────────────────
 	case tea.MouseMotionMsg:
 		viewY := msg.Y - m.scrollbackYOffset
 		if viewY >= 0 && viewY < m.scrollList.height {
 			m.scrollList.HandleMouseDrag(msg.X, viewY)
+		}
+
+		// Forward to InputComponent if it has an active selection drag.
+		if ic, ok := m.input.(*InputComponent); ok {
+			ic.SetYOffset(m.inputYOffset)
+			ic.HandleMouseDrag(msg.X, msg.Y)
 		}
 
 	// ── Mouse release: finalize selection and copy to clipboard ──────────────
@@ -1289,6 +1312,22 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// Clear selection after copy (crush-style: copy on mouse-up).
 				m.scrollList.ClearSelection()
+			}
+		}
+
+		// Handle mouse release for InputComponent selection.
+		if ic, ok := m.input.(*InputComponent); ok {
+			if ic.HandleMouseUp() {
+				// Selection completed — extract text and copy to clipboard.
+				if ic.HasSelection() {
+					text := ic.ExtractSelectedText()
+					if text != "" {
+						cmd := clipboard.CopyToClipboard(text)
+						cmds = append(cmds, cmd)
+					}
+					// Clear selection after copy.
+					ic.ClearSelection()
+				}
 			}
 		}
 
@@ -1368,6 +1407,13 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollList.autoScroll = true
 				return m, tea.Batch(cmds...)
 			}
+		}
+
+		// End key works in all states to force-scroll to bottom.
+		if msg.String() == "end" {
+			m.scrollList.GotoBottom()
+			m.scrollList.autoScroll = true
+			return m, tea.Batch(cmds...)
 		}
 
 		// Thinking keybindings — only when the model supports reasoning.
@@ -2471,10 +2517,10 @@ func (m *AppModel) View() tea.View {
 
 	// Custom header (if set by extension) — above everything.
 	// Track its height so mouse coordinates can be adjusted for the scrollback.
-	m.scrollbackYOffset = 0
-	if headerView := m.renderHeaderFooter(m.getHeader); headerView != "" {
+	headerView, headerHeight := m.renderHeaderFooterSlot(m.getHeaders)
+	m.scrollbackYOffset = headerHeight
+	if headerView != "" {
 		parts = append(parts, headerView)
-		m.scrollbackYOffset = lipgloss.Height(headerView)
 	}
 
 	// Only include the scrollback region when it has content. When idle the
@@ -2516,7 +2562,14 @@ func (m *AppModel) View() tea.View {
 		parts = append(parts, queuedView)
 	}
 
+	// Calculate inputYOffset: the Y position where the input area starts.
+	// This is the cumulative height of all parts rendered before the input.
+	m.inputYOffset = lipgloss.Height(strings.Join(parts, "\n"))
+
 	parts = append(parts, inputView)
+
+	// Set inputHeight for mouse coordinate conversion.
+	m.inputHeight = lipgloss.Height(inputView)
 
 	// Render "below" widgets between input and status bar.
 	if belowView := m.renderWidgetSlot("below"); belowView != "" {
@@ -2528,7 +2581,8 @@ func (m *AppModel) View() tea.View {
 	}
 
 	// Custom footer (if set by extension) — below everything.
-	if footerView := m.renderHeaderFooter(m.getFooter); footerView != "" {
+	footerView, _ := m.renderHeaderFooterSlot(m.getFooters)
+	if footerView != "" {
 		parts = append(parts, footerView)
 	}
 
@@ -2826,37 +2880,45 @@ func (m *AppModel) renderWidgetSlot(placement string) string {
 }
 
 // renderHeaderFooter renders a custom header or footer from an extension. The
-// getter function returns the current data (*WidgetData) or nil when inactive.
-// Returns "" when the getter is nil or returns nil. Uses the same rendering
-// pipeline as widgets for visual consistency.
-func (m *AppModel) renderHeaderFooter(getter func() *WidgetData) string {
+// getter function returns the current data ([]WidgetData) or nil when inactive.
+// Returns the rendered view and its height. Uses the same rendering pipeline as
+// widgets for visual consistency.
+func (m *AppModel) renderHeaderFooterSlot(getter func() []WidgetData) (string, int) {
 	if getter == nil {
-		return ""
+		return "", 0
 	}
-	data := getter()
-	if data == nil {
-		return ""
+	widgets := getter()
+	if len(widgets) == 0 {
+		return "", 0
 	}
 
 	theme := style.GetTheme()
-
-	var opts []renderingOption
-	opts = append(opts, WithAlign(lipgloss.Left))
-
-	if data.NoBorder {
-		opts = append(opts, WithNoBorder())
-	} else {
+	var rendered []string
+	for _, w := range widgets {
+		opts := []renderingOption{
+			WithAlign(lipgloss.Left),
+			WithPaddingTop(0), WithPaddingBottom(0),
+			WithAutoWidth(),
+		}
 		borderClr := theme.Accent
-		if data.BorderColor != "" {
-			borderClr = lipgloss.Color(data.BorderColor)
+		if w.BorderColor != "" {
+			borderClr = lipgloss.Color(w.BorderColor)
 		}
 		opts = append(opts, WithBorderColor(borderClr))
+		rendered = append(rendered, renderContentBlock(w.Text, 0, opts...))
 	}
 
-	// Compact padding like widgets.
-	opts = append(opts, WithPaddingTop(0), WithPaddingBottom(0))
-
-	return renderContentBlock(data.Text, m.width, opts...)
+	// Join side-by-side with gaps.
+	gap := "  " // two spaces between widgets
+	var spaced []string
+	for i, r := range rendered {
+		spaced = append(spaced, r)
+		if i < len(rendered)-1 {
+			spaced = append(spaced, gap)
+		}
+	}
+	view := lipgloss.JoinHorizontal(lipgloss.Top, spaced...)
+	return view, lipgloss.Height(view)
 }
 
 // maxQueuedMessageLines is the maximum number of visible content lines
@@ -3805,11 +3867,13 @@ func (m *AppModel) distributeHeight() {
 
 	// Measure header/footer heights.
 	var headerFooterLines int
-	if headerView := m.renderHeaderFooter(m.getHeader); headerView != "" {
-		headerFooterLines += lipgloss.Height(headerView)
+	headerView, headerH := m.renderHeaderFooterSlot(m.getHeaders)
+	if headerView != "" {
+		headerFooterLines += headerH
 	}
-	if footerView := m.renderHeaderFooter(m.getFooter); footerView != "" {
-		headerFooterLines += lipgloss.Height(footerView)
+	footerView, footerH := m.renderHeaderFooterSlot(m.getFooters)
+	if footerView != "" {
+		headerFooterLines += footerH
 	}
 
 	streamHeight := max(m.height-separatorLines-widgetLines-headerFooterLines-queuedLines-inputLines-statusBarLines, 0)

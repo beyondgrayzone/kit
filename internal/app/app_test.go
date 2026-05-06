@@ -712,27 +712,44 @@ func TestHandleTurnEnd_LengthEmitsWarning(t *testing.T) {
 }
 
 // TestHandleTurnEnd_NonLengthIgnored verifies that ordinary stop reasons
-// (stop, tool-calls, error, unknown, "") do not produce a warning banner.
+// do not produce a warning banner, except for suspicious cases:
+//   - FinishReasonStop with EMPTY response (possible MaxSteps reached)
+//   - FinishReasonToolCalls (agent should continue processing)
 func TestHandleTurnEnd_NonLengthIgnored(t *testing.T) {
 	app := New(Options{}, nil)
 	defer app.Close()
 
-	reasons := []string{
-		kit.FinishReasonStop,
-		kit.FinishReasonToolCalls,
-		kit.FinishReasonError,
-		kit.FinishReasonContentFilter,
-		kit.FinishReasonOther,
-		kit.FinishReasonUnknown,
-		"",
+	// Cases that should NOT warn (normal completions with non-empty response)
+	normalCases := []kit.TurnEndEvent{
+		{StopReason: kit.FinishReasonStop, Response: "some response"}, // Normal completion
+		{StopReason: kit.FinishReasonError},
+		{StopReason: kit.FinishReasonContentFilter},
+		{StopReason: kit.FinishReasonOther},
+		{StopReason: kit.FinishReasonUnknown},
+		{StopReason: ""},
 	}
-	for _, r := range reasons {
+	for _, ev := range normalCases {
 		var called bool
-		app.handleTurnEnd(kit.TurnEndEvent{StopReason: r}, func(m tea.Msg) {
+		app.handleTurnEnd(ev, func(m tea.Msg) {
 			called = true
 		})
 		if called {
-			t.Errorf("stop reason %q unexpectedly emitted a warning", r)
+			t.Errorf("stop reason %q unexpectedly emitted a warning", ev.StopReason)
+		}
+	}
+
+	// Cases that SHOULD warn (suspicious stops)
+	suspiciousCases := []kit.TurnEndEvent{
+		{StopReason: kit.FinishReasonStop, Response: ""}, // Empty response with stop
+		{StopReason: kit.FinishReasonToolCalls},          // Tool calls pending
+	}
+	for _, ev := range suspiciousCases {
+		var called bool
+		app.handleTurnEnd(ev, func(m tea.Msg) {
+			called = true
+		})
+		if !called {
+			t.Errorf("stop reason %q should have emitted a warning", ev.StopReason)
 		}
 	}
 }

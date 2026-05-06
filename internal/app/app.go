@@ -12,7 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/fantasy"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/session"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
@@ -964,13 +964,39 @@ func (a *App) handleTurnEnd(ev kit.TurnEndEvent, sendFn func(tea.Msg)) {
 	if sendFn == nil {
 		return
 	}
-	if ev.StopReason != kit.FinishReasonLength {
+
+	// Always log the stop reason for debugging.
+	log.Printf("[handleTurnEnd] StopReason=%s, Response len=%d, Error=%v",
+		ev.StopReason, len(ev.Response), ev.Error)
+
+	// Case 1: Model hit max_output_tokens limit.
+	if ev.StopReason == kit.FinishReasonLength {
+		sendFn(ExtensionPrintEvent{
+			Level: "info",
+			Text:  a.formatMaxTokensTruncatedMessage(),
+		})
 		return
 	}
-	sendFn(ExtensionPrintEvent{
-		Level: "info",
-		Text:  a.formatMaxTokensTruncatedMessage(),
-	})
+
+	// Case 2: Agent stopped with "stop" but empty response.
+	// This may indicate MaxSteps was reached or the LLM returned an incomplete response.
+	if ev.StopReason == kit.FinishReasonStop && ev.Response == "" {
+		sendFn(ExtensionPrintEvent{
+			Level: "warning",
+			Text:  "⚠ Agent stopped unexpectedly (stop reason: stop with empty response). This may indicate MaxSteps limit reached.",
+		})
+		return
+	}
+
+	// Case 3: Agent stopped with tool-calls reason but no error.
+	// This is unexpected - the agent should continue processing tool calls.
+	if ev.StopReason == kit.FinishReasonToolCalls {
+		sendFn(ExtensionPrintEvent{
+			Level: "warning",
+			Text:  "⚠ Agent stopped while tool calls are still pending. This may indicate an internal error.",
+		})
+		return
+	}
 }
 
 // formatMaxTokensTruncatedMessage builds the user-facing explanation for a
