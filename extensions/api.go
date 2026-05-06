@@ -157,34 +157,40 @@ type Context struct {
 	// SetHeader places a custom header at the top of the TUI view, above
 	// the stream region. Only one header can be active at a time; calling
 	// SetHeader replaces any previous header. The header persists across
-	// agent turns until explicitly removed.
+	// agent turns until explicitly removed. Multiple extensions can set headers;
+	// they will be displayed side-by-side, ordered by priority.
 	//
 	// Example:
 	//
 	//   ctx.SetHeader(ext.HeaderFooterConfig{
-	//       Content: ext.WidgetContent{Text: "Project: my-app | Branch: main"},
+	//       ID:      "my-ext:project-header",
+	//       Content: ext.WidgetContent{Text: "Project: my-app"},
 	//       Style:   ext.WidgetStyle{BorderColor: "#89b4fa"},
+	//       Priority: 10,
 	//   })
 	SetHeader func(HeaderFooterConfig)
 
-	// RemoveHeader removes the custom header. No-op if no header is set.
-	RemoveHeader func()
+	// RemoveHeader removes a custom header by its ID.
+	RemoveHeader func(id string)
 
 	// SetFooter places a custom footer at the bottom of the TUI view,
 	// below the status bar. Only one footer can be active at a time;
-	// calling SetFooter replaces any previous footer. The footer persists
-	// across agent turns until explicitly removed.
+	// calling SetFooter replaces any previous footer. Multiple extensions can
+	// set footers; they will be displayed side-by-side, ordered by priority.
+	// The footer persists across agent turns until explicitly removed.
 	//
 	// Example:
 	//
 	//   ctx.SetFooter(ext.HeaderFooterConfig{
-	//       Content: ext.WidgetContent{Text: "Ready | 3 tasks remaining"},
+	//       ID:      "my-ext:status-footer",
+	//       Content: ext.WidgetContent{Text: "Ready"},
 	//       Style:   ext.WidgetStyle{BorderColor: "#a6e3a1"},
+	//       Priority: 10,
 	//   })
 	SetFooter func(HeaderFooterConfig)
 
-	// RemoveFooter removes the custom footer. No-op if no footer is set.
-	RemoveFooter func()
+	// RemoveFooter removes a custom footer by its ID.
+	RemoveFooter func(id string)
 
 	// PromptSelect shows a selection list to the user and blocks until
 	// they pick an option or cancel (ESC). Returns a cancelled result in
@@ -1525,15 +1531,23 @@ type PromptMultiSelectResult struct {
 // ---------------------------------------------------------------------------
 
 // HeaderFooterConfig describes a custom header or footer region that replaces
-// or augments the default TUI chrome. Extensions use ctx.SetHeader/SetFooter
-// to place one; only one header and one footer can be active at a time (the
+// calling SetHeader replaces any previous header. Multiple extensions can
+// set headers/footers; they are displayed side-by-side, ordered by priority.
 // latest call wins). Reuses WidgetContent and WidgetStyle for consistency.
 type HeaderFooterConfig struct {
+	// ID uniquely identifies this header/footer. Must be non-empty.
+	// Extensions should use a namespaced ID (e.g. "my-ext:status-header").
+	ID string
+
 	// Content describes what to render.
 	Content WidgetContent
 
 	// Style configures the appearance.
 	Style WidgetStyle
+
+	// Priority controls ordering when multiple headers/footers are displayed.
+	// Lower values render further left.
+	Priority int
 }
 
 // ---------------------------------------------------------------------------

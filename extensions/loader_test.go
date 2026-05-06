@@ -591,3 +591,118 @@ func TestCountHandlers(t *testing.T) {
 		t.Errorf("expected 3 handlers, got %d", n)
 	}
 }
+
+func TestLoadExplicitExtensions_LoadsFile(t *testing.T) {
+	dir := t.TempDir()
+	extFile := filepath.Join(dir, "my-ext.go")
+	src := `package main
+import "kit/ext"
+func Init(api ext.API) {
+	api.RegisterTool(ext.ToolDef{
+		Name: "test_tool",
+		Description: "A test tool",
+		Execute: func(input string) (string, error) {
+			return "test: " + input, nil
+		},
+	})
+}
+`
+	if err := os.WriteFile(extFile, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadExplicitExtensions([]string{extFile})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 loaded extension, got %d", len(loaded))
+	}
+	if len(loaded[0].Tools) != 1 {
+		t.Errorf("expected 1 tool, got %d", len(loaded[0].Tools))
+	}
+	if loaded[0].Tools[0].Name != "test_tool" {
+		t.Errorf("expected tool name 'test_tool', got %q", loaded[0].Tools[0].Name)
+	}
+}
+
+func TestLoadExplicitExtensions_SkipsDiscovery(t *testing.T) {
+	// Create a temp extension file
+	dir := t.TempDir()
+	extFile := filepath.Join(dir, "my-ext.go")
+	src := `package main
+import "kit/ext"
+func Init(api ext.API) {
+	api.RegisterTool(ext.ToolDef{
+		Name: "test_tool",
+		Description: "A test tool",
+		Execute: func(input string) (string, error) {
+			return "test: " + input, nil
+		},
+	})
+}
+`
+	if err := os.WriteFile(extFile, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a global extensions directory with another extension (should NOT be loaded)
+	globalDir := filepath.Join(t.TempDir(), "global-extensions")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	globalExt := filepath.Join(globalDir, "global-ext.go")
+	src2 := `package main
+import "kit/ext"
+func Init(api ext.API) {
+	api.RegisterTool(ext.ToolDef{
+		Name: "global_tool",
+		Description: "A global tool",
+		Execute: func(input string) (string, error) {
+			return "global: " + input, nil
+		},
+	})
+}
+`
+	if err := os.WriteFile(globalExt, []byte(src2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// LoadExplicitExtensions should only load the explicitly specified file
+	loaded, err := LoadExplicitExtensions([]string{extFile})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 loaded extension, got %d", len(loaded))
+	}
+	// Verify the global extension was NOT loaded
+	toolNames := make([]string, len(loaded[0].Tools))
+	for i, t := range loaded[0].Tools {
+		toolNames[i] = t.Name
+	}
+	if slices.Contains(toolNames, "global_tool") {
+		t.Error("global_tool should not be loaded when using LoadExplicitExtensions")
+	}
+}
+
+func TestLoadExplicitExtensions_EmptyPaths(t *testing.T) {
+	loaded, err := LoadExplicitExtensions([]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("expected 0 loaded extensions, got %d", len(loaded))
+	}
+}
+
+func TestLoadExplicitExtensions_InvalidPath(t *testing.T) {
+	loaded, err := LoadExplicitExtensions([]string{"/nonexistent/path/ext.go"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should return empty (not an error), since the invalid path is skipped
+	if len(loaded) != 0 {
+		t.Errorf("expected 0 loaded extensions for invalid path, got %d", len(loaded))
+	}
+}
