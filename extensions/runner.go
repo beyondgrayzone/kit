@@ -91,8 +91,8 @@ type Runner struct {
 	ctx             Context
 	widgets         map[string]WidgetConfig   // keyed by widget ID
 	statusEntries   map[string]StatusBarEntry // keyed by status key
-	header          *HeaderFooterConfig       // nil = no custom header
-	footer          *HeaderFooterConfig       // nil = no custom footer
+	headers         map[string]HeaderFooterConfig
+	footers         map[string]HeaderFooterConfig
 	customEditor    *EditorConfig             // nil = no custom editor interceptor
 	uiVisibility    *UIVisibility             // nil = show everything (default)
 	disabledTools   map[string]bool           // nil = all tools enabled
@@ -187,13 +187,13 @@ func normalizeContext(ctx Context) Context {
 		ctx.SetHeader = func(HeaderFooterConfig) {}
 	}
 	if ctx.RemoveHeader == nil {
-		ctx.RemoveHeader = func() {}
+		ctx.RemoveHeader = func(id string) {}
 	}
 	if ctx.SetFooter == nil {
 		ctx.SetFooter = func(HeaderFooterConfig) {}
 	}
 	if ctx.RemoveFooter == nil {
-		ctx.RemoveFooter = func() {}
+		ctx.RemoveFooter = func(id string) {}
 	}
 	if ctx.PromptSelect == nil {
 		ctx.PromptSelect = func(PromptSelectConfig) PromptSelectResult {
@@ -500,9 +500,7 @@ func (r *Runner) Extensions() []LoadedExtension {
 // Widget management
 // ---------------------------------------------------------------------------
 
-// SetWidget places or updates a persistent widget. The widget is identified
-// by config.ID; calling SetWidget with the same ID replaces the previous
-// content. Thread-safe.
+// SetWidget places or replaces a widget. Thread-safe.
 func (r *Runner) SetWidget(config WidgetConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -512,7 +510,7 @@ func (r *Runner) SetWidget(config WidgetConfig) {
 	r.widgets[config.ID] = config
 }
 
-// RemoveWidget removes a widget by ID. No-op if the ID does not exist.
+// RemoveWidget removes a widget by its ID. No-op if the ID doesn't exist.
 // Thread-safe.
 func (r *Runner) RemoveWidget(id string) {
 	r.mu.Lock()
@@ -520,8 +518,8 @@ func (r *Runner) RemoveWidget(id string) {
 	delete(r.widgets, id)
 }
 
-// GetWidgets returns all widgets matching the given placement, sorted by
-// priority (ascending). Thread-safe.
+// GetWidgets returns all widgets for a given placement, sorted by priority.
+// Returns nil if no widgets exist for that placement. Thread-safe.
 func (r *Runner) GetWidgets(placement WidgetPlacement) []WidgetConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -531,11 +529,14 @@ func (r *Runner) GetWidgets(placement WidgetPlacement) []WidgetConfig {
 			result = append(result, w)
 		}
 	}
+	if len(result) == 0 {
+		return nil
+	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Priority != result[j].Priority {
 			return result[i].Priority < result[j].Priority
 		}
-		return result[i].ID < result[j].ID // stable tie-break
+		return result[i].ID < result[j].ID
 	})
 	return result
 }
@@ -544,7 +545,7 @@ func (r *Runner) GetWidgets(placement WidgetPlacement) []WidgetConfig {
 // Status bar management
 // ---------------------------------------------------------------------------
 
-// SetStatusEntry places or updates a keyed status bar entry. Thread-safe.
+// SetStatusEntry places or replaces a status bar entry. Thread-safe.
 func (r *Runner) SetStatusEntry(entry StatusBarEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -554,21 +555,25 @@ func (r *Runner) SetStatusEntry(entry StatusBarEntry) {
 	r.statusEntries[entry.Key] = entry
 }
 
-// RemoveStatusEntry removes a status bar entry by key. Thread-safe.
+// RemoveStatusEntry removes a status bar entry by its key. No-op if the key
+// doesn't exist. Thread-safe.
 func (r *Runner) RemoveStatusEntry(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.statusEntries, key)
 }
 
-// GetStatusEntries returns all status bar entries, sorted by priority
-// (ascending). Thread-safe.
+// GetStatusEntries returns all status bar entries, sorted by priority.
+// Returns nil if no entries exist. Thread-safe.
 func (r *Runner) GetStatusEntries() []StatusBarEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	result := make([]StatusBarEntry, 0, len(r.statusEntries))
 	for _, e := range r.statusEntries {
 		result = append(result, e)
+	}
+	if len(result) == 0 {
+		return nil
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Priority != result[j].Priority {
@@ -587,54 +592,70 @@ func (r *Runner) GetStatusEntries() []StatusBarEntry {
 func (r *Runner) SetHeader(config HeaderFooterConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.header = &config
+	if r.headers == nil {
+		r.headers = make(map[string]HeaderFooterConfig)
+	}
+	r.headers[config.ID] = config
 }
 
 // RemoveHeader removes the custom header. No-op if none is set. Thread-safe.
-func (r *Runner) RemoveHeader() {
+func (r *Runner) RemoveHeader(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.header = nil
+	delete(r.headers, id)
 }
 
 // GetHeader returns the current custom header, or nil if none is set.
-// Thread-safe.
-func (r *Runner) GetHeader() *HeaderFooterConfig {
+// GetHeaders returns all headers, sorted by priority (ascending). Thread-safe.
+func (r *Runner) GetHeaders() []HeaderFooterConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.header == nil {
-		return nil
+	result := make([]HeaderFooterConfig, 0, len(r.headers))
+	for _, h := range r.headers {
+		result = append(result, h)
 	}
-	// Return a copy to avoid races on the caller side.
-	h := *r.header
-	return &h
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Priority != result[j].Priority {
+			return result[i].Priority < result[j].Priority
+		}
+		return result[i].ID < result[j].ID
+	})
+	return result
 }
 
 // SetFooter places or replaces the custom footer. Thread-safe.
 func (r *Runner) SetFooter(config HeaderFooterConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.footer = &config
+	if r.footers == nil {
+		r.footers = make(map[string]HeaderFooterConfig)
+	}
+	r.footers[config.ID] = config
 }
 
 // RemoveFooter removes the custom footer. No-op if none is set. Thread-safe.
-func (r *Runner) RemoveFooter() {
+func (r *Runner) RemoveFooter(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.footer = nil
+	delete(r.footers, id)
 }
 
 // GetFooter returns the current custom footer, or nil if none is set.
 // Thread-safe.
-func (r *Runner) GetFooter() *HeaderFooterConfig {
+func (r *Runner) GetFooters() []HeaderFooterConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.footer == nil {
-		return nil
+	result := make([]HeaderFooterConfig, 0, len(r.footers))
+	for _, f := range r.footers {
+		result = append(result, f)
 	}
-	// Return a copy to avoid races on the caller side.
-	f := *r.footer
-	return &f
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Priority != result[j].Priority {
+			return result[i].Priority < result[j].Priority
+		}
+		return result[i].ID < result[j].ID
+	})
+	return result
 }
 
 // ---------------------------------------------------------------------------
@@ -749,10 +770,16 @@ func (r *Runner) Reload(exts []LoadedExtension) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.extensions = exts
+	// Re-initialize per-extension mutexes to match the new extension count.
+	mus := make([]reentrantMu, len(exts))
+	for i := range mus {
+		mus[i].init()
+	}
+	r.extMu = mus
 	r.widgets = nil
 	r.statusEntries = nil
-	r.header = nil
-	r.footer = nil
+	r.headers = nil
+	r.footers = nil
 	r.customEditor = nil
 	r.uiVisibility = nil
 	r.disabledTools = nil

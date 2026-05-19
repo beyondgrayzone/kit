@@ -8,8 +8,8 @@ import (
 
 	"github.com/charmbracelet/log"
 
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/extbridge"
-	"github.com/mark3labs/kit/internal/extensions"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
 
@@ -87,9 +87,9 @@ func (r *sessionRegistry) create(ctx context.Context, cwd string) (*acpSession, 
 			SetWidget:       func(extensions.WidgetConfig) {},
 			RemoveWidget:    func(string) {},
 			SetHeader:       func(extensions.HeaderFooterConfig) {},
-			RemoveHeader:    func() {},
+			RemoveHeader:    func(string) {},
 			SetFooter:       func(extensions.HeaderFooterConfig) {},
-			RemoveFooter:    func() {},
+			RemoveFooter:    func(string) {},
 			SetEditor:       func(extensions.EditorConfig) {},
 			ResetEditor:     func() {},
 			SetEditorText:   func(string) {},

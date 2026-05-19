@@ -12,7 +12,7 @@ import (
 	"github.com/mark3labs/kit/internal/app"
 	"github.com/mark3labs/kit/internal/auth"
 	"github.com/mark3labs/kit/internal/extbridge"
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/models"
 	"github.com/mark3labs/kit/internal/ui"
 	kit "github.com/mark3labs/kit/pkg/kit"
@@ -95,16 +95,16 @@ func buildInteractiveExtensionContext(deps extensionContextDeps) extensions.Cont
 			kitInstance.Extensions().SetHeader(config)
 			go appInstance.NotifyWidgetUpdate()
 		},
-		RemoveHeader: func() {
-			kitInstance.Extensions().RemoveHeader()
+		RemoveHeader: func(id string) {
+			kitInstance.Extensions().RemoveHeader(id)
 			go appInstance.NotifyWidgetUpdate()
 		},
 		SetFooter: func(config extensions.HeaderFooterConfig) {
 			kitInstance.Extensions().SetFooter(config)
 			go appInstance.NotifyWidgetUpdate()
 		},
-		RemoveFooter: func() {
-			kitInstance.Extensions().RemoveFooter()
+		RemoveFooter: func(id string) {
+			kitInstance.Extensions().RemoveFooter(id)
 			go appInstance.NotifyWidgetUpdate()
 		},
 		PromptSelect: func(config extensions.PromptSelectConfig) extensions.PromptSelectResult {

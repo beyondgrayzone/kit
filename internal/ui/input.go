@@ -4,15 +4,18 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/mark3labs/kit/internal/clipboard"
 	"github.com/mark3labs/kit/internal/ui/commands"
 	"github.com/mark3labs/kit/internal/ui/core"
+	"github.com/mark3labs/kit/internal/ui/selection"
 	"github.com/mark3labs/kit/internal/ui/style"
 )
 
@@ -94,6 +97,13 @@ type InputComponent struct {
 	// browsingHistory is true when the user is navigating history with
 	// up/down arrows. Set to false when they type a character or submit.
 	browsingHistory bool
+
+	// yOffset is the Y coordinate of the input area in the terminal.
+	// Used to convert absolute mouse coordinates to input-relative coordinates.
+	yOffset int
+
+	// sel is the selection state for text selection (crush-style).
+	sel selection.State
 }
 
 // maxHistory is the maximum number of prompt entries kept in history.
@@ -123,6 +133,16 @@ func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 	ta.KeyMap.InsertNewline = key.NewBinding(
 		key.WithKeys("ctrl+j", "shift+enter"),
 		key.WithHelp("ctrl+j", "insert newline"),
+	)
+
+	// Ensure Home and End keys work for line navigation.
+	ta.KeyMap.LineStart = key.NewBinding(
+		key.WithKeys("home", "ctrl+a"),
+		key.WithHelp("home", "start of line"),
+	)
+	ta.KeyMap.LineEnd = key.NewBinding(
+		key.WithKeys("end", "ctrl+e"),
+		key.WithHelp("end", "end of line"),
 	)
 
 	// Style the textarea using theme colors.
@@ -155,6 +175,172 @@ func (s *InputComponent) SetCwd(cwd string) {
 // for the @ autocomplete popup. Called by the parent after construction.
 func (s *InputComponent) SetMCPResourceProvider(fn func() []FileSuggestion) {
 	s.mcpResources = fn
+}
+
+// SetYOffset sets the Y coordinate of the input area in the terminal.
+// Used to convert absolute mouse coordinates to input-relative coordinates.
+func (s *InputComponent) SetYOffset(y int) {
+	s.yOffset = y
+}
+
+// HandleMouseDown handles mouse button press. Returns true if the click
+// was within the input area.
+func (s *InputComponent) HandleMouseDown(x, y int) bool {
+	// Convert to input-relative coordinates.
+	relY := y - s.yOffset
+
+	// Adjust for style margins/padding to get coordinates relative to text content.
+	// inputBoxStyle has MarginTop(1) and no PaddingTop, so text content starts 1 row below.
+	// Also account for left border (1 char) and PaddingLeft(2) = 3 columns offset.
+	const marginTop = 1
+	const leftOffset = 3 // BorderLeft(1) + PaddingLeft(2)
+
+	relYAdjusted := relY - marginTop
+	if relYAdjusted < 0 || relYAdjusted >= s.textarea.Height() {
+		return false
+	}
+
+	// Approximate line and column from coordinates.
+	line := relYAdjusted + s.textarea.ScrollYOffset()
+	col := x - leftOffset
+
+	// Multi-click detection (crush-style).
+	now := time.Now()
+	if now.Sub(s.sel.LastClickTime) <= selection.DoubleClickThreshold &&
+		abs(x-s.sel.LastClickX) <= selection.ClickTolerance &&
+		abs(y-s.sel.LastClickY) <= selection.ClickTolerance {
+		s.sel.ClickCount++
+	} else {
+		s.sel.ClickCount = 1
+	}
+	s.sel.LastClickTime = now
+	s.sel.LastClickX = x
+	s.sel.LastClickY = y
+
+	switch s.sel.ClickCount {
+	case 1:
+		// Single click: start character-level drag selection.
+		s.sel.MouseDown = true
+		s.sel.MouseDownItemIdx = 0 // Input has only one "item" (the text)
+		s.sel.MouseDownLineIdx = line
+		s.sel.MouseDownCol = col
+		s.sel.DragItemIdx = 0
+		s.sel.DragLineIdx = line
+		s.sel.DragCol = col
+	case 2:
+		// Double click: select word at position.
+		s.selectWord(line, col)
+	case 3:
+		// Triple click: select entire line.
+		s.selectLine(line)
+		s.sel.ClickCount = 0 // Reset after triple
+	}
+
+	return true
+}
+
+// HandleMouseDrag handles mouse motion while button is held.
+// Returns true if selection was updated.
+func (s *InputComponent) HandleMouseDrag(x, y int) bool {
+	if !s.sel.MouseDown {
+		return false
+	}
+
+	// Convert to input-relative coordinates.
+	relY := y - s.yOffset
+
+	// Adjust for style margins/padding to get coordinates relative to text content.
+	const marginTop = 1
+	const leftOffset = 3 // BorderLeft(1) + PaddingLeft(2)
+
+	relYAdjusted := relY - marginTop
+	if relYAdjusted < 0 || relYAdjusted >= s.textarea.Height() {
+		return false
+	}
+
+	line := relYAdjusted + s.textarea.ScrollYOffset()
+	col := x - leftOffset
+
+	s.sel.DragItemIdx = 0
+	s.sel.DragLineIdx = line
+	s.sel.DragCol = col
+
+	return true
+}
+
+// HandleMouseUp handles mouse button release.
+// Returns true if there was an active selection.
+func (s *InputComponent) HandleMouseUp() bool {
+	if !s.sel.MouseDown {
+		return false
+	}
+	s.sel.MouseDown = false
+	return s.sel.HasSelection()
+}
+
+// selectWord selects the word at the given position (line, col in display cols).
+func (s *InputComponent) selectWord(line, col int) {
+	text := s.textarea.Value()
+	lines := strings.Split(text, "\n")
+	if line < 0 || line >= len(lines) {
+		return
+	}
+	startCol, endCol := selection.FindWordBoundaries(lines[line], col)
+	s.sel.MouseDownLineIdx = line
+	s.sel.MouseDownCol = startCol
+	s.sel.DragLineIdx = line
+	s.sel.DragCol = endCol
+}
+
+// selectLine selects the entire line.
+func (s *InputComponent) selectLine(line int) {
+	text := s.textarea.Value()
+	lines := strings.Split(text, "\n")
+	if line < 0 || line >= len(lines) {
+		return
+	}
+	s.sel.MouseDownLineIdx = line
+	s.sel.MouseDownCol = 0
+	s.sel.DragLineIdx = line
+	s.sel.DragCol = xansi.StringWidth(lines[line]) // end of line in display cols
+}
+
+// HasSelection returns true if there is a non-empty active selection.
+func (s *InputComponent) HasSelection() bool {
+	return s.sel.HasSelection()
+}
+
+// ClearSelection clears the current text selection.
+func (s *InputComponent) ClearSelection() {
+	s.sel.Clear()
+}
+
+// ExtractSelectedText returns the plain text content of the current selection.
+func (s *InputComponent) ExtractSelectedText() string {
+	if !s.sel.HasSelection() {
+		return ""
+	}
+
+	text := s.textarea.Value()
+	lines := strings.Split(text, "\n")
+	rng := s.sel.GetRange()
+
+	var sb strings.Builder
+	for lineIdx := rng.StartLine; lineIdx <= rng.EndLine && lineIdx < len(lines); lineIdx++ {
+		line := lines[lineIdx]
+		if lineIdx == rng.StartLine && lineIdx == rng.EndLine {
+			sb.WriteString(selection.ExtractText(line, rng.StartCol, rng.EndCol))
+		} else if lineIdx == rng.StartLine {
+			sb.WriteString(selection.ExtractText(line, rng.StartCol, -1))
+			sb.WriteString("\n")
+		} else if lineIdx == rng.EndLine {
+			sb.WriteString(selection.ExtractText(line, 0, rng.EndCol))
+		} else {
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
 }
 
 // Init implements tea.Model. Starts the cursor blink animation.
@@ -246,6 +432,22 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+v":
 				// Try to read an image from the clipboard asynchronously.
 				return s, readClipboardImageCmd()
+			case "ctrl+left":
+				// Move cursor to previous word boundary.
+				s.moveCursorWordLeft()
+				return s, nil
+			case "ctrl+right":
+				// Move cursor to next word boundary.
+				s.moveCursorWordRight()
+				return s, nil
+			case "end":
+				// Move cursor to end of line (explicit handling for reliability).
+				s.textarea.CursorEnd()
+				return s, nil
+			case "home":
+				// Move cursor to start of line (explicit handling for reliability).
+				s.textarea.CursorStart()
+				return s, nil
 			case "ctrl+u":
 				// Clear all pending image attachments.
 				if len(s.pendingImages) > 0 {
@@ -539,7 +741,25 @@ func (s *InputComponent) View() tea.View {
 		Width(s.width - 1) // full width minus left border
 
 	var view strings.Builder
-	view.WriteString(inputBoxStyle.Render(s.textarea.View()))
+
+	// Get textarea content and apply selection highlighting if needed.
+	textareaView := s.textarea.View()
+	if s.sel.HasSelection() {
+		// Apply selection highlighting to visible lines.
+		lines := strings.Split(textareaView, "\n")
+		scrollOffset := s.textarea.ScrollYOffset()
+		rng := s.sel.GetRange()
+		for i, line := range lines {
+			absLine := scrollOffset + i
+			inRange, startCol, endCol := selection.IsLineInRange(rng, 0, absLine)
+			if inRange {
+				lines[i] = selection.HighlightLine(line, startCol, endCol)
+			}
+		}
+		textareaView = strings.Join(lines, "\n")
+	}
+
+	view.WriteString(inputBoxStyle.Render(textareaView))
 
 	// Popup is now rendered as a centered overlay in AppModel.View()
 	// instead of inline here to prevent bottom overflow
@@ -850,6 +1070,140 @@ func (s *InputComponent) ClearPendingImages() []core.ImageAttachment {
 // PendingImageCount returns the number of images currently attached.
 func (s *InputComponent) PendingImageCount() int {
 	return len(s.pendingImages)
+}
+
+// isWordChar returns true if the rune is considered a word character.
+// Word characters are alphanumeric and underscore.
+func isWordChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+}
+
+// getCursorOffset returns the cursor position as a rune offset from the
+// start of the textarea text (across all lines).
+func (s *InputComponent) getCursorOffset() int {
+	text := s.textarea.Value()
+	lines := strings.Split(text, "\n")
+	currentLine := s.textarea.Line()
+	currentCol := s.textarea.Column()
+
+	// Bounds check
+	if currentLine < 0 {
+		currentLine = 0
+	}
+	if currentLine >= len(lines) {
+		currentLine = len(lines) - 1
+	}
+	if currentCol < 0 {
+		currentCol = 0
+	}
+
+	offset := 0
+	for i := 0; i < currentLine; i++ {
+		offset += len([]rune(lines[i])) + 1 // +1 for newline
+	}
+	offset += currentCol
+
+	return offset
+}
+
+// setCursorOffset sets the cursor position to the given rune offset from
+// the start of the text. Uses CursorStart, CursorDown and SetCursorColumn.
+func (s *InputComponent) setCursorOffset(offset int) {
+	text := s.textarea.Value()
+	runes := []rune(text)
+
+	// Clamp offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(runes) {
+		offset = len(runes)
+	}
+
+	// Convert offset to line and column
+	lines := strings.Split(text, "\n")
+	currentOffset := 0
+	targetLine := 0
+	targetCol := 0
+
+	for i, line := range lines {
+		lineLen := len([]rune(line))
+		if currentOffset+lineLen >= offset {
+			targetLine = i
+			targetCol = offset - currentOffset
+			break
+		}
+		currentOffset += lineLen + 1 // +1 for newline
+	}
+
+	s.textarea.CursorStart()
+
+	for s.textarea.Line() > targetLine {
+		s.textarea.CursorUp()
+	}
+	for s.textarea.Line() < targetLine {
+		s.textarea.CursorDown()
+	}
+
+	s.textarea.SetCursorColumn(targetCol)
+}
+
+// moveCursorWordLeft moves the cursor to the previous word boundary.
+func (s *InputComponent) moveCursorWordLeft() {
+	text := s.textarea.Value()
+	if text == "" {
+		return
+	}
+
+	offset := s.getCursorOffset()
+	runes := []rune(text)
+
+	if offset <= 0 {
+		return
+	}
+
+	// Find previous word boundary.
+	newOffset := offset
+
+	// Skip any word characters to the left (move to start of current word).
+	for newOffset > 0 && isWordChar(runes[newOffset-1]) {
+		newOffset--
+	}
+	// Skip any non-word characters to the left (move past spaces/punctuation).
+	for newOffset > 0 && !isWordChar(runes[newOffset-1]) {
+		newOffset--
+	}
+
+	s.setCursorOffset(newOffset)
+}
+
+// moveCursorWordRight moves the cursor to the next word boundary.
+func (s *InputComponent) moveCursorWordRight() {
+	text := s.textarea.Value()
+	if text == "" {
+		return
+	}
+
+	offset := s.getCursorOffset()
+	runes := []rune(text)
+
+	if offset >= len(runes) {
+		return
+	}
+
+	// Find next word boundary.
+	newOffset := offset
+
+	// Skip current word characters.
+	for newOffset < len(runes) && isWordChar(runes[newOffset]) {
+		newOffset++
+	}
+	// Skip non-word characters.
+	for newOffset < len(runes) && !isWordChar(runes[newOffset]) {
+		newOffset++
+	}
+
+	s.setCursorOffset(newOffset)
 }
 
 // Clear clears the textarea content and resets related state. Returns true if

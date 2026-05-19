@@ -245,6 +245,10 @@ func TestLoadSkillsFromDir_CaseInsensitiveSKILLmd(t *testing.T) {
 
 func TestLoadSkills_ProjectLocal(t *testing.T) {
 	dir := t.TempDir()
+
+	// Isolate from real global skills by pointing XDG_CONFIG_HOME elsewhere.
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
 	skillsDir := filepath.Join(dir, ".kit", "skills")
 	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
 		t.Fatal(err)

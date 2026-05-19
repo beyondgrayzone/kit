@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 )
 
 // AssertNotBlocked fails the test if the tool call result indicates the tool was blocked.
@@ -166,7 +166,7 @@ func AssertWidgetTextContains(t *testing.T, harness *Harness, id string, substri
 // AssertHeaderSet fails the test if no header was set.
 func AssertHeaderSet(t *testing.T, harness *Harness) {
 	t.Helper()
-	if harness.Context().GetHeader() == nil {
+	if len(harness.Context().GetHeaders()) == 0 {
 		t.Error("expected header to be set, but it was not")
 	}
 }
@@ -174,7 +174,7 @@ func AssertHeaderSet(t *testing.T, harness *Harness) {
 // AssertFooterSet fails the test if no footer was set.
 func AssertFooterSet(t *testing.T, harness *Harness) {
 	t.Helper()
-	if harness.Context().GetFooter() == nil {
+	if len(harness.Context().GetFooters()) == 0 {
 		t.Error("expected footer to be set, but it was not")
 	}
 }

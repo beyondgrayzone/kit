@@ -9,9 +9,9 @@ import (
 
 	"charm.land/fantasy"
 
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/agent"
 	"github.com/mark3labs/kit/internal/config"
-	"github.com/mark3labs/kit/internal/extensions"
 	"github.com/mark3labs/kit/internal/models"
 	"github.com/mark3labs/kit/internal/tools"
 	"github.com/spf13/viper"
@@ -184,10 +184,28 @@ func SetupAgent(ctx context.Context, opts AgentSetupOptions) (*AgentSetupResult,
 		}
 	}
 
-	// Load extensions unless --no-extensions is set.
+	// Load extensions. When --no-extensions is set, skip discovery but
+	// still load any extensions explicitly specified via -e/--extension flags.
 	var extRunner *extensions.Runner
 	var extCreationOpts extensionCreationOpts
-	if !noExtensions {
+	extraPaths := viper.GetStringSlice("extension")
+	if noExtensions {
+		// --no-extensions: skip discovery, but still load explicit -e paths
+		if len(extraPaths) > 0 {
+			loaded, err := extensions.LoadExplicitExtensions(extraPaths)
+			if err != nil {
+				fmt.Printf("Warning: Failed to load extensions: %v\n", err)
+			} else if len(loaded) > 0 {
+				runner := extensions.NewRunner(loaded)
+				extRunner = runner
+				extCreationOpts.toolWrapper = func(tools []fantasy.AgentTool) []fantasy.AgentTool {
+					return extensions.WrapToolsWithExtensions(tools, runner)
+				}
+				extCreationOpts.extraTools = extensions.ExtensionToolsAsLLMTools(runner.RegisteredTools(), runner)
+			}
+		}
+	} else {
+		// Normal loading with discovery
 		var extErr error
 		extRunner, extCreationOpts, extErr = loadExtensions()
 		if extErr != nil {

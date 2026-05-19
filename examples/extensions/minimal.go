@@ -43,6 +43,7 @@ func Init(api ext.API) {
 		}
 
 		ctx.SetFooter(ext.HeaderFooterConfig{
+			ID: "minimal:footer",
 			Content: ext.WidgetContent{Text: text},
 			Style:   ext.WidgetStyle{BorderColor: "#585b70"},
 		})
@@ -66,6 +67,6 @@ func Init(api ext.API) {
 	})
 
 	api.OnSessionShutdown(func(_ ext.SessionShutdownEvent, ctx ext.Context) {
-		ctx.RemoveFooter()
+		ctx.RemoveFooter("minimal:footer")
 	})
 }

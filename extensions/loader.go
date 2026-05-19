@@ -42,6 +42,79 @@ func LoadExtensions(extraPaths []string) ([]LoadedExtension, error) {
 	return loaded, nil
 }
 
+// LoadExplicitExtensions loads only the extensions specified in extraPaths,
+// without any automatic discovery of global or project-local extensions.
+// If a path does not exist as-is, it searches in standard
+// extension directories (~/.config/kit/extensions/ and .kit/extensions/).
+// Extensions that fail to load are logged and skipped.
+func LoadExplicitExtensions(extraPaths []string) ([]LoadedExtension, error) {
+	if len(extraPaths) == 0 {
+		return nil, nil
+	}
+
+	// Get standard extension directories
+	standardDirs := []string{
+		globalExtensionsDir(),
+		filepath.Join(".kit", "extensions"),
+	}
+
+	var loaded []LoadedExtension
+	for _, p := range extraPaths {
+		// Try the path as-is first
+		paths := resolveExtensionPath(p, standardDirs)
+		if len(paths) == 0 {
+			log.Debug("skipping extension - not found", "path", p)
+			continue
+		}
+
+		for _, path := range paths {
+			ext, err := loadSingleExtension(path)
+			if err != nil {
+				log.Debug("failed to load extension", "path", path, "error", err)
+				continue
+			}
+			loaded = append(loaded, *ext)
+			log.Debug("loaded extension", "path", path, "handlers", countHandlers(ext), "tools", len(ext.Tools), "commands", len(ext.Commands), "tool_renderers", len(ext.ToolRenderers))
+		}
+	}
+
+	return loaded, nil
+}
+
+// resolveExtensionPath resolves an extension path, searching in standard
+// directories if the path doesn't exist as-is.
+func resolveExtensionPath(p string, standardDirs []string) []string {
+	// Try as-is first
+	info, err := os.Stat(p)
+	if err == nil {
+		// Path exists
+		if info.IsDir() {
+			return findExtensionsInDir(p)
+		}
+		if strings.HasSuffix(p, ".go") {
+			return []string{p}
+		}
+		return nil
+	}
+
+	// Not found as-is, try standard directories
+	for _, dir := range standardDirs {
+		candidate := filepath.Join(dir, p)
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			return findExtensionsInDir(candidate)
+		}
+		if strings.HasSuffix(p, ".go") {
+			return []string{candidate}
+		}
+	}
+
+	return nil
+}
+
 // pathSet is a thread-safe helper for deduplicating and ordering file paths.
 type pathSet struct {
 	m    map[string]bool

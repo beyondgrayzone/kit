@@ -5,7 +5,7 @@ import (
 	"os/exec"
 
 	"github.com/charmbracelet/log"
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/spf13/cobra"
 )
 

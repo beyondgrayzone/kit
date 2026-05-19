@@ -5,7 +5,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 )
 
 // bridgeExtensions registers extension event handlers as SDK hooks and

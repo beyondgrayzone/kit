@@ -6,7 +6,7 @@ package extbridge
 import (
 	"context"
 
-	"github.com/mark3labs/kit/internal/extensions"
+	"github.com/mark3labs/kit/extensions"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
 

@@ -26,7 +26,7 @@ The test package is part of the Kit codebase. Import it in your extension tests:
 import (
     "testing"
     "github.com/mark3labs/kit/pkg/extensions/test"
-    "github.com/mark3labs/kit/internal/extensions"
+    "github.com/mark3labs/kit/extensions"
 )
 ```
 
@@ -42,7 +42,7 @@ package main
 import (
     "testing"
     "github.com/mark3labs/kit/pkg/extensions/test"
-    "github.com/mark3labs/kit/internal/extensions"
+    "github.com/mark3labs/kit/extensions"
 )
 
 func TestMyExtension(t *testing.T) {

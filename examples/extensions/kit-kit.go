@@ -396,6 +396,7 @@ func updateFooter() {
 	text := fmt.Sprintf("%s  |  Kit Kit%s", ctx.Model, mid)
 
 	ctx.SetFooter(ext.HeaderFooterConfig{
+		ID: "kit-kit:footer",
 		Content: ext.WidgetContent{Text: text},
 		Style:   ext.WidgetStyle{BorderColor: "#89b4fa"},
 	})
@@ -681,7 +682,7 @@ func Init(api ext.API) {
 	// ── Session Shutdown: cleanup ──
 	api.OnSessionShutdown(func(_ ext.SessionShutdownEvent, ctx ext.Context) {
 		ctx.RemoveWidget("kit-kit:grid")
-		ctx.RemoveFooter()
+		ctx.RemoveFooter("kit-kit:footer")
 	})
 
 	// ── Tool: query_experts ──

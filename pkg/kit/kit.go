@@ -14,10 +14,10 @@ import (
 
 	"charm.land/fantasy"
 
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/agent"
 	"github.com/mark3labs/kit/internal/config"
 	"github.com/mark3labs/kit/internal/core"
-	"github.com/mark3labs/kit/internal/extensions"
 	"github.com/mark3labs/kit/internal/kitsetup"
 	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/models"
