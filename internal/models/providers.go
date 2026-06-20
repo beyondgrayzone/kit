@@ -9,8 +9,11 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/fantasy"
@@ -25,11 +28,30 @@ import (
 	openaisdk "github.com/charmbracelet/openai-go"
 
 	"github.com/mark3labs/kit/internal/auth"
+	"github.com/spf13/viper"
 )
 
 const (
 	// ClaudeCodePrompt is the required system prompt for OAuth authentication.
 	ClaudeCodePrompt = "You are Claude Code, Anthropic's official CLI for Claude."
+
+	// copilotProviderID is the canonical models.dev provider key. The CLI also
+	// accepts the shorter "copilot" alias for user-facing model strings.
+	copilotProviderID = "github-copilot"
+	// copilotAliasProviderID is the short provider prefix accepted by kit.
+	copilotAliasProviderID = "copilot"
+	// copilotBaseURL is the fallback API URL if the model catalog has no API URL.
+	copilotBaseURL = "https://api.githubcopilot.com"
+
+	// GitHub Copilot currently expects VS Code Copilot Chat client identifiers.
+	// Keep these centralized so they are easy to audit and update when GitHub
+	// changes accepted client metadata.
+	copilotIntegrationID       = "vscode-chat"
+	copilotEditorVersion       = "vscode/1.104.1"
+	copilotEditorPluginVersion = "copilot-chat/0.31.0"
+	copilotUserAgent           = "GitHubCopilotChat/0.31.0"
+	copilotOpenAIIntent        = "conversation-agent"
+	copilotGitHubAPIVersion    = "2026-01-09"
 )
 
 // resolveModelAlias resolves model aliases to their full names using the registry
@@ -164,6 +186,13 @@ type ProviderConfig struct {
 	ThinkingLevel    ThinkingLevel
 	DisableCaching   bool // Opt-out: set to true to disable automatic prompt caching
 
+	// ConfigStore is the per-instance configuration store used to resolve
+	// "explicitly set" precedence checks (isExplicitlySet), per-model
+	// settings, and right-sizing. When nil, the process-global viper store is
+	// used. Threading a per-Kit store here keeps generation-parameter
+	// precedence isolated between Kit instances in the same process.
+	ConfigStore *viper.Viper
+
 	// ProgressReaderFunc, when set, wraps an io.Reader with progress display
 	// for long operations like Ollama model pulls. The returned io.ReadCloser
 	// must be closed when done. When nil, the raw reader is consumed directly
@@ -205,6 +234,20 @@ func ParseModelString(modelString string) (provider, model string, err error) {
 	return "", "", fmt.Errorf("invalid model format %q: expected provider/model (e.g. anthropic/claude-sonnet-4-5)", modelString)
 }
 
+// isCopilotProvider reports whether provider is the canonical catalog key or
+// the user-facing shorthand alias.
+func isCopilotProvider(provider string) bool {
+	return provider == copilotAliasProviderID || provider == copilotProviderID
+}
+
+// catalogProviderID maps supported provider aliases to their models.dev keys.
+func catalogProviderID(provider string) string {
+	if isCopilotProvider(provider) {
+		return copilotProviderID
+	}
+	return provider
+}
+
 // CreateProvider creates a fantasy LanguageModel based on the provider configuration.
 // Model metadata is looked up from the models.dev database for cost tracking and
 // capability detection, but unknown models are passed through to the provider
@@ -212,8 +255,10 @@ func ParseModelString(modelString string) (provider, model string, err error) {
 //
 // Native providers: anthropic, openai, google, ollama, azure, google-vertex-anthropic,
 // openrouter, bedrock, vercel.
-// Any provider in models.dev with an api URL or openai-compatible npm package
-// is auto-routed through fantasy's openaicompat provider.
+// Any other provider in models.dev is auto-routed by wire protocol: its npm
+// package (or per-model override) selects the OpenAI, Anthropic, or Google
+// transport, using the provider's api URL as the base. Providers with an api
+// URL but an unrecognized npm package fall back to the OpenAI-compatible wire.
 func CreateProvider(ctx context.Context, config *ProviderConfig) (*ProviderResult, error) {
 	provider, modelName, err := ParseModelString(config.ModelString)
 	if err != nil {
@@ -226,17 +271,30 @@ func CreateProvider(ctx context.Context, config *ProviderConfig) (*ProviderResul
 	}
 
 	registry := GetGlobalRegistry()
+	lookupProvider := catalogProviderID(provider)
 
-	// Look up model metadata (advisory, not blocking).
+	// Look up model metadata (advisory for most providers, strict for Copilot).
 	// When the model is known we validate config limits and print
 	// suggestions on likely typos; when unknown we let the provider
-	// API be the authority.
-	modelInfo := registry.LookupModel(provider, modelName)
-	if modelInfo == nil && provider != "ollama" && config.ProviderURL == "" {
+	// API be the authority except for Copilot, whose non-GPT catalog entries
+	// require unsupported wire protocols.
+	modelInfo := registry.LookupModel(lookupProvider, modelName)
+	if isCopilotProvider(provider) {
+		providerInfo := registry.GetProviderInfo(copilotProviderID)
+		if providerInfo == nil {
+			return nil, fmt.Errorf("unsupported provider: %s (not found in model database)", copilotProviderID)
+		}
+		if modelInfo == nil {
+			if suggestions := registry.SuggestModels(copilotProviderID, modelName); len(suggestions) > 0 {
+				return nil, fmt.Errorf("model %q not found for provider %s. Did you mean one of: %s", modelName, copilotProviderID, strings.Join(suggestions, ", "))
+			}
+			return nil, fmt.Errorf("model %q not found for provider %s", modelName, copilotProviderID)
+		}
+	} else if modelInfo == nil && provider != "ollama" && config.ProviderURL == "" {
 		// Model not in database — warn with suggestions but don't block.
-		if suggestions := registry.SuggestModels(provider, modelName); len(suggestions) > 0 {
+		if suggestions := registry.SuggestModels(lookupProvider, modelName); len(suggestions) > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: model %q not found in model database for provider %s. Similar models: %s\n",
-				modelName, provider, strings.Join(suggestions, ", "))
+				modelName, lookupProvider, strings.Join(suggestions, ", "))
 		}
 	}
 
@@ -270,17 +328,21 @@ func CreateProvider(ctx context.Context, config *ProviderConfig) (*ProviderResul
 		result, createErr = createAnthropicProvider(ctx, config, modelName)
 	case "openai":
 		result, createErr = createOpenAIProvider(ctx, config, modelName)
+	case "copilot", "github-copilot":
+		result, createErr = createCopilotProvider(ctx, config, modelName)
 	case "google", "gemini":
 		result, createErr = createGoogleProvider(ctx, config, modelName)
 	case "ollama":
 		result, createErr = createOllamaProvider(ctx, config, modelName)
-	case "azure":
+	case "azure", "azure-cognitive-services":
 		result, createErr = createAzureProvider(ctx, config, modelName)
 	case "google-vertex-anthropic":
 		result, createErr = createVertexAnthropicProvider(ctx, config, modelName)
+	case "google-vertex":
+		result, createErr = createGoogleVertexProvider(ctx, config, modelName)
 	case "openrouter":
 		result, createErr = createOpenRouterProvider(ctx, config, modelName)
-	case "bedrock":
+	case "bedrock", "amazon-bedrock":
 		result, createErr = createBedrockProvider(ctx, config, modelName)
 	case "vercel":
 		result, createErr = createVercelProvider(ctx, config, modelName)
@@ -327,44 +389,100 @@ func CreateProvider(ctx context.Context, config *ProviderConfig) (*ProviderResul
 
 // autoRouteProvider attempts to create a provider by looking up its npm package
 // in the models.dev database and routing through the appropriate fantasy provider.
-// For openai-compatible providers, it uses the api URL from models.dev.
-// Models may have a provider override that specifies a different npm package than
-// the provider's default (e.g., opencode's claude-opus-4-6 uses @ai-sdk/anthropic).
+// It routes on wire protocol (openai, anthropic, google) rather than per-npm
+// provider name: fantasy implements three native wire protocols, and every other
+// entry in its providers/ tree is a thin wrapper around one of them. Using the
+// provider's api URL from models.dev as the base URL, any proxy that re-flavors
+// one of these protocols (e.g. opencode's Gemini routes) Just Works.
+//
+// Models may carry a provider override that specifies a different npm package
+// than the provider's default (e.g. opencode's claude-* uses @ai-sdk/anthropic
+// and its gemini-* uses @ai-sdk/google), which is resolved first.
 func autoRouteProvider(ctx context.Context, config *ProviderConfig, provider, modelName string, registry *ModelsRegistry) (*ProviderResult, error) {
 	providerInfo := registry.GetProviderInfo(provider)
 	if providerInfo == nil {
 		return nil, fmt.Errorf("unsupported provider: %s (not found in model database)", provider)
 	}
 
-	// Check for model-specific provider override
+	// Resolve npm: per-model override > provider default.
 	npmPackage := providerInfo.NPM
 	if modelInfo := registry.LookupModel(provider, modelName); modelInfo != nil && modelInfo.ProviderNPM != "" {
 		npmPackage = modelInfo.ProviderNPM
 	}
 
-	// Determine the LLM provider for this npm package
-	llmProvider := npmToLLMProvider[npmPackage]
-	if llmProvider == "" && providerInfo.API != "" {
-		// Unknown npm but has API URL → route through openaicompat
-		llmProvider = "openaicompat"
+	wire, known := npmToWireProtocol[npmPackage]
+	if !known {
+		// Unknown npm but the provider has an API URL → assume OpenAI-compatible.
+		// (Preserves the long-standing "any provider in models.dev with an api URL
+		// is auto-routed through openaicompat" behaviour.)
+		if providerInfo.API == "" {
+			return nil, fmt.Errorf(
+				"cannot auto-route provider %s: npm package %q has no known wire protocol "+
+					"and the registry has no API URL (use --provider-url to override)",
+				provider, npmPackage,
+			)
+		}
+		wire = wireOpenAI
 	}
 
-	switch llmProvider {
-	case "openaicompat":
-		return createAutoRoutedOpenAICompatProvider(ctx, config, modelName, providerInfo)
-	case "anthropic":
-		if config.ProviderURL == "" && providerInfo.API != "" {
+	// All three wires use the provider's API URL from models.dev as the base.
+	// When the registry has none, fall back to the SDK's hard-coded default for
+	// this npm package (covers groq, cerebras, mistral, x.ai, etc. — providers
+	// whose JS SDK ships a built-in baseURL that models.dev doesn't restate).
+	if config.ProviderURL == "" {
+		if providerInfo.API != "" {
 			config.ProviderURL = providerInfo.API
+		} else if defaultURL, ok := sdkDefaultBaseURL[npmPackage]; ok {
+			config.ProviderURL = defaultURL
+			providerInfo.API = defaultURL // for downstream helpers that read info.API
 		}
-		return createAutoRoutedAnthropicProvider(ctx, config, modelName, providerInfo)
-	case "openai":
-		if config.ProviderURL == "" && providerInfo.API != "" {
-			config.ProviderURL = providerInfo.API
-		}
-		return createAutoRoutedOpenAIProvider(ctx, config, modelName, providerInfo)
-	default:
-		return nil, fmt.Errorf("unsupported provider: %s (npm: %s has no LLM provider mapping)", provider, npmPackage)
 	}
+
+	// Provider templates a runtime account/region/deployment segment into the
+	// URL (cloudflare-ai-gateway, databricks, snowflake-cortex, gitlab,
+	// sap-ai-core). Resolve via environment variables, or surface a targeted
+	// error pointing the user at the right knobs.
+	if resolved, err := resolveTemplatedAPIURL(config.ProviderURL, providerInfo); err != nil {
+		return nil, err
+	} else if resolved != "" {
+		config.ProviderURL = resolved
+		providerInfo.API = resolved
+	}
+
+	switch wire {
+	case wireOpenAI:
+		// The native OpenAI SDK package (@ai-sdk/openai) speaks the Responses
+		// API; openai-compatible proxies (and unknown-npm fallbacks) use the
+		// chat-completions wire via fantasy's openaicompat provider.
+		if npmPackage == "@ai-sdk/openai" {
+			return createAutoRoutedOpenAIProvider(ctx, config, modelName, providerInfo)
+		}
+		return createAutoRoutedOpenAICompatProvider(ctx, config, modelName, providerInfo)
+	case wireAnthropic:
+		return createAutoRoutedAnthropicProvider(ctx, config, modelName, providerInfo)
+	case wireGoogle:
+		return createAutoRoutedGoogleProvider(ctx, config, modelName, providerInfo)
+	default:
+		return nil, fmt.Errorf("internal error: unknown wire protocol for provider %s (npm: %s)", provider, npmPackage)
+	}
+}
+
+// resolveAutoRouteAPIKey looks up the API key for an auto-routed provider,
+// returning a uniform error message when none can be resolved.
+func resolveAutoRouteAPIKey(config *ProviderConfig, info *ProviderInfo) (string, error) {
+	apiKey := resolveAPIKey(config.ProviderAPIKey, info.Env)
+	if apiKey == "" {
+		return "", fmt.Errorf("%s API key not provided. Use --provider-api-key or set %s",
+			info.Name, strings.Join(info.Env, " / "))
+	}
+	return apiKey, nil
+}
+
+// wrapProviderErr produces the uniform "failed to create X provider/model: %w"
+// error wrap used by every createXxxProvider path. kind is typically
+// "provider" or "model".
+func wrapProviderErr(name, kind string, err error) error {
+	return fmt.Errorf("failed to create %s %s: %w", name, kind, err)
 }
 
 // createAutoRoutedOpenAICompatProvider creates an openaicompat provider using
@@ -378,10 +496,9 @@ func createAutoRoutedOpenAICompatProvider(ctx context.Context, config *ProviderC
 		return nil, fmt.Errorf("provider %s requires --provider-url (no API URL in database)", info.ID)
 	}
 
-	apiKey := resolveAPIKey(config.ProviderAPIKey, info.Env)
-	if apiKey == "" {
-		return nil, fmt.Errorf("%s API key not provided. Use --provider-api-key or set %s",
-			info.Name, strings.Join(info.Env, " / "))
+	apiKey, err := resolveAutoRouteAPIKey(config, info)
+	if err != nil {
+		return nil, err
 	}
 
 	var opts []openaicompat.Option
@@ -395,12 +512,12 @@ func createAutoRoutedOpenAICompatProvider(ctx context.Context, config *ProviderC
 
 	p, err := openaicompat.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s provider: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "provider", err)
 	}
 
 	model, err := p.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s model: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -411,10 +528,9 @@ func createAutoRoutedOpenAICompatProvider(ctx context.Context, config *ProviderC
 func createAutoRoutedAnthropicProvider(ctx context.Context, config *ProviderConfig, modelName string, info *ProviderInfo) (*ProviderResult, error) {
 	clearConflictingAnthropicSamplingParams(config)
 
-	apiKey := resolveAPIKey(config.ProviderAPIKey, info.Env)
-	if apiKey == "" {
-		return nil, fmt.Errorf("%s API key not provided. Use --provider-api-key or set %s",
-			info.Name, strings.Join(info.Env, " / "))
+	apiKey, err := resolveAutoRouteAPIKey(config, info)
+	if err != nil {
+		return nil, err
 	}
 
 	var opts []anthropic.Option
@@ -433,12 +549,12 @@ func createAutoRoutedAnthropicProvider(ctx context.Context, config *ProviderConf
 
 	p, err := anthropic.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s provider: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "provider", err)
 	}
 
 	model, err := p.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s model: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -447,10 +563,9 @@ func createAutoRoutedAnthropicProvider(ctx context.Context, config *ProviderConf
 // createAutoRoutedOpenAIProvider creates an openai provider for
 // third-party providers with openai-compatible APIs.
 func createAutoRoutedOpenAIProvider(ctx context.Context, config *ProviderConfig, modelName string, info *ProviderInfo) (*ProviderResult, error) {
-	apiKey := resolveAPIKey(config.ProviderAPIKey, info.Env)
-	if apiKey == "" {
-		return nil, fmt.Errorf("%s API key not provided. Use --provider-api-key or set %s",
-			info.Name, strings.Join(info.Env, " / "))
+	apiKey, err := resolveAutoRouteAPIKey(config, info)
+	if err != nil {
+		return nil, err
 	}
 
 	var opts []openai.Option
@@ -467,17 +582,125 @@ func createAutoRoutedOpenAIProvider(ctx context.Context, config *ProviderConfig,
 
 	p, err := openai.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s provider: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "provider", err)
 	}
 
 	model, err := p.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s model: %w", info.Name, err)
+		return nil, wrapProviderErr(info.Name, "model", err)
 	}
 
 	providerOpts := buildOpenAIProviderOptions(config, modelName)
 
 	return &ProviderResult{Model: model, ProviderOptions: providerOpts}, nil
+}
+
+// createAutoRoutedGoogleProvider creates a Google (Gemini) provider for
+// third-party providers that expose a Gemini-compatible API (e.g. opencode's
+// Gemini routes, which carry an @ai-sdk/google per-model override).
+//
+// The underlying genai SDK always injects its own API version segment
+// ("v1beta") between the base URL and the resource path. When the proxy's
+// base URL from models.dev already carries a version segment (e.g. opencode's
+// https://opencode.ai/zen/v1), that produces a doubled ".../v1/v1beta/..."
+// path that the proxy rejects. In that case we install a transport that
+// strips the injected segment so the proxy's own version is used.
+func createAutoRoutedGoogleProvider(ctx context.Context, config *ProviderConfig, modelName string, info *ProviderInfo) (*ProviderResult, error) {
+	apiKey, err := resolveAutoRouteAPIKey(config, info)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []google.Option{
+		google.WithGeminiAPIKey(apiKey),
+		google.WithName(info.ID),
+	}
+
+	if config.ProviderURL != "" {
+		opts = append(opts, google.WithBaseURL(config.ProviderURL))
+	}
+
+	// Decide whether the genai-injected version segment needs stripping.
+	var httpClient *http.Client
+	if basePath := versionedBasePath(config.ProviderURL); basePath != "" {
+		httpClient = newGeminiProxyHTTPClient(basePath, config.TLSSkipVerify)
+	} else if config.TLSSkipVerify {
+		httpClient = createHTTPClientWithTLSConfig(true)
+	}
+	if httpClient != nil {
+		opts = append(opts, google.WithHTTPClient(httpClient))
+	}
+
+	p, err := google.New(opts...)
+	if err != nil {
+		return nil, wrapProviderErr(info.Name, "provider", err)
+	}
+
+	model, err := p.LanguageModel(ctx, modelName)
+	if err != nil {
+		return nil, wrapProviderErr(info.Name, "model", err)
+	}
+
+	return &ProviderResult{Model: model}, nil
+}
+
+// versionSegmentRe matches a trailing API version segment in a URL path,
+// e.g. "/v1", "/v1beta", "/v1beta1", "/v2alpha".
+var versionSegmentRe = regexp.MustCompile(`/v\d+(?:beta\d*|alpha\d*)?$`)
+
+// versionedBasePath returns the path component of rawURL when that path ends
+// with an API version segment (e.g. opencode's ".../zen/v1" → "/zen/v1").
+// It returns "" when rawURL is empty, unparseable, or has no version suffix
+// — in which case the genai SDK's default version injection is correct and
+// no rewriting is needed.
+func versionedBasePath(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSuffix(u.Path, "/")
+	if versionSegmentRe.MatchString(path) {
+		return path
+	}
+	return ""
+}
+
+// newGeminiProxyHTTPClient builds an HTTP client whose transport strips the
+// genai-injected version segment ("v1beta"/"v1beta1") that directly follows
+// basePath, collapsing "{basePath}/v1beta/..." back to "{basePath}/...".
+func newGeminiProxyHTTPClient(basePath string, skipVerify bool) *http.Client {
+	var base http.RoundTripper
+	if skipVerify {
+		base = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	} else {
+		base = http.DefaultTransport
+	}
+	return &http.Client{
+		Transport: &geminiProxyTransport{base: base, basePath: basePath},
+	}
+}
+
+// geminiProxyTransport removes the redundant API version segment that the
+// genai SDK injects after a proxy base URL that already carries its own
+// version segment.
+type geminiProxyTransport struct {
+	base     http.RoundTripper
+	basePath string
+}
+
+func (t *geminiProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for _, injected := range []string{"/v1beta1", "/v1beta"} {
+		prefix := t.basePath + injected + "/"
+		if strings.HasPrefix(req.URL.Path, prefix) {
+			newReq := req.Clone(req.Context())
+			newReq.URL.Path = t.basePath + strings.TrimPrefix(req.URL.Path, t.basePath+injected)
+			return t.base.RoundTrip(newReq)
+		}
+	}
+	return t.base.RoundTrip(req)
 }
 
 // resolveAPIKey returns the first non-empty API key from the explicit key
@@ -530,7 +753,7 @@ func rightSizeMaxTokens(config *ProviderConfig, modelInfo *ModelInfo) {
 	if modelInfo == nil || modelInfo.Limit.Output <= 0 {
 		return
 	}
-	if isExplicitlySet("max-tokens") {
+	if isExplicitlySet(config.ConfigStore, "max-tokens") {
 		return
 	}
 	target := min(modelInfo.Limit.Output, defaultRightSizeCap)
@@ -709,7 +932,7 @@ func createAnthropicProvider(ctx context.Context, config *ProviderConfig, modelN
 	}
 
 	// Handle OAuth vs API key authentication
-	if strings.HasPrefix(source, "stored OAuth") {
+	if source == auth.CredentialSourceOAuth {
 		httpClient := createOAuthHTTPClient(apiKey, config.TLSSkipVerify)
 		opts = append(opts, anthropic.WithHTTPClient(httpClient))
 		// Note: For OAuth, the API key is set as a placeholder; the transport handles auth
@@ -719,12 +942,12 @@ func createAnthropicProvider(ctx context.Context, config *ProviderConfig, modelN
 
 	provider, err := anthropic.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Anthropic provider: %w", err)
+		return nil, wrapProviderErr("Anthropic", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Anthropic model: %w", err)
+		return nil, wrapProviderErr("Anthropic", "model", err)
 	}
 
 	// Build provider options for extended thinking (reasoning budget).
@@ -761,12 +984,12 @@ func createVertexAnthropicProvider(ctx context.Context, config *ProviderConfig, 
 
 	provider, err := anthropic.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Vertex Anthropic provider: %w", err)
+		return nil, wrapProviderErr("Vertex Anthropic", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Vertex Anthropic model: %w", err)
+		return nil, wrapProviderErr("Vertex Anthropic", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -834,18 +1057,84 @@ func createOpenAIProvider(ctx context.Context, config *ProviderConfig, modelName
 
 	provider, err := openai.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenAI provider: %w", err)
+		return nil, wrapProviderErr("OpenAI", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenAI model: %w", err)
+		return nil, wrapProviderErr("OpenAI", "model", err)
 	}
 
 	// Build provider options for OpenAI Responses API reasoning models.
 	providerOpts := buildOpenAIProviderOptions(config, modelName)
 
 	return &ProviderResult{Model: model, ProviderOptions: providerOpts}, nil
+}
+
+// createCopilotProvider builds a GitHub Copilot provider through fantasy's
+// OpenAI-compatible provider. The catalog key is github-copilot, but the public
+// model prefix may be either copilot/ or github-copilot/.
+//
+// Only gpt-* Copilot models are enabled here. The catalog also lists Claude and
+// Gemini Copilot models, but those require different wire protocols and must be
+// routed explicitly before they can be safely accepted.
+func createCopilotProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
+	if !strings.HasPrefix(modelName, "gpt-") {
+		return nil, fmt.Errorf("GitHub Copilot model %q is not supported yet: only gpt-* models use the OpenAI-compatible protocol", modelName)
+	}
+
+	cm, err := auth.NewCredentialManager()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize credential manager: %w", err)
+	}
+
+	token, err := cm.GetValidCopilotAccessTokenContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub Copilot credentials not available. Use 'kit auth login copilot': %w", err)
+	}
+
+	expiresAt := int64(0)
+	if creds, err := cm.GetCopilotCredentials(); err == nil && creds != nil && creds.CopilotAccessToken == token {
+		expiresAt = creds.ExpiresAt
+	}
+
+	baseURL := copilotBaseURL
+	if providerInfo := GetGlobalRegistry().GetProviderInfo(copilotProviderID); providerInfo != nil && providerInfo.API != "" {
+		baseURL = providerInfo.API
+	}
+	if config.ProviderURL != "" {
+		baseURL = config.ProviderURL
+	}
+
+	opts := []openai.Option{
+		openai.WithName(copilotAliasProviderID),
+		openai.WithBaseURL(baseURL),
+		openai.WithAPIKey(token),
+		openai.WithHTTPClient(createCopilotHTTPClient(token, expiresAt, config.TLSSkipVerify)),
+		openai.WithUseResponsesAPI(),
+		openai.WithResponsesAPIFunc(copilotUsesResponsesAPI),
+		openai.WithObjectMode(fantasy.ObjectModeTool),
+	}
+
+	provider, err := openai.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GitHub Copilot provider: %w", err)
+	}
+
+	model, err := provider.LanguageModel(ctx, modelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GitHub Copilot model: %w", err)
+	}
+
+	providerOpts := buildOpenAIProviderOptions(config, modelName)
+
+	return &ProviderResult{Model: model, ProviderOptions: providerOpts}, nil
+}
+
+// copilotUsesResponsesAPI selects the OpenAI Responses API for Copilot models
+// known to support it. Non-gpt models are rejected before provider creation.
+func copilotUsesResponsesAPI(modelID string) bool {
+	return strings.HasPrefix(modelID, "gpt-5")
 }
 
 // createOpenAICodexProvider creates a provider for ChatGPT/Codex OAuth tokens.
@@ -875,12 +1164,12 @@ func createOpenAICodexProvider(ctx context.Context, config *ProviderConfig, mode
 
 	provider, err := openai.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenAI Codex provider: %w", err)
+		return nil, wrapProviderErr("OpenAI Codex", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenAI Codex model: %w", err)
+		return nil, wrapProviderErr("OpenAI Codex", "model", err)
 	}
 
 	providerOpts := buildCodexProviderOptions(config, modelName)
@@ -977,6 +1266,87 @@ func (t *codexTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(newReq)
 }
 
+// createCopilotHTTPClient returns an HTTP client that injects Copilot-specific
+// authorization and client metadata headers. The token and expiry are cached in
+// the transport so streaming requests do not hit credentials.json on every
+// RoundTrip; the credential manager is consulted only near expiry.
+func createCopilotHTTPClient(token string, expiresAt int64, skipVerify bool) *http.Client {
+	var base http.RoundTripper
+	if skipVerify {
+		base = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	} else {
+		base = http.DefaultTransport
+	}
+
+	return &http.Client{
+		Transport: &copilotTransport{
+			base:      base,
+			token:     token,
+			expiresAt: expiresAt,
+		},
+		Timeout: 120 * time.Second,
+	}
+}
+
+// copilotTransport decorates requests for api.githubcopilot.com.
+//
+// It owns a cached Copilot access token. When the token is still valid, the hot
+// path is in-memory only. Near expiry it refreshes through CredentialManager,
+// which updates both the cache here and credentials.json.
+type copilotTransport struct {
+	base      http.RoundTripper
+	token     string
+	expiresAt int64
+	mu        sync.Mutex
+}
+
+func (t *copilotTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	token := t.cachedToken(req.Context())
+
+	newReq := req.Clone(req.Context())
+	newReq.Header.Set("Authorization", "Bearer "+token)
+	newReq.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
+	newReq.Header.Set("Editor-Version", copilotEditorVersion)
+	newReq.Header.Set("Editor-Plugin-Version", copilotEditorPluginVersion)
+	newReq.Header.Set("Openai-Intent", copilotOpenAIIntent)
+	newReq.Header.Set("User-Agent", copilotUserAgent)
+	newReq.Header.Set("X-GitHub-Api-Version", copilotGitHubAPIVersion)
+
+	return t.base.RoundTrip(newReq)
+}
+
+// cachedToken returns the cached token unless it is within the five-minute
+// refresh window. Refresh errors fall back to the last token so the request can
+// surface any authoritative auth failure from the Copilot API.
+func (t *copilotTransport) cachedToken(ctx context.Context) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.expiresAt == 0 || time.Now().Unix() < t.expiresAt-300 {
+		return t.token
+	}
+
+	cm, err := auth.NewCredentialManager()
+	if err != nil {
+		return t.token
+	}
+
+	fresh, err := cm.GetValidCopilotAccessTokenContext(ctx)
+	if err != nil || fresh == "" {
+		return t.token
+	}
+
+	t.token = fresh
+	if creds, err := cm.GetCopilotCredentials(); err == nil && creds != nil && creds.CopilotAccessToken == fresh {
+		t.expiresAt = creds.ExpiresAt
+	}
+	return t.token
+}
+
 func createGoogleProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
 	apiKey := firstNonEmpty(
 		config.ProviderAPIKey,
@@ -993,12 +1363,12 @@ func createGoogleProvider(ctx context.Context, config *ProviderConfig, modelName
 
 	provider, err := google.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Google provider: %w", err)
+		return nil, wrapProviderErr("Google", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Google model: %w", err)
+		return nil, wrapProviderErr("Google", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1031,12 +1401,12 @@ func createAzureProvider(ctx context.Context, config *ProviderConfig, modelName 
 
 	provider, err := azure.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Azure OpenAI provider: %w", err)
+		return nil, wrapProviderErr("Azure OpenAI", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Azure OpenAI model: %w", err)
+		return nil, wrapProviderErr("Azure OpenAI", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1056,12 +1426,12 @@ func createOpenRouterProvider(ctx context.Context, config *ProviderConfig, model
 
 	provider, err := openrouter.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenRouter provider: %w", err)
+		return nil, wrapProviderErr("OpenRouter", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenRouter model: %w", err)
+		return nil, wrapProviderErr("OpenRouter", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1073,12 +1443,12 @@ func createBedrockProvider(ctx context.Context, config *ProviderConfig, modelNam
 	// Bedrock uses AWS SDK default credential chain (env vars, shared config, etc.)
 	provider, err := bedrock.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Bedrock provider: %w", err)
+		return nil, wrapProviderErr("Bedrock", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Bedrock model: %w", err)
+		return nil, wrapProviderErr("Bedrock", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1102,12 +1472,12 @@ func createVercelProvider(ctx context.Context, config *ProviderConfig, modelName
 
 	provider, err := vercel.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Vercel provider: %w", err)
+		return nil, wrapProviderErr("Vercel", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Vercel model: %w", err)
+		return nil, wrapProviderErr("Vercel", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1160,12 +1530,17 @@ func createCustomProvider(ctx context.Context, config *ProviderConfig, modelName
 
 	p, err := openai.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create custom provider: %w", err)
+		return nil, wrapProviderErr("custom", "provider", err)
 	}
 
-	model, err := p.LanguageModel(ctx, modelName)
+	apiModelName := modelName
+	if modelInfo != nil && modelInfo.APIModelName != "" {
+		apiModelName = modelInfo.APIModelName
+	}
+
+	model, err := p.LanguageModel(ctx, apiModelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create custom model: %w", err)
+		return nil, wrapProviderErr("custom", "model", err)
 	}
 
 	return &ProviderResult{Model: model}, nil
@@ -1209,12 +1584,12 @@ func createOllamaProvider(ctx context.Context, config *ProviderConfig, modelName
 
 	provider, err := openaicompat.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Ollama provider: %w", err)
+		return nil, wrapProviderErr("Ollama", "provider", err)
 	}
 
 	model, err := provider.LanguageModel(ctx, modelName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Ollama model: %w", err)
+		return nil, wrapProviderErr("Ollama", "model", err)
 	}
 
 	return &ProviderResult{

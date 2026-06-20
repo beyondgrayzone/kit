@@ -49,6 +49,37 @@ The SDK behaves identically to the CLI:
 - Respects all environment variables (`KIT_*`)
 - Uses the same defaults as the CLI
 
+Each `kit.New` / `kit.NewAgent` call owns an **isolated configuration store**,
+so constructing multiple Kit instances in the same process is safe — setting
+the model, thinking level, or generation parameters on one never affects
+another, and runtime mutators (`SetModel`, `SetThinkingLevel`) only touch the
+owning instance. This makes subagent spawning and multi-Kit embedding race-free
+without external synchronization.
+
+### Functional options (`NewAgent`)
+
+For simple programmatic setups, `kit.NewAgent` is an ergonomic
+functional-options front door over `kit.New`. Streaming is enabled by default;
+pass `kit.WithStreaming(false)` to opt out.
+
+```go
+host, err := kit.NewAgent(ctx,
+    kit.WithModel("anthropic/claude-sonnet-4-5-20250929"),
+    kit.WithSystemPrompt("You are a helpful assistant."),
+    kit.WithMaxTokens(8192),
+    kit.WithThinkingLevel("medium"),
+    kit.Ephemeral(), // in-memory session, no persistence
+)
+```
+
+Helpers: `WithModel`, `WithSystemPrompt`, `WithStreaming`, `WithMaxTokens`,
+`WithThinkingLevel`, `WithTools`, `WithExtraTools`, `WithProviderAPIKey`,
+`WithProviderURL`, `WithConfigFile`, `WithDebug`, `WithDebugLogger`, and
+`Ephemeral`. `Option` is
+a plain `func(*Options)`, so you can define your own. For fields without a
+`With*` helper (`MCPConfig`, `InProcessMCPServers`, `SessionManager`, MCP task
+tuning) construct an `Options` value and call `kit.New`.
+
 ### Options
 
 You can override specific settings:
@@ -59,7 +90,7 @@ host, err := kit.New(ctx, &kit.Options{
     SystemPrompt: "You are a helpful bot",    // Override system prompt
     ConfigFile:   "/path/to/config.yml",      // Use specific config file
     MaxSteps:     10,                         // Override max steps
-    Streaming:    true,                       // Enable streaming
+    Streaming:    ptrBool(true),               // *bool: nil = unset (default true), &false = off
     Quiet:        true,                       // Suppress debug output
 
     // Session options
@@ -241,6 +272,43 @@ response, _ := host.Prompt(ctx, "What's my name?")
 host.ClearSession()
 ```
 
+### Runtime Skills and Context Files
+
+For multi-tenant chatbots, web services, or any host that needs per-user or
+per-session instructions, the SDK lets you add, remove, and replace skills and
+project context files (e.g. `AGENTS.md`) **after** Kit construction. Every
+mutation recomposes the system prompt and applies it to the agent so the next
+turn picks up the new instructions — no restart required.
+
+```go
+// Add a programmatic skill (no file on disk required).
+host.AddSkill(&kit.Skill{
+    Name:        "polite-french",
+    Description: "Respond in French and always greet the user.",
+    Content:     "Always reply in French. Open every response with 'Bonjour'.",
+})
+
+// Or load one from disk.
+host.LoadAndAddSkill("/var/skills/refund-policy.md")
+
+// Swap per-user AGENTS.md content fetched from your database.
+host.AddContextFileContent(
+    fmt.Sprintf("session://%s/AGENTS.md", userID),
+    rulesFromDB,
+)
+
+// Tear down session-specific state when the user logs off.
+host.RemoveSkill("polite-french")
+host.RemoveContextFile(fmt.Sprintf("session://%s/AGENTS.md", userID))
+
+// Or replace the whole set in one shot.
+host.SetSkills(activeSkillsForUser)
+host.SetContextFiles(activeContextForUser)
+```
+
+Readers (`GetSkills`, `GetContextFiles`) return snapshots, and every mutator
+is safe to call concurrently from multiple goroutines.
+
 ## Re-exported Types
 
 The SDK re-exports message/session/MCP types so you don't need direct internal imports. Agent-configuration types are Kit-owned (not aliases) and use only SDK types in their signatures, so consumers never need to import the underlying LLM-provider package.
@@ -262,7 +330,6 @@ kit.LLMFilePart     // {Filename, Data []byte, MediaType}
 // Agent configuration — concrete Kit-owned structs and function types.
 // All fields use SDK types (e.g. `[]kit.Tool`), so consumers can construct
 // these without importing any LLM-provider package.
-kit.AgentConfig              // Lower-level agent config — prefer Options unless you need direct control
 kit.DebugLogger              // Interface: LogDebug(string) / IsDebugEnabled() bool
 kit.MCPTaskConfig            // Task-aware MCP tools/call config (modes, polling, progress)
 kit.ToolCallHandler          // func(toolCallID, toolName, toolArgs string)
@@ -294,16 +361,31 @@ msg  := kit.ConvertFromLLMMessage(lMsg)  // LLMMessage  → SDK Message
 
 - `Kit` - Main SDK type
 - `Options` - Configuration options
+- `Option` - Functional option (`func(*Options)`) for `NewAgent`
 - `Message` - Conversation message with typed content parts
 - `Tool` - Agent tool interface
-- `TurnResult` - Full result from a prompt including usage stats
+- `TurnResult` - Full result from a prompt including usage stats, captured
+  stream deltas (`Stream`), and any tool-driven halt (`FinalValue` /
+  `HaltedByTool`)
+- `StreamEvent` / `StreamEventKind` - Ordered delta events captured in
+  `TurnResult.Stream`
+- `ToolOutput` - Custom tool return value; set `Halt`/`FinalValue` to end the
+  agent loop and surface a typed result
+- Provider-error sentinels - `ErrContextOverflow`, `ErrRateLimit`, `ErrAuth`,
+  `ErrProviderUnavailable`, `ErrInvalidRequest`; classify with
+  `ClassifyProviderError(err)` and match via `errors.Is`
 
 ### Key Methods
 
 - `New(ctx, opts)` - Create new Kit instance
+- `NewAgent(ctx, ...Option)` - Create a Kit via functional options (streaming on by default)
 - `Prompt(ctx, message)` - Send message and get response string
-- `PromptResult(ctx, message)` - Send message and get full TurnResult
+- `PromptResult(ctx, message)` - Send message and get full TurnResult (blocks
+  until end-of-turn; populates `TurnResult.Stream` in streaming mode)
 - `PromptWithOptions(ctx, message, opts)` - Prompt with per-call options
+  (system message, model, thinking level, provider credentials, extra tools)
+- `PromptResultWithOptions(ctx, message, opts)` - Per-call options variant that
+  returns the full TurnResult
 - `Steer(ctx, instruction)` - System-level steering
 - `FollowUp(ctx, text)` - Continue without new user input
 - `SetModel(ctx, model)` - Switch model at runtime
@@ -312,7 +394,18 @@ msg  := kit.ConvertFromLLMMessage(lMsg)  // LLMMessage  → SDK Message
 - `ClearSession()` - Clear conversation history
 - `GetSessionPath()` - Get session file path
 - `GetSessionID()` - Get session UUID
+- `AddSkill(*Skill)` / `LoadAndAddSkill(path)` / `RemoveSkill(name)` / `SetSkills([])` - Manage skills at runtime
+- `AddContextFile(*ContextFile)` / `AddContextFileContent(path, content)` / `LoadAndAddContextFile(path)` / `RemoveContextFile(path)` / `SetContextFiles([])` - Manage AGENTS.md-style context files at runtime
+- `RefreshSystemPrompt()` - Re-apply the composed system prompt to the agent
+- `NewTool[T]` / `NewParallelTool[T]` - Create a typed custom tool
+- `NewRawTool(name, desc, schema, fn)` - Create a schema-driven tool when the
+  input shape isn't known at compile time (skill/MCP catalogs)
+- `LoadSkillsFromFS(fsys, root)` - `fs.FS`-typed skill loader (embed.FS,
+  fstest.MapFS, per-tenant virtual filesystems)
+- `CollapseBranch(fromID, toID, summary)` - Collapse a branch range into a
+  summary (works with any `SessionManager` via `AppendBranchSummary`)
 - `Close()` - Clean up resources
+- `CloseContext(ctx)` - Clean up resources with a shutdown deadline
 
 ### Options
 
@@ -331,7 +424,8 @@ Key `Options` fields for SDK usage:
 | `SessionPath` | Open specific session file |
 | `Continue` | Resume most recent session |
 | `InProcessMCPServers` | Map of name → `*kit.MCPServer` for in-process MCP servers |
-| `Debug` | Enable debug logging |
+| `Debug` | Enable debug logging via the built-in console logger (ignored when `DebugLogger` is set) |
+| `DebugLogger` | Custom `DebugLogger` implementation — routes engine + MCP debug output into your own logging system |
 
 ## Environment Variables
 

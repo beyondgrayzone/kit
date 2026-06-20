@@ -28,6 +28,11 @@ func Symbols() interp.Exports {
 			"CommandDef":     reflect.ValueOf((*CommandDef)(nil)),
 			"PrintBlockOpts": reflect.ValueOf((*PrintBlockOpts)(nil)),
 
+			// Sentinel errors. Extensions detect them with errors.Is:
+			//
+			//   if errors.Is(err, ext.ErrAgentBusy) { ... }
+			"ErrAgentBusy": reflect.ValueOf(&ErrAgentBusy).Elem(),
+
 			// Session types
 			"SessionMessage": reflect.ValueOf((*SessionMessage)(nil)),
 			"ExtensionEntry": reflect.ValueOf((*ExtensionEntry)(nil)),
@@ -183,6 +188,7 @@ func Symbols() interp.Exports {
 			"RetryEvent":          reflect.ValueOf((*RetryEvent)(nil)),
 			"PrepareStepEvent":    reflect.ValueOf((*PrepareStepEvent)(nil)),
 			"PrepareStepResult":   reflect.ValueOf((*PrepareStepResult)(nil)),
+			"LLMUsageEvent":       reflect.ValueOf((*LLMUsageEvent)(nil)),
 		},
 	}
 }

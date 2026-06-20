@@ -3,6 +3,8 @@ package kit
 import (
 	"encoding/json"
 	"sync"
+
+	"github.com/mark3labs/kit/extensions"
 )
 
 // ---------------------------------------------------------------------------
@@ -103,34 +105,21 @@ type Event interface {
 // appropriate visualizations (e.g. diff view for edit tools, command+output
 // for execute tools) and file trackers to identify which results contain
 // modifications.
+//
+// These constants re-export the canonical classification used by extension
+// events, so SDK events and extension events always agree.
 const (
-	ToolKindExecute  = "execute" // Shell execution (bash)
-	ToolKindEdit     = "edit"    // File modification (edit, write)
-	ToolKindRead     = "read"    // File reading (read, ls)
-	ToolKindSearch   = "search"  // Content/file search (grep, find)
-	ToolKindSubagent = "agent"   // Subagent spawning (subagent)
+	ToolKindExecute  = extensions.ToolKindExecute  // Shell execution (bash)
+	ToolKindEdit     = extensions.ToolKindEdit     // File modification (edit, write)
+	ToolKindRead     = extensions.ToolKindRead     // File reading (read, ls)
+	ToolKindSearch   = extensions.ToolKindSearch   // Content/file search (grep, find)
+	ToolKindSubagent = extensions.ToolKindSubagent // Subagent spawning (subagent)
 )
-
-// coreToolKinds maps built-in tool names to their kind. MCP and extension
-// tools without an entry default to ToolKindExecute.
-var coreToolKinds = map[string]string{
-	"bash":     ToolKindExecute,
-	"edit":     ToolKindEdit,
-	"write":    ToolKindEdit,
-	"read":     ToolKindRead,
-	"ls":       ToolKindRead,
-	"grep":     ToolKindSearch,
-	"find":     ToolKindSearch,
-	"subagent": ToolKindSubagent,
-}
 
 // toolKindFor returns the ToolKind for a given tool name, defaulting to
 // ToolKindExecute for unknown tools.
 func toolKindFor(toolName string) string {
-	if kind, ok := coreToolKinds[toolName]; ok {
-		return kind
-	}
-	return ToolKindExecute
+	return extensions.ToolKindFor(toolName)
 }
 
 // parseToolArgs attempts to parse a JSON-encoded tool args string into a map.
@@ -381,7 +370,10 @@ type StepUsageEvent struct {
 // EventType implements Event.
 func (e StepUsageEvent) EventType() EventType { return EventStepUsage }
 
-// CompactionEvent fires after a successful compaction.
+// CompactionEvent fires after a compaction attempt. On success Err is nil and
+// the summary/token/file fields are populated. On failure Err is non-nil and
+// the remaining fields are zero-valued, so embedders can wire symmetric
+// start/end lifecycle telemetry around both outcomes.
 type CompactionEvent struct {
 	Summary         string
 	OriginalTokens  int
@@ -389,6 +381,10 @@ type CompactionEvent struct {
 	MessagesRemoved int
 	ReadFiles       []string
 	ModifiedFiles   []string
+
+	// Err is non-nil when compaction failed. On the failure path the other
+	// fields are zero-valued.
+	Err error
 }
 
 // EventType implements Event.
@@ -571,67 +567,56 @@ func (eb *eventBus) emit(event Event) {
 // Typed convenience subscribers
 // ---------------------------------------------------------------------------
 
+// subscribeTyped is the generic backbone of all the typed `On<EventName>`
+// convenience methods on *Kit. It wraps Subscribe with a type assertion
+// against E so handlers receive a strongly-typed event without each
+// public method having to repeat the boilerplate. Returns an unsubscribe
+// function.
+func subscribeTyped[E Event](k *Kit, handler func(E)) func() {
+	return k.Subscribe(func(e Event) {
+		if tev, ok := e.(E); ok {
+			handler(tev)
+		}
+	})
+}
+
 // OnToolCall registers a handler that fires only for ToolCallEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolCall(handler func(ToolCallEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tc, ok := e.(ToolCallEvent); ok {
-			handler(tc)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolCallStart registers a handler that fires only for ToolCallStartEvent.
 // This fires when the LLM begins generating tool call arguments — before the
 // full argument JSON is available. Returns an unsubscribe function.
 func (m *Kit) OnToolCallStart(handler func(ToolCallStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tcs, ok := e.(ToolCallStartEvent); ok {
-			handler(tcs)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolCallDelta registers a handler that fires only for ToolCallDeltaEvent.
 // Each delta contains a JSON fragment of tool call arguments as they stream in.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolCallDelta(handler func(ToolCallDeltaEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tcd, ok := e.(ToolCallDeltaEvent); ok {
-			handler(tcd)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolCallEnd registers a handler that fires only for ToolCallEndEvent.
 // This fires when tool argument streaming is complete, before the tool call
 // is parsed and execution begins. Returns an unsubscribe function.
 func (m *Kit) OnToolCallEnd(handler func(ToolCallEndEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tce, ok := e.(ToolCallEndEvent); ok {
-			handler(tce)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolResult registers a handler that fires only for ToolResultEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolResult(handler func(ToolResultEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tr, ok := e.(ToolResultEvent); ok {
-			handler(tr)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolOutput registers a handler that fires only for ToolOutputEvent
 // (streaming tool output chunks, e.g., from bash). Returns an unsubscribe function.
 func (m *Kit) OnToolOutput(handler func(ToolOutputEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if to, ok := e.(ToolOutputEvent); ok {
-			handler(to)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnStreaming registers a handler that fires only for MessageUpdateEvent
@@ -646,41 +631,25 @@ func (m *Kit) OnStreaming(handler func(MessageUpdateEvent)) func() {
 // OnMessageUpdate registers a handler that fires only for MessageUpdateEvent
 // (streaming text chunks). Returns an unsubscribe function.
 func (m *Kit) OnMessageUpdate(handler func(MessageUpdateEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if mu, ok := e.(MessageUpdateEvent); ok {
-			handler(mu)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnResponse registers a handler that fires only for ResponseEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnResponse(handler func(ResponseEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if r, ok := e.(ResponseEvent); ok {
-			handler(r)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnTurnStart registers a handler that fires only for TurnStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnTurnStart(handler func(TurnStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ts, ok := e.(TurnStartEvent); ok {
-			handler(ts)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnTurnEnd registers a handler that fires only for TurnEndEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnTurnEnd(handler func(TurnEndEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if te, ok := e.(TurnEndEvent); ok {
-			handler(te)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // ---------------------------------------------------------------------------
@@ -690,101 +659,61 @@ func (m *Kit) OnTurnEnd(handler func(TurnEndEvent)) func() {
 // OnMessageStart registers a handler that fires only for MessageStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnMessageStart(handler func(MessageStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ms, ok := e.(MessageStartEvent); ok {
-			handler(ms)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnMessageEnd registers a handler that fires only for MessageEndEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnMessageEnd(handler func(MessageEndEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if me, ok := e.(MessageEndEvent); ok {
-			handler(me)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnReasoningDelta registers a handler that fires only for ReasoningDeltaEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnReasoningDelta(handler func(ReasoningDeltaEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if rd, ok := e.(ReasoningDeltaEvent); ok {
-			handler(rd)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnReasoningComplete registers a handler that fires only for ReasoningCompleteEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnReasoningComplete(handler func(ReasoningCompleteEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if rc, ok := e.(ReasoningCompleteEvent); ok {
-			handler(rc)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolExecutionStart registers a handler that fires only for ToolExecutionStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolExecutionStart(handler func(ToolExecutionStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tes, ok := e.(ToolExecutionStartEvent); ok {
-			handler(tes)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolExecutionEnd registers a handler that fires only for ToolExecutionEndEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolExecutionEnd(handler func(ToolExecutionEndEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tee, ok := e.(ToolExecutionEndEvent); ok {
-			handler(tee)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnToolCallContent registers a handler that fires only for ToolCallContentEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnToolCallContent(handler func(ToolCallContentEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if tcc, ok := e.(ToolCallContentEvent); ok {
-			handler(tcc)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnStepUsage registers a handler that fires only for StepUsageEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnStepUsage(handler func(StepUsageEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if su, ok := e.(StepUsageEvent); ok {
-			handler(su)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnCompaction registers a handler that fires only for CompactionEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnCompaction(handler func(CompactionEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ce, ok := e.(CompactionEvent); ok {
-			handler(ce)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnSteerConsumed registers a handler that fires only for SteerConsumedEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnSteerConsumed(handler func(SteerConsumedEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if sc, ok := e.(SteerConsumedEvent); ok {
-			handler(sc)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // ---------------------------------------------------------------------------
@@ -794,101 +723,61 @@ func (m *Kit) OnSteerConsumed(handler func(SteerConsumedEvent)) func() {
 // OnStepStart registers a handler that fires only for StepStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnStepStart(handler func(StepStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ss, ok := e.(StepStartEvent); ok {
-			handler(ss)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnStepFinish registers a handler that fires only for StepFinishEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnStepFinish(handler func(StepFinishEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if sf, ok := e.(StepFinishEvent); ok {
-			handler(sf)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnTextStart registers a handler that fires only for TextStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnTextStart(handler func(TextStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ts, ok := e.(TextStartEvent); ok {
-			handler(ts)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnTextEnd registers a handler that fires only for TextEndEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnTextEnd(handler func(TextEndEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if te, ok := e.(TextEndEvent); ok {
-			handler(te)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnReasoningStart registers a handler that fires only for ReasoningStartEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnReasoningStart(handler func(ReasoningStartEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if rs, ok := e.(ReasoningStartEvent); ok {
-			handler(rs)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnWarnings registers a handler that fires only for WarningsEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnWarnings(handler func(WarningsEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if w, ok := e.(WarningsEvent); ok {
-			handler(w)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnSource registers a handler that fires only for SourceEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnSource(handler func(SourceEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if s, ok := e.(SourceEvent); ok {
-			handler(s)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnStreamFinish registers a handler that fires only for StreamFinishEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnStreamFinish(handler func(StreamFinishEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if sf, ok := e.(StreamFinishEvent); ok {
-			handler(sf)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnError registers a handler that fires only for ErrorEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnError(handler func(ErrorEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if ee, ok := e.(ErrorEvent); ok {
-			handler(ee)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // OnRetry registers a handler that fires only for RetryEvent.
 // Returns an unsubscribe function.
 func (m *Kit) OnRetry(handler func(RetryEvent)) func() {
-	return m.Subscribe(func(e Event) {
-		if r, ok := e.(RetryEvent); ok {
-			handler(r)
-		}
-	})
+	return subscribeTyped(m, handler)
 }
 
 // ---------------------------------------------------------------------------

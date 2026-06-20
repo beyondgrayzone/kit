@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/fantasy"
@@ -168,9 +169,9 @@ type RetryHandler func(attempt int, err error)
 type PrepareStepHandler func(stepNumber int, messages []fantasy.Message) []fantasy.Message
 
 // GenerateCallbacks consolidates all callback functions for
-// GenerateWithLoopAndStreaming into a single struct. This replaces the previous
-// 16+ positional callback parameters, making it easier to add new callbacks
-// without breaking existing callers (new fields default to nil).
+// GenerateWithCallbacks into a single struct, replacing what was previously
+// 16+ positional callback parameters. New fields default to nil, so adding
+// new callbacks does not break existing callers.
 type GenerateCallbacks struct {
 	OnToolCall          ToolCallHandler
 	OnToolExecution     ToolExecutionHandler
@@ -245,6 +246,12 @@ type Agent struct {
 	mcpReady chan struct{}
 	// mcpErr holds any error from background MCP loading.
 	mcpErr error
+
+	// promptMu serializes runtime updates to systemPrompt and the
+	// accompanying fantasy agent rebuild so concurrent SetSystemPrompt
+	// callers (e.g. Kit.applyComposedSystemPrompt invoked from multiple
+	// goroutines) don't race on a.systemPrompt / a.fantasyAgent.
+	promptMu sync.Mutex
 }
 
 // GenerateWithLoopResult contains the result and conversation history from an agent interaction.
@@ -515,44 +522,6 @@ func (a *Agent) GenerateWithLoop(ctx context.Context, messages []fantasy.Message
 	})
 }
 
-// GenerateWithLoopAndStreaming processes messages using the agent with streaming and callbacks.
-// The agent handles the tool call loop internally.
-//
-// Deprecated: Use GenerateWithCallbacks instead, which takes a GenerateCallbacks
-// struct and is easier to extend with new callbacks.
-func (a *Agent) GenerateWithLoopAndStreaming(ctx context.Context, messages []fantasy.Message,
-	onToolCall ToolCallHandler, onToolExecution ToolExecutionHandler, onToolResult ToolResultHandler,
-	onResponse ResponseHandler, onToolCallContent ToolCallContentHandler,
-	onStreamingResponse StreamingResponseHandler,
-	onReasoningDelta ReasoningDeltaHandler,
-	onReasoningComplete ReasoningCompleteHandler,
-	onToolOutput ToolOutputHandler,
-	onStepMessages StepMessagesHandler,
-	onStepUsage StepUsageHandler,
-	onPasswordPrompt PasswordPromptHandler,
-	onToolCallStart ToolCallStartHandler,
-	onToolCallDelta ToolCallDeltaHandler,
-	onToolCallEnd ToolCallEndHandler,
-) (*GenerateWithLoopResult, error) {
-	return a.GenerateWithCallbacks(ctx, messages, GenerateCallbacks{
-		OnToolCall:          onToolCall,
-		OnToolExecution:     onToolExecution,
-		OnToolResult:        onToolResult,
-		OnResponse:          onResponse,
-		OnToolCallContent:   onToolCallContent,
-		OnStreamingResponse: onStreamingResponse,
-		OnReasoningDelta:    onReasoningDelta,
-		OnReasoningComplete: onReasoningComplete,
-		OnToolOutput:        onToolOutput,
-		OnStepMessages:      onStepMessages,
-		OnStepUsage:         onStepUsage,
-		OnPasswordPrompt:    onPasswordPrompt,
-		OnToolCallStart:     onToolCallStart,
-		OnToolCallDelta:     onToolCallDelta,
-		OnToolCallEnd:       onToolCallEnd,
-	})
-}
-
 // GenerateWithCallbacks processes messages using the agent with streaming and callbacks.
 // The agent handles the tool call loop internally. We map the rich callback system
 // to kit's existing callback interface for UI integration.
@@ -585,8 +554,13 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 	// This avoids type conflicts with provider-level options.
 	history = applyCacheControlToMessages(history)
 
-	// Track current tool call args for callbacks
-	var currentToolArgs string
+	// Track tool call args per-ToolCallID so parallel tool calls in a single
+	// step don't clobber each other. Without this, OnToolResult callbacks would
+	// all see the args of the last OnToolCall in the step. The mutex guards
+	// against the possibility that the underlying streaming layer dispatches
+	// callbacks from multiple goroutines.
+	toolCallArgs := make(map[string]string)
+	var toolCallArgsMu sync.Mutex
 
 	// Use the streaming path when streaming is enabled OR when any callbacks are
 	// provided. The agent only exposes tool/step callbacks on AgentStreamCall, so
@@ -773,7 +747,9 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				currentToolArgs = tc.Input
+				toolCallArgsMu.Lock()
+				toolCallArgs[tc.ToolCallID] = tc.Input
+				toolCallArgsMu.Unlock()
 
 				// Notify about the tool call
 				if cb.OnToolCall != nil {
@@ -793,15 +769,22 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
+				// Look up the args recorded for this specific tool call. Delete
+				// the entry so the map doesn't accumulate across steps.
+				toolCallArgsMu.Lock()
+				args := toolCallArgs[tr.ToolCallID]
+				delete(toolCallArgs, tr.ToolCallID)
+				toolCallArgsMu.Unlock()
+
 				// Notify tool execution finished
 				if cb.OnToolExecution != nil {
-					cb.OnToolExecution(tr.ToolCallID, tr.ToolName, currentToolArgs, false)
+					cb.OnToolExecution(tr.ToolCallID, tr.ToolName, args, false)
 				}
 
 				if cb.OnToolResult != nil {
 					// Extract result text and error status
 					resultText, isError := extractToolResultText(tr)
-					cb.OnToolResult(tr.ToolCallID, tr.ToolName, currentToolArgs, resultText, tr.ClientMetadata, isError)
+					cb.OnToolResult(tr.ToolCallID, tr.ToolName, args, resultText, tr.ClientMetadata, isError)
 				}
 
 				return nil
@@ -1122,6 +1105,18 @@ func (a *Agent) GetExtensionToolCount() int {
 	return len(a.extraTools)
 }
 
+// GetExtraTools returns the agent's current extra tools (e.g.
+// extension-registered tools). The returned slice is a copy so callers can
+// snapshot and later restore it via SetExtraTools.
+func (a *Agent) GetExtraTools() []fantasy.AgentTool {
+	if len(a.extraTools) == 0 {
+		return nil
+	}
+	out := make([]fantasy.AgentTool, len(a.extraTools))
+	copy(out, a.extraTools)
+	return out
+}
+
 // SetExtraTools replaces the agent's extra tools (e.g. extension-registered
 // tools) and rebuilds the internal agent with the updated tool list. The
 // model, system prompt, and all other configuration are preserved.
@@ -1301,6 +1296,24 @@ func (a *Agent) SetModel(ctx context.Context, config *models.ProviderConfig) err
 // GetModel returns the underlying LanguageModel.
 func (a *Agent) GetModel() fantasy.LanguageModel {
 	return a.model
+}
+
+// SetSystemPrompt updates the agent's system prompt and rebuilds the underlying
+// fantasy agent so subsequent turns use the new prompt. Safe to call while the
+// agent is idle; if invoked during an in-flight turn the new prompt takes
+// effect on the next LLM call.
+func (a *Agent) SetSystemPrompt(prompt string) {
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
+	a.systemPrompt = prompt
+	a.rebuildFantasyAgent()
+}
+
+// GetSystemPrompt returns the agent's current system prompt.
+func (a *Agent) GetSystemPrompt() string {
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
+	return a.systemPrompt
 }
 
 // GetMaxTokens returns the effective max output tokens the agent currently

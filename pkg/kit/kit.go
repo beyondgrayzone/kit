@@ -23,6 +23,7 @@ import (
 	"github.com/mark3labs/kit/internal/models"
 	"github.com/mark3labs/kit/internal/session"
 	"github.com/mark3labs/kit/internal/skills"
+	"github.com/mark3labs/kit/internal/skilltool"
 	"github.com/mark3labs/kit/internal/tools"
 
 	"github.com/spf13/viper"
@@ -53,6 +54,14 @@ type Kit struct {
 	opts           *Options       // stored for reload operations (skills, etc.)
 	mcpConfig      *config.Config // loaded MCP/server config, shared with subagents
 
+	// v is this Kit instance's isolated configuration store. Each Kit owns its
+	// own *viper.Viper (constructed via viper.New) so that runtime config
+	// mutators (SetModel, SetThinkingLevel) and config reads do not clobber or
+	// observe state from other Kit instances in the same process. When the CLI
+	// constructs a Kit (Options.CLI != nil) this points at the process-global
+	// store so cobra flag bindings remain in effect.
+	v *viper.Viper
+
 	// hasCustomSystemPrompt is true when the user explicitly configured a
 	// system prompt (via --system-prompt flag, config file, or SDK option).
 	// When false, per-model system prompts from modelSettings/customModels
@@ -61,6 +70,11 @@ type Kit struct {
 	// systemPromptSource holds the raw configured value (file path or text)
 	// when hasCustomSystemPrompt is true; empty when the built-in default is in use.
 	systemPromptSource string
+	// basePrompt holds the resolved base system prompt text (post file-load,
+	// pre runtime-context composition) captured during New. Used by
+	// RefreshSystemPrompt to recompose after skills/context-file mutations.
+	// Protected by runtimeMu.
+	basePrompt string
 
 	// Hook registries — interception layer (see hooks.go).
 	beforeToolCall  *hookRegistry[BeforeToolCallHook, BeforeToolCallResult]
@@ -90,12 +104,23 @@ type Kit struct {
 		mu     sync.RWMutex
 	}
 
+	// runtimeMu protects contextFiles and skills against concurrent runtime
+	// mutations via AddSkill / RemoveSkill / AddContextFile etc. The fields
+	// are read by composeSystemPrompt and several other accessors, so all
+	// reads and writes after Kit construction must take this lock.
+	runtimeMu sync.RWMutex
+
 	// steerCh is a buffered channel used to inject steering messages into
 	// the running agent turn via the LLM library's PrepareStep. Created fresh for
 	// each generate() call and set to nil when idle. Protected by steerMu.
 	steerMu       sync.Mutex
 	steerCh       chan agent.SteerMessage
 	leftoverSteer []agent.SteerMessage // unconsumed steer messages from the last turn
+
+	// promptOptsMu serializes per-call PromptOptions overrides that mutate
+	// shared agent state (model, thinking level, provider creds, extra tools)
+	// so the apply/restore window of one call never races another.
+	promptOptsMu sync.Mutex
 }
 
 // Subscribe registers an EventListener that will be called for every lifecycle
@@ -117,6 +142,19 @@ func (m *Kit) GetToolNames() []string {
 		names[i] = t.Info().Name
 	}
 	return names
+}
+
+// GetToolsForSubagent like GetTools but eliminates subagent tool
+// to avoid infinite recursion.
+func (m *Kit) GetToolsForSubagent() []Tool {
+	var tools []Tool
+	for _, t := range m.agent.GetTools() {
+		if t.Info().Name == "subagent" {
+			continue
+		}
+		tools = append(tools, t)
+	}
+	return tools
 }
 
 // GetLoadingMessage returns the agent's startup info message (e.g. GPU
@@ -544,8 +582,8 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 
 	// Build a provider config from current settings, overriding the model.
 	// Load system prompt properly (handles both file paths and inline content).
-	systemPrompt, _ := config.LoadSystemPrompt(viper.GetString("system-prompt"))
-	thinkingLevel := models.ParseThinkingLevel(viper.GetString("thinking-level"))
+	systemPrompt, _ := config.LoadSystemPrompt(m.v.GetString("system-prompt"))
+	thinkingLevel := models.ParseThinkingLevel(m.v.GetString("thinking-level"))
 
 	// Validate and adjust thinking level for the target model.
 	// Some models (e.g., OpenAI gpt-5.4) don't support "minimal" and require "none".
@@ -556,8 +594,8 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 			if !models.IsValidThinkingLevelForModel(thinkingLevel, modelName) {
 				fallback := models.SuggestThinkingLevelFallback(thinkingLevel, modelName)
 				if fallback != models.ThinkingOff {
-					// Adjust the thinking level in viper so the change persists.
-					viper.Set("thinking-level", string(fallback))
+					// Adjust the thinking level in the instance store so the change persists.
+					m.v.Set("thinking-level", string(fallback))
 					thinkingLevel = fallback
 				}
 			}
@@ -569,35 +607,36 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 	cfg := &models.ProviderConfig{
 		ModelString:    modelString,
 		SystemPrompt:   systemPrompt,
-		ProviderAPIKey: viper.GetString("provider-api-key"),
-		ProviderURL:    viper.GetString("provider-url"),
-		MaxTokens:      viper.GetInt("max-tokens"),
-		TLSSkipVerify:  viper.GetBool("tls-skip-verify"),
+		ProviderAPIKey: m.v.GetString("provider-api-key"),
+		ProviderURL:    m.v.GetString("provider-url"),
+		MaxTokens:      m.v.GetInt("max-tokens"),
+		TLSSkipVerify:  m.v.GetBool("tls-skip-verify"),
 		ThinkingLevel:  thinkingLevel,
 		DisableCaching: false, // Caching enabled by default, works with thinking
+		ConfigStore:    m.v,
 	}
 
 	// Only set generation parameter pointers when the user has explicitly
 	// provided a value. This leaves nil pointers for unset params, allowing
 	// per-model defaults (modelSettings / customModels params) to apply.
-	if viper.IsSet("temperature") {
-		v := float32(viper.GetFloat64("temperature"))
+	if m.v.IsSet("temperature") {
+		v := float32(m.v.GetFloat64("temperature"))
 		cfg.Temperature = &v
 	}
-	if viper.IsSet("top-p") {
-		v := float32(viper.GetFloat64("top-p"))
+	if m.v.IsSet("top-p") {
+		v := float32(m.v.GetFloat64("top-p"))
 		cfg.TopP = &v
 	}
-	if viper.IsSet("top-k") {
-		v := int32(viper.GetInt("top-k"))
+	if m.v.IsSet("top-k") {
+		v := int32(m.v.GetInt("top-k"))
 		cfg.TopK = &v
 	}
-	if viper.IsSet("frequency-penalty") {
-		v := float32(viper.GetFloat64("frequency-penalty"))
+	if m.v.IsSet("frequency-penalty") {
+		v := float32(m.v.GetFloat64("frequency-penalty"))
 		cfg.FrequencyPenalty = &v
 	}
-	if viper.IsSet("presence-penalty") {
-		v := float32(viper.GetFloat64("presence-penalty"))
+	if m.v.IsSet("presence-penalty") {
+		v := float32(m.v.GetFloat64("presence-penalty"))
 		cfg.PresencePenalty = &v
 	}
 
@@ -653,18 +692,25 @@ func (m *Kit) GetSystemPromptSource() string {
 // composeSystemPrompt takes a base system prompt and composes it with the
 // current runtime context: AGENTS.md content, skills metadata, and date/cwd.
 // This mirrors the composition done during Kit.New() initialization.
+// It acquires a read lock on runtimeMu while snapshotting contextFiles and
+// skills, so callers must not hold the write lock.
 func (m *Kit) composeSystemPrompt(basePrompt string) string {
 	cwd, _ := os.Getwd()
 	pb := skills.NewPromptBuilder(basePrompt)
 
+	m.runtimeMu.RLock()
+	contextFiles := append([]*ContextFile(nil), m.contextFiles...)
+	loadedSkills := append([]*skills.Skill(nil), m.skills...)
+	m.runtimeMu.RUnlock()
+
 	// Inject AGENTS.md content as project context.
-	for _, cf := range m.contextFiles {
+	for _, cf := range contextFiles {
 		pb.WithSection("", fmt.Sprintf("Instructions from: %s\n\n%s", cf.Path, cf.Content))
 	}
 
 	// Inject skills metadata.
-	if len(m.skills) > 0 {
-		pb.WithSkills(m.skills)
+	if len(loadedSkills) > 0 {
+		pb.WithSkills(loadedSkills)
 	}
 
 	// Append current date/time and working directory.
@@ -716,7 +762,7 @@ func (m *Kit) ReloadExtensions() error {
 	}
 
 	// Re-load from disk.
-	extraPaths := viper.GetStringSlice("extension")
+	extraPaths := m.v.GetStringSlice("extension")
 	loaded, err := extensions.LoadExtensions(extraPaths)
 	if err != nil {
 		return fmt.Errorf("reloading extensions: %w", err)
@@ -724,6 +770,7 @@ func (m *Kit) ReloadExtensions() error {
 
 	// Swap extensions on the runner (clears dynamic state).
 	m.extRunner.Reload(loaded)
+	m.extRunner.SetConfigStore(m.v)
 
 	// Update extension tools on the agent so the LLM sees changes.
 	if m.agent != nil {
@@ -762,7 +809,8 @@ func (m *Kit) ExecuteCompletion(ctx context.Context, req extensions.CompleteRequ
 		// Create a temporary provider for the requested model.
 		config := &models.ProviderConfig{
 			ModelString:   req.Model,
-			TLSSkipVerify: viper.GetBool("tls-skip-verify"),
+			TLSSkipVerify: m.v.GetBool("tls-skip-verify"),
+			ConfigStore:   m.v,
 		}
 		if req.MaxTokens > 0 {
 			config.MaxTokens = req.MaxTokens
@@ -848,37 +896,30 @@ func (m *Kit) ExecuteCompletion(ctx context.Context, req extensions.CompleteRequ
 // prompts, configuration, and behavior settings. All fields are optional
 // and will use CLI defaults if not specified.
 //
-// Global viper state warning:
-// Options are applied by [New] via [viper.Set] calls against viper's
-// process-global store. This store is shared with every downstream reader
-// (e.g. [Kit.SetModel], [Kit.GetThinkingLevel], BuildProviderConfig, and
-// any other code path that calls viper.Get*). Two consequences:
-//
-//  1. Kit instances are NOT isolated from each other within a single
-//     process. Values set by the second New() call overwrite the first,
-//     and any code that later reads viper will see the most recent Set.
-//  2. Fields left at the zero value do NOT clear prior viper state; they
-//     simply skip the viper.Set. Callers that need a clean slate between
-//     constructions should invoke viper.Reset() (the test suite uses a
-//     private resetViper() helper that wraps it) before the next New().
-//
-// Recommended usage: create one Kit per process, or reset viper between
-// constructions. Concurrent calls to New are serialized internally by
-// [viperInitMu], but that mutex does not prevent later viper reads (from
-// a different Kit) from observing mutated keys.
-//
-// TODO: refactor New to use a per-instance *viper.Viper (constructed via
-// viper.New()) so each Kit owns its own isolated config store and Options
-// no longer leak through the global singleton.
+// Config isolation: each [New] / [NewAgent] call constructs its own isolated
+// configuration store (via viper.New internally). Options are applied to that
+// per-instance store, so two Kits constructed in the same process do NOT share
+// or clobber each other's configuration. Runtime mutators ([Kit.SetModel],
+// [Kit.SetThinkingLevel]) and config readers ([Kit.GetThinkingLevel]) operate
+// only on the owning instance. Fields left at their zero value are simply not
+// applied; they fall through to the precedence chain (env → .kit.yml →
+// per-model defaults) resolved within the instance's own store.
 type Options struct {
 	Model        string // Override model (e.g., "anthropic/claude-sonnet-4-5-20250929")
 	SystemPrompt string // Override system prompt
 	ConfigFile   string // Override config file path
 	MaxSteps     int    // Override max steps (0 = use default)
-	Streaming    bool   // Enable streaming (default from config)
-	Quiet        bool   // Suppress debug output
-	Tools        []Tool // Custom tool set. If empty, AllTools() is used.
-	ExtraTools   []Tool // Additional tools added alongside core/MCP/extension tools.
+
+	// Streaming enables or disables streaming output. It is a pointer so the
+	// SDK can distinguish "unset" (nil) from an explicit choice, mirroring the
+	// sampling-parameter fields below. nil leaves streaming to the precedence
+	// chain (env → .kit.yml → default true); a non-nil value forces it. Prefer
+	// [WithStreaming] for the functional-options API.
+	Streaming *bool
+
+	Quiet      bool   // Suppress debug output
+	Tools      []Tool // Custom tool set. If empty, AllTools() is used.
+	ExtraTools []Tool // Additional tools added alongside core/MCP/extension tools.
 
 	// Generation parameters. These override the corresponding values from
 	// .kit.yml / KIT_* environment variables. Leaving a field at its
@@ -969,8 +1010,23 @@ type Options struct {
 
 	// Skills
 	Skills    []string // Explicit skill files/dirs to load (empty = auto-discover)
-	SkillsDir string   // Override default project-local skills directory
+	SkillsDir string   // Direct skills directory to scan (overrides auto-discovery; scanned as-is)
 	NoSkills  bool     // Disable skill loading entirely (auto-discovery and explicit)
+
+	// SkillsDisable names skills (by Name) to exclude from the model-facing
+	// catalog. Disabled skills remain available via the /skill: slash command.
+	SkillsDisable []string
+
+	// SkillTrustPrompt is an optional callback invoked the first time Kit
+	// auto-discovers project-local skills (under <project>/.agents/skills or
+	// <project>/.kit/skills) in a directory that is not yet on the trust
+	// allowlist. It receives the project directory and the number of skills
+	// found, and returns a TrustDecision controlling whether the skills load.
+	//
+	// When nil, project-local skills are loaded without prompting (historical
+	// behaviour). Directories trusted via TrustProject are persisted to
+	// ~/.config/kit/trusted-projects.json and not prompted again.
+	SkillTrustPrompt func(projectDir string, skillCount int) TrustDecision
 
 	// NoExtensions disables Yaegi extension loading entirely.
 	NoExtensions bool
@@ -1012,8 +1068,24 @@ type Options struct {
 	AutoCompact       bool               // Auto-compact when near context limit
 	CompactionOptions *CompactionOptions // Config for auto-compaction (nil = defaults)
 
-	// Debug enables debug logging for the SDK.
+	// Debug enables debug logging for the SDK. When DebugLogger is nil this
+	// flag selects between the default no-op SimpleDebugLogger (Debug=false)
+	// and the built-in console/buffered logger (Debug=true). When DebugLogger
+	// is non-nil this flag is ignored — the supplied logger's
+	// IsDebugEnabled() controls whether downstream code emits messages.
 	Debug bool
+
+	// DebugLogger, if non-nil, routes low-level debug output from the engine
+	// and the MCP tool plumbing to a caller-supplied implementation. This is
+	// the SDK escape hatch for embedders that want to forward debug output
+	// into their own logging system (zap, slog, log/charm, an in-app TUI
+	// panel, etc.) instead of the built-in console logger.
+	//
+	// When nil (default) the Debug bool controls whether the built-in logger
+	// is installed. When non-nil this logger is used unconditionally and the
+	// Debug bool is ignored; the supplied logger's IsDebugEnabled() reports
+	// whether downstream code should bother formatting messages.
+	DebugLogger DebugLogger
 
 	// MCPAuthHandler handles OAuth authorization for remote MCP servers.
 	// When set, remote transports (streamable HTTP, SSE) are configured
@@ -1125,7 +1197,7 @@ type CLIOptions struct {
 //   - Continue:    resume most recent session for SessionDir (or cwd)
 //   - SessionPath: open a specific JSONL session file
 //   - default:     create a new tree session for SessionDir (or cwd)
-func InitTreeSession(opts *Options) (*session.TreeManager, error) {
+func InitTreeSession(opts *Options) (*TreeManager, error) {
 	if opts == nil {
 		opts = &Options{}
 	}
@@ -1151,40 +1223,40 @@ func InitTreeSession(opts *Options) (*session.TreeManager, error) {
 	return session.CreateTreeSession(sessionDir)
 }
 
-// viperInitMu serializes viper writes during [New]. Viper's global state
-// is not thread-safe, so concurrent calls (e.g. parallel subagent spawns)
-// must not overlap the Set/Get window. Note that this mutex only protects
-// the construction window — it does not isolate long-lived Kit instances
-// from each other. See the "Global viper state warning" on [Options].
-var viperInitMu sync.Mutex
-
 // New creates a Kit instance using the same initialization as the CLI.
 // It loads configuration, initializes MCP servers, creates the LLM model, and
 // sets up the agent for interaction. Returns an error if initialization fails.
 //
-// Global viper state warning: fields on [Options] are applied by calling
-// [viper.Set] on viper's process-global store. As a result, two Kits
-// constructed in the same process are NOT isolated: the second New
-// overwrites viper keys set by the first, and any downstream reader
-// (e.g. [Kit.SetModel], [Kit.GetThinkingLevel]) will observe the most
-// recent value. Callers that need multiple independent Kits should call
-// viper.Reset() between constructions, or avoid constructing more than
-// one Kit per process. Writes during New are serialized by [viperInitMu].
+// Config isolation: New constructs a per-instance configuration store (via
+// viper.New internally) and applies [Options] to it. Two Kits constructed in
+// the same process are therefore fully isolated — neither overwrites the
+// other's model, thinking level, or generation parameters, and runtime
+// mutators ([Kit.SetModel], [Kit.SetThinkingLevel]) only affect the owning
+// instance. This makes subagent spawning and multi-Kit embedding safe without
+// any external synchronization.
 //
-// TODO: refactor to use a per-call viper.New() instance so each Kit owns
-// its own isolated config store and Options stop leaking through the
-// global singleton.
+// CLI integration: when Options.CLI is non-nil the Kit shares the
+// process-global viper store instead of allocating a fresh one, so cobra flag
+// bindings established by the CLI remain in effect. SDK callers leave
+// Options.CLI nil and always get an isolated store.
+//
+// For an ergonomic functional-options front door, see [NewAgent].
 func New(ctx context.Context, opts *Options) (*Kit, error) {
 	if opts == nil {
 		opts = &Options{}
 	}
 
-	// All viper writes (SetSDKDefaults, InitConfig, Set calls, system-prompt
-	// composition) happen under viperInitMu. We also call BuildProviderConfig
-	// here — it's fast (just reads) — so we can capture the full config
-	// snapshot before releasing the lock. The expensive work (MCP loading,
-	// provider creation, session init) then runs outside the lock, allowing
-	// parallel subagent spawns to proceed concurrently.
+	// Construct this Kit's configuration store. SDK callers get a fresh,
+	// isolated *viper.Viper so concurrent constructions never clobber each
+	// other. The CLI (Options.CLI != nil) shares the process-global store so
+	// its cobra flag bindings and pre-loaded config remain visible.
+	var v *viper.Viper
+	if opts.CLI != nil {
+		v = viper.GetViper()
+	} else {
+		v = viper.New()
+	}
+
 	var (
 		providerConfig        *models.ProviderConfig
 		modelString           string
@@ -1194,86 +1266,93 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		mcpConfig             *config.Config
 		debug                 bool
 		noExtensions          bool
+		disableCoreTools      bool
 		maxSteps              int
 		streaming             bool
 		hasCustomSystemPrompt bool
 		systemPromptSource    string
+		capturedBasePrompt    string
 	)
 
 	if err := func() error {
-		viperInitMu.Lock()
-		defer viperInitMu.Unlock()
+		// Set CLI-equivalent defaults on the instance store. When used as an
+		// SDK (without cobra), these defaults are not registered via flag bindings.
+		setSDKDefaults(v)
 
-		// Set CLI-equivalent defaults for viper. When used as an SDK (without
-		// cobra), these defaults are not registered via flag bindings.
-		setSDKDefaults()
-
-		// Initialize config (loads config files and env vars).
-		// Only initialize if not already done (e.g., by CLI's cobra.OnInitialize).
-		// Check if model is already set, which indicates config was loaded.
+		// Initialize config (loads config files and env vars) into the instance
+		// store. The CLI shares the process-global store, which cobra.OnInitialize
+		// has already populated, so re-running initConfig there is unnecessary;
+		// SDK callers get a fresh isolated store that must be loaded here.
+		// We key off opts.CLI (not a config value) because setSDKDefaults always
+		// seeds "model", which would otherwise mask an empty store.
 		// SkipConfig bypasses .kit.yml file loading (viper defaults and env vars still apply).
-		if !opts.SkipConfig && viper.GetString("model") == "" {
-			if err := InitConfig(opts.ConfigFile, false); err != nil {
+		if !opts.SkipConfig && opts.CLI == nil {
+			if err := initConfig(v, opts.ConfigFile, false); err != nil {
 				return fmt.Errorf("failed to initialize config: %w", err)
 			}
 		}
 
 		// Handle CLI debug mode.
 		if opts.Debug {
-			viper.Set("debug", true)
+			v.Set("debug", true)
 		}
 
-		// Override viper settings with options.
+		// Override instance settings with options.
 		if opts.Model != "" {
-			viper.Set("model", opts.Model)
+			v.Set("model", opts.Model)
 		}
 		if opts.SystemPrompt != "" {
-			viper.Set("system-prompt", opts.SystemPrompt)
+			v.Set("system-prompt", opts.SystemPrompt)
 		}
 		if opts.MaxSteps > 0 {
-			viper.Set("max-steps", opts.MaxSteps)
+			v.Set("max-steps", opts.MaxSteps)
 		}
-		viper.Set("stream", opts.Streaming)
+		// Only override streaming when the caller explicitly set it. Otherwise
+		// leave the precedence chain (env → config → default true) untouched so a
+		// zero-valued Options does not silently force stream=false.
+		if opts.Streaming != nil {
+			v.Set("stream", *opts.Streaming)
+		}
 
 		// Generation parameter overrides. Each Options field, when set,
-		// is pushed into viper here so the existing downstream code
-		// (BuildProviderConfig, SetModel, modelSettings lookups) picks
-		// it up uniformly. Pointer-typed sampling params use viper.Set
-		// only when non-nil so that nil means "leave provider/per-model
-		// default in place" (BuildProviderConfig keys off viper.IsSet).
+		// is pushed into the instance store here so the existing downstream
+		// code (BuildProviderConfig, SetModel, modelSettings lookups) picks
+		// it up uniformly. Pointer-typed sampling params use Set only when
+		// non-nil so that nil means "leave provider/per-model default in
+		// place" (BuildProviderConfig keys off IsSet).
 		if opts.MaxTokens > 0 {
-			viper.Set("max-tokens", opts.MaxTokens)
+			v.Set("max-tokens", opts.MaxTokens)
 		}
 		if opts.ThinkingLevel != "" {
-			viper.Set("thinking-level", opts.ThinkingLevel)
+			v.Set("thinking-level", opts.ThinkingLevel)
 		}
 		if opts.Temperature != nil {
-			viper.Set("temperature", *opts.Temperature)
+			v.Set("temperature", *opts.Temperature)
 		}
 		if opts.TopP != nil {
-			viper.Set("top-p", *opts.TopP)
+			v.Set("top-p", *opts.TopP)
 		}
 		if opts.TopK != nil {
-			viper.Set("top-k", *opts.TopK)
+			v.Set("top-k", *opts.TopK)
 		}
 		if opts.FrequencyPenalty != nil {
-			viper.Set("frequency-penalty", *opts.FrequencyPenalty)
+			v.Set("frequency-penalty", *opts.FrequencyPenalty)
 		}
 		if opts.PresencePenalty != nil {
-			viper.Set("presence-penalty", *opts.PresencePenalty)
+			v.Set("presence-penalty", *opts.PresencePenalty)
 		}
 
 		// Provider overrides. TLSSkipVerify only takes effect when true —
 		// callers wanting to force-disable should use the config file or
 		// env var instead.
 		if opts.ProviderAPIKey != "" {
-			viper.Set("provider-api-key", opts.ProviderAPIKey)
+			v.Set("provider-api-key", opts.ProviderAPIKey)
 		}
 		if opts.ProviderURL != "" {
-			viper.Set("provider-url", opts.ProviderURL)
+			v.Set("provider-url", opts.ProviderURL)
 		}
 		if opts.TLSSkipVerify {
-			viper.Set("tls-skip-verify", true)
+			v.Set("tls-skip-verify", true)
 		}
 
 		// Resolve working directory for context/skill discovery.
@@ -1288,12 +1367,37 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		}
 
 		// Load skills — either from explicit paths or via auto-discovery.
-		if !opts.NoSkills {
+		// Merge viper config with opts: CLI flag / config file values are
+		// already bound to viper by cmd/root.go, so v.GetBool("no-skills"),
+		// v.GetStringSlice("skill"), and v.GetString("skills-dir") capture
+		// both --flag and .kit.yml keys transparently.
+		noSkills := opts.NoSkills || v.GetBool("no-skills")
+		skillPaths := opts.Skills
+		if len(skillPaths) == 0 {
+			skillPaths = v.GetStringSlice("skill")
+		}
+		skillsDir := opts.SkillsDir
+		if skillsDir == "" {
+			skillsDir = v.GetString("skills-dir")
+		}
+		if !noSkills {
+			mergedOpts := *opts
+			mergedOpts.Skills = skillPaths
+			mergedOpts.SkillsDir = skillsDir
 			var err error
-			loadedSkills, err = loadSkills(opts)
+			loadedSkills, err = loadSkills(&mergedOpts)
 			if err != nil {
 				return fmt.Errorf("failed to load skills: %w", err)
 			}
+
+			// Apply per-skill disable list (--skill-disable / skill-disable
+			// config key). Disabled skills stay loaded (so /skill: still
+			// works) but are hidden from the model-facing catalog.
+			disable := opts.SkillsDisable
+			if len(disable) == 0 {
+				disable = v.GetStringSlice("skill-disable")
+			}
+			applySkillDisableList(loadedSkills, disable)
 		}
 
 		// Always compose the system prompt with runtime context: base prompt +
@@ -1304,7 +1408,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		// explicitly set system-prompt, use the per-model prompt as the
 		// base instead of the global default.
 		{
-			rawPromptInput := viper.GetString("system-prompt")
+			rawPromptInput := v.GetString("system-prompt")
 
 			// Resolve a file path to its content so PromptBuilder receives the
 			// actual prompt text rather than a literal path string. Without this,
@@ -1329,12 +1433,12 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			// Check for per-model system prompt override when no explicit
 			// global system-prompt was configured by the user.
 			if !userSetSystemPrompt {
-				modelStr := viper.GetString("model")
+				modelStr := v.GetString("model")
 				if modelStr != "" {
 					if mi := models.LookupModelForSettings(modelStr); mi != nil {
 						var perModelParams *models.GenerationParams
 						// modelSettings takes priority over custom model params.
-						if ms := models.LoadModelSettingsFromConfig(); ms != nil {
+						if ms := models.LoadModelSettingsFrom(v); ms != nil {
 							perModelParams = ms[modelStr]
 						}
 						if perModelParams == nil && mi.Params != nil {
@@ -1348,6 +1452,10 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			}
 
 			pb := skills.NewPromptBuilder(basePrompt)
+
+			// Capture the resolved base prompt so RefreshSystemPrompt can
+			// recompose later after runtime skill/context-file mutations.
+			capturedBasePrompt = basePrompt
 
 			// Inject AGENTS.md content as project context.
 			for _, cf := range contextFiles {
@@ -1365,41 +1473,42 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 				time.Now().Format("Monday, January 2, 2006, 3:04:05 PM MST"), cwd,
 			))
 
-			viper.Set("system-prompt", pb.Build())
+			v.Set("system-prompt", pb.Build())
 		}
 
-		// Snapshot all viper-derived values now, while the lock is held.
-		// BuildProviderConfig is fast (pure reads), so we do it here.
+		// Snapshot all instance-derived values now.
+		// BuildProviderConfig is fast (pure reads).
 		var pcErr error
-		providerConfig, _, pcErr = kitsetup.BuildProviderConfig()
+		providerConfig, _, pcErr = kitsetup.BuildProviderConfig(v)
 		if pcErr != nil {
 			return fmt.Errorf("failed to build provider config: %w", pcErr)
 		}
 
 		// SDK last-resort max-tokens floor. When nothing — Options, env,
 		// config, nor a per-model default — supplied a value, we land on
-		// zero here (viper.GetInt returns 0 for unset keys). Apply the
-		// SDK default directly on the struct rather than via viper so
-		// viper.IsSet("max-tokens") stays false: downstream right-sizing
+		// zero here (GetInt returns 0 for unset keys). Apply the
+		// SDK default directly on the struct rather than via the store so
+		// IsSet("max-tokens") stays false: downstream right-sizing
 		// can still raise this toward the model's known output ceiling,
 		// and per-model modelSettings[...].maxTokens can still win.
 		if providerConfig.MaxTokens == 0 && opts.MaxTokens == 0 {
 			providerConfig.MaxTokens = sdkDefaultMaxTokens
 		}
-		modelString = viper.GetString("model")
-		debug = viper.GetBool("debug")
-		noExtensions = opts.NoExtensions || viper.GetBool("no-extensions")
-		maxSteps = viper.GetInt("max-steps")
-		streaming = viper.GetBool("stream")
+		modelString = v.GetString("model")
+		debug = v.GetBool("debug")
+		noExtensions = opts.NoExtensions || v.GetBool("no-extensions")
+		disableCoreTools = opts.DisableCoreTools || v.GetBool("no-core-tools")
+		maxSteps = v.GetInt("max-steps")
+		streaming = v.GetBool("stream")
 
 		return nil
 	}(); err != nil {
 		return nil, err
 	}
-	// ---- viperInitMu released — heavy I/O below runs concurrently ----
+	// ---- config snapshot complete — heavy I/O below ----
 
 	// Load MCP configuration. Use pre-loaded config if provided directly,
-	// via CLI options, or load from viper as a last resort.
+	// via CLI options, or load from the instance store as a last resort.
 	if opts.MCPConfig != nil {
 		mcpConfig = opts.MCPConfig
 	} else if opts.CLI != nil && opts.CLI.MCPConfig != nil {
@@ -1407,7 +1516,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 	}
 	if mcpConfig == nil {
 		var err error
-		mcpConfig, err = config.LoadAndValidateConfig()
+		mcpConfig, err = config.LoadAndValidateConfigFrom(v)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load MCP config: %w", err)
 		}
@@ -1442,15 +1551,41 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 	// Build agent setup options, pulling CLI-specific fields when available.
 	// Pass the pre-built ProviderConfig and scalar viper snapshots so
 	// SetupAgent doesn't need to re-read viper (which would require the lock).
+
+	// Register the dedicated activate_skill tool when at least one skill is
+	// loaded (issue #65, gaps #13/#14). The provider closure reads the live
+	// skill set from the Kit instance once it exists so runtime additions
+	// resolve; skillToolKit is assigned after construction below.
+	var skillToolKit *Kit
+	extraTools := opts.ExtraTools
+	if len(loadedSkills) > 0 {
+		names := make([]string, 0, len(loadedSkills))
+		for _, s := range loadedSkills {
+			if !s.DisableModelInvocation {
+				names = append(names, s.Name)
+			}
+		}
+		provider := func() []*skills.Skill {
+			if skillToolKit == nil {
+				return loadedSkills
+			}
+			return skillToolKit.GetSkills()
+		}
+		if t := skilltool.New(names, provider); t != nil {
+			extraTools = append(extraTools, t)
+		}
+	}
+
 	setupOpts := kitsetup.AgentSetupOptions{
 		MCPConfig:         mcpConfig,
 		Quiet:             opts.Quiet,
 		CoreTools:         opts.Tools,
-		DisableCoreTools:  opts.DisableCoreTools,
-		ExtraTools:        opts.ExtraTools,
+		DisableCoreTools:  disableCoreTools,
+		ExtraTools:        extraTools,
 		ToolWrapper:       hookToolWrapper(beforeToolCall, afterToolResult),
 		ProviderConfig:    providerConfig,
 		Debug:             debug,
+		DebugLogger:       opts.DebugLogger,
 		NoExtensions:      noExtensions,
 		MaxSteps:          maxSteps,
 		StreamingEnabled:  streaming,
@@ -1463,6 +1598,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			timeout:         opts.MCPTaskTimeout,
 			progress:        opts.MCPTaskProgress,
 		}.toToolsConfig(),
+		Viper: v,
 	}
 
 	// Set up OAuth handler for remote MCP servers. The SDK does not create
@@ -1532,8 +1668,10 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		authHandler:           setupOpts.AuthHandler,
 		opts:                  opts,
 		mcpConfig:             mcpConfig,
+		v:                     v,
 		hasCustomSystemPrompt: hasCustomSystemPrompt,
 		systemPromptSource:    systemPromptSource,
+		basePrompt:            capturedBasePrompt,
 		beforeToolCall:        beforeToolCall,
 		afterToolResult:       afterToolResult,
 		beforeTurn:            beforeTurn,
@@ -1542,6 +1680,10 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		beforeCompact:         beforeCompact,
 		prepareStep:           prepareStep,
 	}
+
+	// Point the activate_skill provider closure at the live Kit instance so it
+	// resolves skills mutated after construction.
+	skillToolKit = k
 
 	// Bridge extension events to SDK hooks.
 	if agentResult.ExtRunner != nil {
@@ -1560,15 +1702,32 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 	return k, nil
 }
 
-// GetContextFiles returns the context files (e.g. AGENTS.md) loaded during
-// initialisation. Returns nil if no context files were found.
+// GetContextFiles returns the context files (e.g. AGENTS.md) currently active
+// on this Kit instance. The returned slice is a snapshot — mutating it does
+// not affect Kit state. Returns nil when no context files are loaded.
 func (m *Kit) GetContextFiles() []*ContextFile {
-	return m.contextFiles
+	m.runtimeMu.RLock()
+	defer m.runtimeMu.RUnlock()
+	if len(m.contextFiles) == 0 {
+		return nil
+	}
+	out := make([]*ContextFile, len(m.contextFiles))
+	copy(out, m.contextFiles)
+	return out
 }
 
-// GetSkills returns the skills loaded during initialisation.
+// GetSkills returns the skills currently active on this Kit instance. The
+// returned slice is a snapshot — mutating it does not affect Kit state.
+// Returns nil when no skills are loaded.
 func (m *Kit) GetSkills() []*Skill {
-	return m.skills
+	m.runtimeMu.RLock()
+	defer m.runtimeMu.RUnlock()
+	if len(m.skills) == 0 {
+		return nil
+	}
+	out := make([]*Skill, len(m.skills))
+	copy(out, m.skills)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,12 +1772,14 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 
 	// Find the skill by name.
 	var skillPath string
+	m.runtimeMu.RLock()
 	for _, s := range m.skills {
 		if s.Name == name {
 			skillPath = s.Path
 			break
 		}
 	}
+	m.runtimeMu.RUnlock()
 	if skillPath == "" {
 		return prompt
 	}
@@ -1634,6 +1795,14 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 	fmt.Fprintf(&buf, "<skill name=%q location=%q>\n", loaded.Name, loaded.Path)
 	fmt.Fprintf(&buf, "References are relative to %s.\n\n", baseDir)
 	buf.WriteString(loaded.Content)
+
+	// Enumerate bundled resources (scripts/, references/, assets/) so the model
+	// knows what it can read without listing the directory itself.
+	if res := skills.FormatResources(loaded.Resources()); res != "" {
+		buf.WriteString("\n\n")
+		buf.WriteString(res)
+	}
+
 	buf.WriteString("\n</skill>")
 
 	args = strings.TrimSpace(args)
@@ -1650,18 +1819,33 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 // ---------------------------------------------------------------------------
 
 // loadSkills loads skills based on Options. If explicit paths are provided
-// they are loaded directly; otherwise auto-discovery runs.
+// they are loaded directly. If SkillsDir is set it is treated as a direct
+// skills directory (scanned as-is, not as a parent of .agents/.kit). Otherwise
+// auto-discovery runs against the standard scopes rooted at SessionDir.
 func loadSkills(opts *Options) ([]*skills.Skill, error) {
 	if len(opts.Skills) > 0 {
 		return loadExplicitSkills(opts.Skills)
 	}
 
-	// Auto-discover from standard directories.
-	cwd := opts.SkillsDir
-	if cwd == "" {
-		cwd = opts.SessionDir
+	// An explicit --skills-dir is a direct skills directory: scan it as-is
+	// rather than appending .agents/skills and .kit/skills beneath it.
+	if opts.SkillsDir != "" {
+		return skills.LoadSkillsFromDir(opts.SkillsDir)
 	}
-	return skills.LoadSkills(cwd)
+
+	// Auto-discover from the standard scopes rooted at the session directory.
+	// Project-local skills are injected into the system prompt, so they are
+	// gated on a trust decision when a SkillTrustPrompt is configured.
+	cwd := opts.SessionDir
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	user := skills.LoadUserSkills()
+	project := skills.LoadProjectSkills(cwd)
+	if len(project) > 0 && !projectSkillsTrusted(opts, cwd, len(project)) {
+		project = nil
+	}
+	return skills.Combine(user, project), nil
 }
 
 // loadExplicitSkills loads skills from a list of explicit paths. Each path
@@ -1739,6 +1923,58 @@ type TurnResult struct {
 	// any tool call/result messages added during the agent loop.
 	// Each message carries role and plain-text content.
 	Messages []LLMMessage
+
+	// FinalValue is set when a tool returned a [ToolOutput] with Halt=true
+	// during the turn. The dynamic type is whatever the tool handler placed
+	// in [ToolOutput.FinalValue]. Nil when no tool halted the turn.
+	FinalValue any
+
+	// HaltedByTool is the name of the tool that returned Halt=true, or empty
+	// if the turn ended for any other reason.
+	HaltedByTool string
+
+	// Stream contains every delta event observed during the turn in emit
+	// order. It is populated regardless of streaming mode (in non-streaming
+	// mode it carries the coarse-grained events the provider reported).
+	// PromptResult and the other turn-returning entry points always block
+	// until end-of-turn, so Stream is complete when they return.
+	Stream []StreamEvent
+}
+
+// StreamEventKind classifies a [StreamEvent] captured during a turn.
+type StreamEventKind string
+
+// Stream event kinds captured in [TurnResult.Stream].
+const (
+	StreamEventTextDelta      StreamEventKind = "text_delta"
+	StreamEventReasoningStart StreamEventKind = "reasoning_start"
+	StreamEventReasoningDelta StreamEventKind = "reasoning_delta"
+	StreamEventReasoningEnd   StreamEventKind = "reasoning_end"
+	StreamEventToolCallChunk  StreamEventKind = "tool_call_chunk"
+)
+
+// StreamEvent is a single delta observed during a turn, captured in
+// [TurnResult.Stream]. It lets embedders assert streamed ordering
+// deterministically without re-implementing an OnMessageUpdate collector.
+type StreamEvent struct {
+	// Kind classifies the event.
+	Kind StreamEventKind
+
+	// Text carries the assistant text for StreamEventTextDelta.
+	Text string
+
+	// Reasoning carries the reasoning text for StreamEventReasoningDelta.
+	Reasoning string
+
+	// ToolName is the tool name for StreamEventToolCallChunk.
+	ToolName string
+
+	// ToolID is the tool call ID for StreamEventToolCallChunk.
+	ToolID string
+
+	// Args carries the (accumulating) tool-call argument JSON for
+	// StreamEventToolCallChunk.
+	Args string
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,8 +1994,14 @@ type SubagentConfig struct {
 	// Empty string uses a minimal default prompt.
 	SystemPrompt string
 
-	// Tools overrides the tool set. If nil, SubagentTools() is used (all
-	// core tools except subagent, preventing infinite recursion).
+	// Tools overrides the tool set available to the subagent.
+	// If nil and the subagent is created via the SDK (Kit.Subagent()), the
+	// static SubagentTools() set (all core tools except "subagent") is used.
+	// When spawned internally by the agent loop, the parent's active tools
+	// minus "subagent" are used instead (see GetToolsForSubagent()).
+	// Pass m.GetToolsForSubagent() explicitly to opt into inheritance from
+	// SDK call sites.
+	// (The subagent tool is dropped to prevent infinite recursion.)
 	Tools []Tool
 
 	// NoSession, when true, uses an in-memory ephemeral session. When false
@@ -1789,6 +2031,50 @@ type SubagentResult struct {
 	Usage *LLMUsage
 	// Elapsed is the total execution time.
 	Elapsed time.Duration
+}
+
+// inheritProviderConfig copies the parent's effective provider/runtime
+// configuration from its isolated config store onto child Options. Used by
+// Kit.Subagent so the child — which owns a separate store and re-loads only
+// .kit.yml / KIT_* on its own — still observes provider credentials, the
+// thinking level, and sampler/token overrides the parent acquired via
+// programmatic Options or runtime setters (e.g. SetThinkingLevel).
+//
+// max-tokens and the sampling parameters are only propagated when the parent
+// explicitly set them (IsSet), preserving the tri-state precedence so per-model
+// defaults still apply on the child when the parent left them unset. A nil
+// child or store is a no-op.
+func inheritProviderConfig(child *Options, v *viper.Viper) {
+	if child == nil || v == nil {
+		return
+	}
+	child.ProviderAPIKey = v.GetString("provider-api-key")
+	child.ProviderURL = v.GetString("provider-url")
+	child.TLSSkipVerify = v.GetBool("tls-skip-verify")
+	child.ThinkingLevel = v.GetString("thinking-level")
+	if v.IsSet("max-tokens") {
+		child.MaxTokens = v.GetInt("max-tokens")
+	}
+	if v.IsSet("temperature") {
+		t := float32(v.GetFloat64("temperature"))
+		child.Temperature = &t
+	}
+	if v.IsSet("top-p") {
+		p := float32(v.GetFloat64("top-p"))
+		child.TopP = &p
+	}
+	if v.IsSet("top-k") {
+		k := int32(v.GetInt("top-k"))
+		child.TopK = &k
+	}
+	if v.IsSet("frequency-penalty") {
+		fp := float32(v.GetFloat64("frequency-penalty"))
+		child.FrequencyPenalty = &fp
+	}
+	if v.IsSet("presence-penalty") {
+		pp := float32(v.GetFloat64("presence-penalty"))
+		child.PresencePenalty = &pp
+	}
 }
 
 // Subagent spawns an in-process child Kit instance to perform a task. The
@@ -1860,22 +2146,28 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	}
 
 	// Create child Kit instance. Pass the parent's loaded MCP config to
-	// avoid re-reading viper (which races with concurrent subagent spawns).
-	// Streaming must be explicitly enabled — Options.Streaming defaults to
-	// false, and New() unconditionally writes viper.Set("stream", opts.Streaming).
-	// Without this, the subagent would (a) pollute viper global state for
-	// other concurrent callers and (b) potentially hit provider-level
-	// differences (e.g. Anthropic non-streaming timeouts with extended
-	// thinking).
+	// avoid re-loading and re-validating config for the child.
+	// Streaming is enabled explicitly — without it, non-streaming can hit
+	// provider-level differences (e.g. Anthropic non-streaming timeouts with
+	// extended thinking). The child gets its own config store, so this does not
+	// affect any other concurrent caller.
+	streamOn := true
 	childOpts := &Options{
 		Model:        model,
 		SystemPrompt: systemPrompt,
 		Tools:        tools,
 		NoSession:    cfg.NoSession,
 		Quiet:        true,
-		Streaming:    true,
+		Streaming:    &streamOn,
 		MCPConfig:    m.mcpConfig,
 	}
+
+	// Inherit the parent's effective provider/runtime configuration. Since #40
+	// each Kit owns an isolated config store, so the child's New() only re-loads
+	// .kit.yml / KIT_* on its own — values the parent picked up from
+	// programmatic Options or runtime setters (e.g. SetThinkingLevel) would
+	// otherwise be lost.
+	inheritProviderConfig(childOpts, m.v)
 	// Propagate the parent's MCP task configuration so a child subagent
 	// invoking long-running MCP tools observes the same per-server modes,
 	// timeouts, and progress callback as the parent. Without this, child
@@ -1923,6 +2215,9 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 // All prompt modes (Prompt, Steer, FollowUp, PromptWithOptions) share this
 // single code path so callback wiring is never duplicated.
 func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.GenerateWithLoopResult, error) {
+	// Capture the per-turn stream collector (set by runTurn) so streamed
+	// deltas are recorded into TurnResult.Stream in emit order.
+	collector := streamCollectorFromContext(ctx)
 	// Create a per-turn steer channel and attach it to the context so the
 	// agent's PrepareStep can inject steering messages between steps.
 	steerCh := make(chan agent.SteerMessage, 16)
@@ -1970,6 +2265,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			SystemPrompt: systemPrompt,
 			Timeout:      timeout,
 			OnEvent:      onEvent,
+			Tools:        m.GetToolsForSubagent(),
 		})
 		m.cleanupSubagentListeners(toolCallID)
 		if result == nil {
@@ -2039,24 +2335,30 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 						i := strings.Index(remaining, thinkClose)
 						if i == -1 {
 							m.events.emit(ReasoningDeltaEvent{Delta: remaining})
+							collector.add(StreamEvent{Kind: StreamEventReasoningDelta, Reasoning: remaining})
 							return
 						}
 						if i > 0 {
 							m.events.emit(ReasoningDeltaEvent{Delta: remaining[:i]})
+							collector.add(StreamEvent{Kind: StreamEventReasoningDelta, Reasoning: remaining[:i]})
 						}
 						inThinkTag = false
 						m.events.emit(ReasoningCompleteEvent{})
+						collector.add(StreamEvent{Kind: StreamEventReasoningEnd})
 						remaining = remaining[i+len(thinkClose):]
 					} else {
 						i := strings.Index(remaining, thinkOpen)
 						if i == -1 {
 							m.events.emit(MessageUpdateEvent{Chunk: remaining})
+							collector.add(StreamEvent{Kind: StreamEventTextDelta, Text: remaining})
 							return
 						}
 						if i > 0 {
 							m.events.emit(MessageUpdateEvent{Chunk: remaining[:i]})
+							collector.add(StreamEvent{Kind: StreamEventTextDelta, Text: remaining[:i]})
 						}
 						inThinkTag = true
+						collector.add(StreamEvent{Kind: StreamEventReasoningStart})
 						remaining = remaining[i+len(thinkOpen):]
 					}
 				}
@@ -2064,9 +2366,11 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 		}(),
 		OnReasoningDelta: func(delta string) {
 			m.events.emit(ReasoningDeltaEvent{Delta: delta})
+			collector.add(StreamEvent{Kind: StreamEventReasoningDelta, Reasoning: delta})
 		},
 		OnReasoningComplete: func() {
 			m.events.emit(ReasoningCompleteEvent{})
+			collector.add(StreamEvent{Kind: StreamEventReasoningEnd})
 		},
 		OnToolOutput: func(toolCallID, toolName, chunk string, isStderr bool) {
 			m.events.emit(ToolOutputEvent{
@@ -2084,7 +2388,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			}
 		},
 		OnStepUsage: func(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64) {
-			if viper.GetBool("debug") {
+			if m.v.GetBool("debug") {
 				log.Printf("DEBUG Kit.generate emitting StepUsageEvent: input=%d output=%d cacheRead=%d cacheCreate=%d",
 					inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
 				)
@@ -2113,12 +2417,14 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 				ToolName:   toolName,
 				ToolKind:   toolKindFor(toolName),
 			})
+			collector.add(StreamEvent{Kind: StreamEventToolCallChunk, ToolID: toolCallID, ToolName: toolName})
 		},
 		OnToolCallDelta: func(toolCallID, delta string) {
 			m.events.emit(ToolCallDeltaEvent{
 				ToolCallID: toolCallID,
 				Delta:      delta,
 			})
+			collector.add(StreamEvent{Kind: StreamEventToolCallChunk, ToolID: toolCallID, Args: delta})
 		},
 		OnToolCallEnd: func(toolCallID string) {
 			m.events.emit(ToolCallEndEvent{
@@ -2126,7 +2432,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			})
 		},
 
-		// New callbacks for previously unwired Fantasy lifecycle events.
+		// New callbacks for previously unwired agent lifecycle events.
 		OnStepStart: func(stepNumber int) {
 			m.events.emit(StepStartEvent{StepNumber: stepNumber})
 		},
@@ -2270,6 +2576,14 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 
 	sentCount := len(messages)
 
+	// Attach a per-turn stream collector and halt holder so generate's
+	// callbacks can capture delta events (TurnResult.Stream) and tools can
+	// signal loop termination (TurnResult.FinalValue / HaltedByTool).
+	collector := &streamCollector{}
+	holder := &haltHolder{}
+	ctx = context.WithValue(ctx, streamCollectorKey{}, collector)
+	ctx = context.WithValue(ctx, haltHolderKey{}, holder)
+
 	m.events.emit(TurnStartEvent{Prompt: promptLabel})
 	m.events.emit(MessageStartEvent{})
 
@@ -2292,7 +2606,7 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 		m.events.emit(TurnEndEvent{Error: err})
 		// Run AfterTurn hooks even on error.
 		m.afterTurn.run(AfterTurnHook{Error: err})
-		return nil, err
+		return nil, ClassifyProviderError(err)
 	}
 
 	responseText := result.FinalResponse.Content.Text()
@@ -2343,6 +2657,13 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 	if result.FinalResponse != nil {
 		finalUsage := result.FinalResponse.Usage
 		turnResult.FinalUsage = &finalUsage
+	}
+
+	// Surface captured stream deltas and any tool-driven halt signal.
+	turnResult.Stream = collector.drain()
+	if halted, toolName, value := holder.snapshot(); halted {
+		turnResult.HaltedByTool = toolName
+		turnResult.FinalValue = value
 	}
 
 	return turnResult, nil
@@ -2486,28 +2807,158 @@ type PromptOptions struct {
 	// Use it to inject per-call instructions or context without permanently
 	// modifying the agent's system prompt.
 	SystemMessage string
+
+	// Model overrides the agent's configured model for this call only. Empty
+	// string means "use the agent's default". The previous model is restored
+	// after the call returns.
+	Model string
+
+	// ThinkingLevel overrides the agent's reasoning level for this call only
+	// (e.g. "off", "low", "medium", "high"). Empty string means "use the
+	// agent's default". The previous level is restored after the call.
+	ThinkingLevel string
+
+	// ExtraTools are added to the effective tool set for this call only and
+	// removed afterwards.
+	ExtraTools []Tool
+
+	// ProviderURL overrides the provider base URL for this call only. Useful
+	// for multi-tenant embedders that resolve endpoints per request. The
+	// previous value is restored after the call.
+	ProviderURL string
+
+	// ProviderAPIKey overrides the provider credential for this call only.
+	// The previous value is restored after the call.
+	ProviderAPIKey string
+}
+
+// applyPromptOptions applies the per-call overrides in opts to the shared
+// agent state and returns a restore function that reverts every change. It
+// holds promptOptsMu for the lifetime of the override window (the returned
+// restore releases it), so concurrent option-driven prompts are serialized.
+// On error nothing is changed and the lock is released.
+func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(), error) {
+	needsModelRebuild := opts.Model != "" || opts.ThinkingLevel != "" ||
+		opts.ProviderURL != "" || opts.ProviderAPIKey != ""
+	if !needsModelRebuild && len(opts.ExtraTools) == 0 {
+		return func() {}, nil
+	}
+
+	m.promptOptsMu.Lock()
+	var restores []func()
+	restore := func() {
+		for i := len(restores) - 1; i >= 0; i-- {
+			restores[i]()
+		}
+		m.promptOptsMu.Unlock()
+	}
+
+	// Extra tools (additive) — restored by re-setting the prior slice.
+	if len(opts.ExtraTools) > 0 {
+		prev := m.agent.GetExtraTools()
+		merged := make([]Tool, 0, len(prev)+len(opts.ExtraTools))
+		merged = append(merged, prev...)
+		merged = append(merged, opts.ExtraTools...)
+		m.agent.SetExtraTools(merged)
+		restores = append(restores, func() { m.agent.SetExtraTools(prev) })
+	}
+
+	if needsModelRebuild {
+		prevModel := m.modelString
+		prevThinkingSet := m.v.IsSet("thinking-level")
+		prevThinking := m.v.GetString("thinking-level")
+		prevURLSet := m.v.IsSet("provider-url")
+		prevURL := m.v.GetString("provider-url")
+		prevKeySet := m.v.IsSet("provider-api-key")
+		prevKey := m.v.GetString("provider-api-key")
+
+		if opts.ThinkingLevel != "" {
+			m.v.Set("thinking-level", opts.ThinkingLevel)
+		}
+		if opts.ProviderURL != "" {
+			m.v.Set("provider-url", opts.ProviderURL)
+		}
+		if opts.ProviderAPIKey != "" {
+			m.v.Set("provider-api-key", opts.ProviderAPIKey)
+		}
+
+		targetModel := opts.Model
+		if targetModel == "" {
+			targetModel = prevModel
+		}
+		if err := m.SetModel(ctx, targetModel); err != nil {
+			// Revert config keys we may have set, then unwind prior restores.
+			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
+			restoreViperString(m.v, "provider-url", prevURL, prevURLSet)
+			restoreViperString(m.v, "provider-api-key", prevKey, prevKeySet)
+			restore()
+			return nil, err
+		}
+		restores = append(restores, func() {
+			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
+			restoreViperString(m.v, "provider-url", prevURL, prevURLSet)
+			restoreViperString(m.v, "provider-api-key", prevKey, prevKeySet)
+			// Use a fresh context: the rollback must complete even if the
+			// caller's ctx was canceled or expired during the call, otherwise
+			// the per-call model override would leak into subsequent calls.
+			_ = m.SetModel(context.Background(), prevModel)
+		})
+	}
+
+	return restore, nil
+}
+
+// restoreViperString restores a config key to its prior value, clearing it
+// back to the unset state when it was not explicitly set before.
+func restoreViperString(v *viper.Viper, key, prev string, wasSet bool) {
+	if wasSet {
+		v.Set(key, prev)
+		return
+	}
+	v.Set(key, "")
 }
 
 // PromptWithOptions sends a message with per-call configuration. It behaves
-// like Prompt but allows injecting an additional system message before the
-// user prompt. Both messages are persisted to the session.
+// like Prompt but applies the overrides in opts (system message, model,
+// thinking level, provider credentials, extra tools) for this call only,
+// restoring the agent's prior state afterwards.
 func (m *Kit) PromptWithOptions(ctx context.Context, msg string, opts PromptOptions) (string, error) {
-	var preMessages []fantasy.Message
-	if opts.SystemMessage != "" {
-		preMessages = append(preMessages, fantasy.NewSystemMessage(opts.SystemMessage))
-	}
-	preMessages = append(preMessages, fantasy.NewUserMessage(msg))
-
-	result, err := m.runTurn(ctx, msg, msg, preMessages)
+	result, err := m.PromptResultWithOptions(ctx, msg, opts)
 	if err != nil {
 		return "", err
 	}
 	return result.Response, nil
 }
 
+// PromptResultWithOptions is the [TurnResult]-returning counterpart of
+// PromptWithOptions. Like all turn-returning entry points it blocks until
+// end-of-turn, so the returned TurnResult (including TurnResult.Stream) is
+// complete when it returns. Per-call overrides in opts are applied for this
+// call only and the agent's prior state is restored before returning.
+func (m *Kit) PromptResultWithOptions(ctx context.Context, msg string, opts PromptOptions) (*TurnResult, error) {
+	restore, err := m.applyPromptOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
+
+	var preMessages []fantasy.Message
+	if opts.SystemMessage != "" {
+		preMessages = append(preMessages, fantasy.NewSystemMessage(opts.SystemMessage))
+	}
+	preMessages = append(preMessages, fantasy.NewUserMessage(msg))
+
+	return m.runTurn(ctx, msg, msg, preMessages)
+}
+
 // PromptResult sends a message and returns the full turn result including
 // usage statistics and conversation messages. Use this instead of Prompt()
 // when you need more than just the response text.
+//
+// PromptResult blocks until end-of-turn regardless of whether streaming is
+// enabled. When streaming is enabled, every delta observed during the turn is
+// also captured in order in [TurnResult.Stream], so callers can assert
+// streamed ordering deterministically without an OnMessageUpdate collector.
 func (m *Kit) PromptResult(ctx context.Context, message string) (*TurnResult, error) {
 	return m.runTurn(ctx, message, message, []fantasy.Message{
 		fantasy.NewUserMessage(message),
@@ -2580,7 +3031,7 @@ func (m *Kit) IsReasoningModel() bool {
 
 // GetThinkingLevel returns the current thinking level.
 func (m *Kit) GetThinkingLevel() string {
-	return viper.GetString("thinking-level")
+	return m.v.GetString("thinking-level")
 }
 
 // SetThinkingLevel changes the thinking level and recreates the agent with
@@ -2589,7 +3040,7 @@ func (m *Kit) GetThinkingLevel() string {
 // With message-level caching, both thinking and caching work together.
 // Caching reduces costs by 60-90% for repeated context.
 func (m *Kit) SetThinkingLevel(ctx context.Context, level string) error {
-	viper.Set("thinking-level", level)
+	m.v.Set("thinking-level", level)
 	// Recreate agent with new thinking config by re-running SetModel
 	// with the same model string. SetModel rebuilds the provider and
 	// passes the updated viper config (including thinking-level).
@@ -2645,7 +3096,18 @@ func extractFileParts(msg fantasy.Message) []fantasy.FilePart {
 // Close cleans up resources including MCP server connections, model resources,
 // and the tree session file handle. Should be called when the Kit instance is
 // no longer needed. Returns an error if cleanup fails.
+//
+// Close is equivalent to CloseContext(context.Background()). Use
+// [Kit.CloseContext] when shutdown must be bounded by a deadline.
 func (m *Kit) Close() error {
+	return m.CloseContext(context.Background())
+}
+
+// CloseContext is like [Kit.Close] but accepts a context so graceful shutdown
+// can be bounded by a deadline or cancellation. The context is honored on a
+// best-effort basis: if it is already done when CloseContext is called, the
+// context error is returned after a best-effort cleanup pass.
+func (m *Kit) CloseContext(ctx context.Context) error {
 	// Emit SessionShutdown for extensions.
 	if m.extRunner != nil && m.extRunner.HasHandlers(extensions.SessionShutdown) {
 		_, _ = m.extRunner.Emit(extensions.SessionShutdownEvent{})
@@ -2657,7 +3119,11 @@ func (m *Kit) Close() error {
 	if closer, ok := m.authHandler.(interface{ Close() error }); ok {
 		_ = closer.Close()
 	}
-	return m.agent.Close()
+	err := m.agent.Close()
+	if ctxErr := ctx.Err(); ctxErr != nil && err == nil {
+		return ctxErr
+	}
+	return err
 }
 
 // Conversion helpers are defined in adapter.go.

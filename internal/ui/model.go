@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/mark3labs/kit/internal/ui/commands"
 	uicore "github.com/mark3labs/kit/internal/ui/core"
 	"github.com/mark3labs/kit/internal/ui/fileutil"
+	"github.com/mark3labs/kit/internal/ui/imagepreview"
 	"github.com/mark3labs/kit/internal/ui/prefs"
 	"github.com/mark3labs/kit/internal/ui/style"
 	kit "github.com/mark3labs/kit/pkg/kit"
@@ -124,6 +126,14 @@ type AppController interface {
 	// attachments (e.g. pasted images) into the currently running agent
 	// turn. Behaves like Steer but includes file parts alongside the text.
 	SteerWithFiles(prompt string, files []kit.LLMFilePart) int
+	// PopLastUserMessage truncates the tree session at the parent of the
+	// most recent user message on the current branch, syncs the in-memory
+	// message store, and returns that user prompt (plus any image file
+	// parts) so the caller can resubmit it. Used by /retry to recover from
+	// provider errors (overloaded, timeout) without duplicating the user
+	// message in context. Returns an error if the agent is busy, no tree
+	// session is active, or no user message exists on the current branch.
+	PopLastUserMessage() (string, []kit.LLMFilePart, error)
 }
 
 // SkillItem holds display metadata about a loaded skill for the startup
@@ -435,9 +445,12 @@ type AppModelOptions struct {
 	EmitBeforeFork func(targetID string, isUserMsg bool, userText string) (bool, string)
 
 	// EmitBeforeSessionSwitch, if non-nil, is called before switching
-	// to a new session branch (e.g. /new, /clear). Returns (cancelled,
-	// reason). May be nil if no extensions are loaded.
-	EmitBeforeSessionSwitch func(reason string) (bool, string)
+	// to a new session branch (e.g. /new, /clear). reason is the trigger
+	// ("new", "clear", "extension"); initialPrompt is the user prompt
+	// that will run as the first turn of the new session (empty when
+	// /new is called without arguments). Returns (cancelled, reason).
+	// May be nil if no extensions are loaded.
+	EmitBeforeSessionSwitch func(reason, initialPrompt string) (bool, string)
 
 	// GetGlobalShortcuts, if non-nil, returns extension-registered global
 	// keyboard shortcuts. Keys are binding strings (e.g., "ctrl+p").
@@ -565,6 +578,13 @@ type AppModel struct {
 	// flushed first, preserving chronological order.
 	pendingUserPrints []string
 
+	// newSessionResultCh, when non-nil, receives the outcome of an
+	// in-flight extension-triggered NewSession request. Set when an
+	// app.NewSessionRequestEvent arrives; cleared (with a result sent)
+	// in performNewSession success/failure paths or in the
+	// beforeSessionSwitchResultMsg cancellation path.
+	newSessionResultCh chan<- error
+
 	// canceling tracks whether the user has pressed ESC once during stateWorking.
 	// A second ESC within 2 seconds will cancel the current step.
 	canceling bool
@@ -667,7 +687,7 @@ type AppModel struct {
 
 	// emitBeforeSessionSwitch emits a before-session-switch event to extensions.
 	// Returns (cancelled, reason). May be nil if no extensions are loaded.
-	emitBeforeSessionSwitch func(reason string) (bool, string)
+	emitBeforeSessionSwitch func(reason, initialPrompt string) (bool, string)
 
 	// thinkingLevel is the current extended thinking level.
 	thinkingLevel string
@@ -1205,53 +1225,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelSelector = nil
 		m.state = stateInput
 		if m.setModel != nil {
-			previousModel := m.providerName + "/" + m.modelName
-
-			// Check if thinking level needs adjustment for the new model.
-			// Some models (e.g., OpenAI gpt-5.4) don't support "minimal" and require "none".
-			if m.thinkingLevel != "" && m.thinkingLevel != "off" {
-				parts := strings.SplitN(msg.ModelString, "/", 2)
-				if len(parts) == 2 {
-					modelName := parts[1]
-					currentLevel := models.ParseThinkingLevel(m.thinkingLevel)
-					if !models.IsValidThinkingLevelForModel(currentLevel, modelName) {
-						fallback := models.SuggestThinkingLevelFallback(currentLevel, modelName)
-						if fallback != models.ThinkingOff {
-							m.printSystemMessage(fmt.Sprintf(
-								"Note: Model %s doesn't support '%s' thinking level. Adjusted to '%s'.",
-								modelName, currentLevel, fallback,
-							))
-							m.thinkingLevel = string(fallback)
-							if m.setThinkingLevel != nil {
-								_ = m.setThinkingLevel(string(fallback))
-							}
-							go func() { _ = prefs.SaveThinkingLevelPreference(string(fallback)) }()
-						}
-					}
-				}
-			}
-
-			if err := m.setModel(msg.ModelString); err != nil {
-				m.printSystemMessage(fmt.Sprintf("Failed to switch model: %v", err))
-			} else {
-				// Update display state directly — we cannot use
-				// NotifyModelChanged (prog.Send) from inside Update()
-				// without deadlocking BubbleTea.
-				parts := strings.SplitN(msg.ModelString, "/", 2)
-				if len(parts) == 2 {
-					m.providerName = parts[0]
-					m.modelName = parts[1]
-				}
-				m.printSystemMessage(fmt.Sprintf("Switched to %s", msg.ModelString))
-				// Persist model selection for next launch.
-				go func() { _ = prefs.SaveModelPreference(msg.ModelString) }()
-				if m.emitModelChange != nil {
-					emit := m.emitModelChange
-					newModel := msg.ModelString
-					prev := previousModel
-					go emit(newModel, prev, "user")
-				}
-			}
+			m.switchModel(msg.ModelString)
 		}
 		return m, tea.Batch(cmds...)
 
@@ -1840,12 +1814,25 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// messages stay in chronological order.
 				m.pendingUserPrints = append(m.pendingUserPrints, displayText)
 				m.flushStreamAndPendingUserMessages()
+				// Insert inline thumbnail previews after the user message.
+				cmds = append(cmds, m.transcriptPreviewCmd(msg.Images, m.lastMessageID()))
 			}
 		} else {
 			m.printUserMessage(displayText)
+			// Insert inline thumbnail previews after the user message.
+			cmds = append(cmds, m.transcriptPreviewCmd(msg.Images, m.lastMessageID()))
 		}
 		if m.state != stateWorking {
 			m.state = stateWorking
+		}
+
+	// ── Async transcript image preview ───────────────────────────────────────
+	case imagePreviewReadyMsg:
+		if msg.block != "" {
+			item := NewStyledMessageItem(generateMessageID(), "user", "", msg.block)
+			m.insertMessageAfter(msg.anchorID, item)
+			m.refreshContent()
+			m.layoutDirty = true
 		}
 
 	// ── Shell command (! / !!) ───────────────────────────────────────────────
@@ -2261,6 +2248,25 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ic.textarea.CursorEnd()
 		}
 
+	case app.NewSessionRequestEvent:
+		// Extension wants to end the current session and start a fresh
+		// one (with an optional initial prompt). Stash the response
+		// channel so performNewSession (or the before-hook cancellation
+		// path) can signal completion, then run the same /new pipeline
+		// the user would trigger.
+		if msg.ResponseCh != nil {
+			// Only one new-session request in flight at a time. If a
+			// previous response channel is still pending, fail it before
+			// replacing it so the prior extension goroutine unblocks.
+			if m.newSessionResultCh != nil {
+				m.newSessionResultCh <- fmt.Errorf("superseded by a newer NewSession request")
+			}
+			m.newSessionResultCh = msg.ResponseCh
+		}
+		if cmd := m.handleNewCommand(msg.InitialPrompt); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
 	case app.PasswordPromptEvent:
 		// Sudo password prompt - show a modal input prompt
 		// If already in prompt state, cancel the new request
@@ -2443,6 +2449,16 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layoutDirty = true
 		}
 
+	case editFileMsg:
+		// User returned from $EDITOR after `/edit <path>`. The file was
+		// edited directly on disk — no textarea changes. Report the result.
+		if msg.err != nil {
+			m.printSystemMessage(fmt.Sprintf("Editor exited with error: %v", msg.err))
+		} else {
+			m.printSystemMessage(fmt.Sprintf("Edited `%s`", msg.path))
+		}
+		m.layoutDirty = true
+
 	case extReloadResultMsg:
 		if msg.err != nil {
 			m.printSystemMessage(fmt.Sprintf("Extension reload failed: %v", msg.err))
@@ -2456,8 +2472,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// session reset if the hook did not cancel.
 		if msg.cancelled {
 			m.printSystemMessage(msg.reason)
+			m.signalNewSessionResult(fmt.Errorf("session switch cancelled: %s", msg.reason))
 		} else {
-			cmds = append(cmds, m.performNewSession())
+			cmds = append(cmds, m.performNewSession(msg.initialPrompt))
 		}
 
 	case beforeForkResultMsg:
@@ -2492,6 +2509,19 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Plain text from extension — add as system message.
 			m.printSystemMessage(msg.Text)
 		}
+
+	// ── Clipboard image attached / thumbnail rendered ────────────────────────
+	// Both messages change the input region's rendered height (the pill and
+	// the async half-block preview), so forward them to the input and mark the
+	// layout dirty — otherwise distributeHeight keeps a stale, too-short input
+	// height and the preview is clipped off the bottom of the screen.
+	case clipboardImageMsg, thumbnailReadyMsg:
+		if m.input != nil {
+			updated, cmd := m.input.Update(msg)
+			m.input, _ = updated.(inputComponentIface)
+			cmds = append(cmds, cmd)
+		}
+		m.layoutDirty = true
 
 	default:
 		// Pass unrecognised messages to all children.
@@ -3108,6 +3138,85 @@ func truncateMessageForBlock(msg string, maxLines, width int) string {
 // Print helpers — add content to ScrollList
 // --------------------------------------------------------------------------
 
+// imagePreviewReadyMsg carries an asynchronously rendered transcript image
+// preview block back to the Update loop, where it is inserted into the
+// ScrollList directly after the originating user message (identified by
+// anchorID). Inserting by anchor — rather than appending — keeps the preview
+// next to its message even when the agent's streamed reply has already been
+// appended while the thumbnail was being decoded off the event loop.
+type imagePreviewReadyMsg struct {
+	block    string
+	anchorID string
+}
+
+// transcriptPreviewCmd returns a tea.Cmd that renders half-block thumbnail
+// previews for the given clipboard images off the Bubble Tea event loop
+// (decode + resample must not block Update). The rendered block is delivered
+// via imagePreviewReadyMsg, tagged with anchorID so the consumer can place it
+// directly after the originating user message. Returns nil when there is
+// nothing to render or no room for a preview; an empty result (terminal lacks
+// color support) yields a nil message that Bubble Tea ignores.
+func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorID string) tea.Cmd {
+	if len(images) == 0 {
+		return nil
+	}
+	cols := thumbMaxCols
+	if m.width > 6 && m.width-6 < cols {
+		cols = m.width - 6
+	}
+	if cols < 1 {
+		return nil
+	}
+	bg := style.GetTheme().Background
+	imgs := images
+	return func() tea.Msg {
+		pad := lipgloss.NewStyle().PaddingLeft(2)
+		var blocks []string
+		for _, img := range imgs {
+			thumb, err := imagepreview.Render(img.Data, img.MediaType, cols, thumbMaxRows, bg)
+			if err != nil || thumb == "" {
+				continue
+			}
+			blocks = append(blocks, pad.Render(thumb))
+		}
+		if len(blocks) == 0 {
+			return nil
+		}
+		return imagePreviewReadyMsg{block: strings.Join(blocks, "\n"), anchorID: anchorID}
+	}
+}
+
+// lastMessageID returns the ID of the most recently added ScrollList message,
+// or "" when there are none. Used to anchor an async transcript preview to the
+// user message that was just printed.
+func (m *AppModel) lastMessageID() string {
+	if len(m.messages) == 0 {
+		return ""
+	}
+	return m.messages[len(m.messages)-1].ID()
+}
+
+// insertMessageAfter inserts item immediately after the message whose ID
+// matches anchorID. If anchorID is empty or not found, item is appended.
+func (m *AppModel) insertMessageAfter(anchorID string, item MessageItem) {
+	idx := -1
+	if anchorID != "" {
+		for i, msgItem := range m.messages {
+			if msgItem.ID() == anchorID {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		m.messages = append(m.messages, item)
+		return
+	}
+	m.messages = append(m.messages, nil)
+	copy(m.messages[idx+2:], m.messages[idx+1:])
+	m.messages[idx+1] = item
+}
+
 // printUserMessage renders a user message into the ScrollList.
 func (m *AppModel) printUserMessage(text string) {
 	// Check if this exact message was just added (prevents duplicates)
@@ -3224,7 +3333,7 @@ func (m *AppModel) handleSlashCommand(sc *commands.SlashCommand, args string) te
 	case "/fork":
 		return m.handleForkCommand()
 	case "/new":
-		return m.handleNewCommand()
+		return m.handleNewCommand(args)
 	case "/name":
 		return m.handleNameCommand(args)
 	case "/resume":
@@ -3233,6 +3342,10 @@ func (m *AppModel) handleSlashCommand(sc *commands.SlashCommand, args string) te
 		return m.handleExportCommand(args)
 	case "/copy":
 		return m.handleCopyCommand()
+	case "/retry":
+		return m.handleRetryCommand()
+	case "/edit":
+		return m.handleEditCommand(args)
 	case "/share":
 		return m.handleShareCommand()
 	case "/import":
@@ -3651,13 +3764,15 @@ func (m *AppModel) printHelpMessage() {
 		"**Navigation:**\n" +
 		"- `/tree`: Navigate session tree (switch branches)\n" +
 		"- `/fork`: Branch from an earlier message\n" +
-		"- `/new`: Start a new session (discards context, saves old session)\n" +
+		"- `/new [prompt]`: Start a new session (discards context, saves old session). With a prompt, runs it as the first message; supports `@file` attachments.\n" +
 		"- `/resume`: Open session picker to switch sessions\n" +
 		"- `/name <name>`: Set a display name for this session\n\n" +
 		"**System:**\n" +
 		"- `/compact [instructions]`: Summarise older messages to free context space\n" +
 		"- `/clear`: Clear message history\n" +
 		"- `/copy`: Copy the last message to the system clipboard\n" +
+		"- `/retry`: Resubmit the last user message (e.g. after a provider error)\n" +
+		"- `/edit [path]`: Open a file in `$EDITOR` (fuzzy-find from cwd)\n" +
 		"- `/export [path]`: Export session as JSONL\n" +
 		"- `/import <path.jsonl>`: Import session from JSONL file\n" +
 		"- `/reset-usage`: Reset usage statistics\n" +
@@ -4148,11 +4263,31 @@ func (m *AppModel) handleModelCommand(args string) tea.Cmd {
 		return nil
 	}
 
+	// Direct model switch with the provided model string.
+	m.switchModel(args)
+	return nil
+}
+
+// switchModel performs a direct model switch, shared by the model selector
+// overlay and the /model slash command: it adjusts the thinking level when
+// the new model doesn't support the current one, calls the setModel
+// callback, updates display state, persists preferences, and emits the
+// ModelChange extension event.
+//
+// Display state is updated directly — we cannot use NotifyModelChanged
+// (prog.Send) from inside Update() without deadlocking BubbleTea.
+func (m *AppModel) switchModel(modelString string) {
+	if m.setModel == nil {
+		m.printSystemMessage("Model switching is not available.")
+		return
+	}
+
+	previousModel := m.providerName + "/" + m.modelName
+
 	// Check if thinking level needs adjustment for the new model.
 	// Some models (e.g., OpenAI gpt-5.4) don't support "minimal" and require "none".
 	if m.thinkingLevel != "" && m.thinkingLevel != "off" {
-		parts := strings.SplitN(args, "/", 2)
-		if len(parts) == 2 {
+		if parts := strings.SplitN(modelString, "/", 2); len(parts) == 2 {
 			modelName := parts[1]
 			currentLevel := models.ParseThinkingLevel(m.thinkingLevel)
 			if !models.IsValidThinkingLevelForModel(currentLevel, modelName) {
@@ -4172,32 +4307,26 @@ func (m *AppModel) handleModelCommand(args string) tea.Cmd {
 		}
 	}
 
-	// Direct model switch with the provided model string.
-	previousModel := m.providerName + "/" + m.modelName
-	if err := m.setModel(args); err != nil {
+	if err := m.setModel(modelString); err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to switch model: %v", err))
-		return nil
+		return
 	}
 
 	// Update display state directly (cannot use prog.Send from Update).
-	parts := strings.SplitN(args, "/", 2)
-	if len(parts) == 2 {
+	if parts := strings.SplitN(modelString, "/", 2); len(parts) == 2 {
 		m.providerName = parts[0]
 		m.modelName = parts[1]
 	}
 
-	if m.emitModelChange != nil {
-		emit := m.emitModelChange
-		prev := previousModel
-		newModel := args
-		go emit(newModel, prev, "user")
-	}
+	m.printSystemMessage(fmt.Sprintf("Switched to %s", modelString))
 
 	// Persist model selection for next launch.
-	go func() { _ = prefs.SaveModelPreference(args) }()
+	go func() { _ = prefs.SaveModelPreference(modelString) }()
 
-	m.printSystemMessage(fmt.Sprintf("Switched to %s", args))
-	return nil
+	if m.emitModelChange != nil {
+		emit := m.emitModelChange
+		go emit(modelString, previousModel, "user")
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -4337,7 +4466,12 @@ func (m *AppModel) handleForkCommand() tea.Cmd {
 
 // handleNewCommand starts a completely new session (Pi-style /new behavior).
 // Creates a new session file, discarding all context from the previous conversation.
-func (m *AppModel) handleNewCommand() tea.Cmd {
+// If initialPrompt is non-empty it is submitted as the first user turn of the
+// new session, with @file references expanded the same way they are for
+// regular user input.
+func (m *AppModel) handleNewCommand(initialPrompt string) tea.Cmd {
+	initialPrompt = strings.TrimSpace(initialPrompt)
+
 	// Emit before-session-switch event in a goroutine so that extension
 	// handlers can call blocking operations (e.g. ctx.PromptConfirm) without
 	// deadlocking the BubbleTea event loop.
@@ -4345,23 +4479,25 @@ func (m *AppModel) handleNewCommand() tea.Cmd {
 		emit := m.emitBeforeSessionSwitch
 		ctrl := m.appCtrl
 		go func() {
-			cancelled, reason := emit("new")
+			cancelled, reason := emit("new", initialPrompt)
 			ctrl.SendEvent(beforeSessionSwitchResultMsg{
-				cancelled: cancelled,
-				reason:    reason,
+				cancelled:     cancelled,
+				reason:        reason,
+				initialPrompt: initialPrompt,
 			})
 		}()
 		return noopCmd
 	}
 
-	return m.performNewSession()
+	return m.performNewSession(initialPrompt)
 }
 
 // performNewSession performs the actual session reset. Called either directly
 // (when no before-hook exists) or after the async hook completes.
 // Matches Pi behavior: creates a completely new session file, discarding all
-// context from the previous conversation.
-func (m *AppModel) performNewSession() tea.Cmd {
+// context from the previous conversation. If initialPrompt is non-empty it
+// is submitted as the first user turn (with @file expansion).
+func (m *AppModel) performNewSession(initialPrompt string) tea.Cmd {
 	ts := m.appCtrl.GetTreeSession()
 	if ts == nil {
 		// No tree session — just clear messages.
@@ -4375,13 +4511,16 @@ func (m *AppModel) performNewSession() tea.Cmd {
 		// Clear the ScrollList so the new session starts fresh.
 		m.messages = []MessageItem{}
 		m.printSystemMessage("Conversation cleared. Starting fresh.")
-		return nil
+		cmd := m.submitInitialPrompt(initialPrompt)
+		m.signalNewSessionResult(nil)
+		return cmd
 	}
 
 	// Create a brand new session file (Pi-style /new behavior)
 	newTs, err := session.CreateTreeSession(m.cwd)
 	if err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to create new session: %v", err))
+		m.signalNewSessionResult(fmt.Errorf("create new session: %w", err))
 		return nil
 	}
 
@@ -4394,6 +4533,67 @@ func (m *AppModel) performNewSession() tea.Cmd {
 	// Clear the ScrollList so the new session starts fresh.
 	m.messages = []MessageItem{}
 	m.printSystemMessage("New session started. Previous conversation saved.")
+	cmd := m.submitInitialPrompt(initialPrompt)
+	m.signalNewSessionResult(nil)
+	return cmd
+}
+
+// signalNewSessionResult delivers the outcome of an extension-triggered
+// NewSession request (if one is in flight) and clears the response channel.
+// Safe to call when no request is pending.
+func (m *AppModel) signalNewSessionResult(err error) {
+	if m.newSessionResultCh == nil {
+		return
+	}
+	ch := m.newSessionResultCh
+	m.newSessionResultCh = nil
+	// Channel is buffered (cap >= 1) by contract — send is non-blocking.
+	ch <- err
+}
+
+// submitInitialPrompt is the shared submission path used by /new <prompt>
+// and ctx.NewSession(prompt). It mirrors the SubmitMsg handler: @file
+// references are expanded via fileutil.ProcessFileAttachments and the
+// resulting prompt is forwarded to AppController.Run / RunWithFiles.
+// Returns nil when prompt is empty.
+func (m *AppModel) submitInitialPrompt(prompt string) tea.Cmd {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" || m.appCtrl == nil {
+		return nil
+	}
+
+	processedText := prompt
+	var fileParts []kit.LLMFilePart
+	if m.cwd != "" {
+		result := fileutil.ProcessFileAttachments(prompt, m.cwd, m.mcpResourceReader)
+		processedText = result.ProcessedText
+		for _, fp := range result.FileParts {
+			fileParts = append(fileParts, kit.LLMFilePart{
+				Filename:  fp.Filename,
+				Data:      fp.Data,
+				MediaType: fp.MediaType,
+			})
+		}
+	}
+
+	displayText := prompt
+	if len(fileParts) > 0 {
+		displayText = fmt.Sprintf("%s\n[%d file(s) attached]", prompt, len(fileParts))
+	}
+
+	var qLen int
+	if len(fileParts) > 0 {
+		qLen = m.appCtrl.RunWithFiles(processedText, fileParts)
+	} else {
+		qLen = m.appCtrl.Run(processedText)
+	}
+	if qLen > 0 {
+		m.queuedMessages = append(m.queuedMessages, displayText)
+		m.layoutDirty = true
+	} else {
+		m.pendingUserPrints = append(m.pendingUserPrints, displayText)
+		m.flushStreamAndPendingUserMessages()
+	}
 	return nil
 }
 
@@ -4514,6 +4714,141 @@ func (m *AppModel) handleCopyCommand() tea.Cmd {
 	return clipboard.CopyToClipboard(text)
 }
 
+// handleRetryCommand resubmits the most recent user message on the current
+// branch. Used to recover from transient provider errors (overloaded,
+// timeout) without users having to retype — and without the duplicate-user-
+// message bloat that retyping creates.
+//
+// Flow:
+//  1. App.PopLastUserMessage() truncates the tree at the parent of the last
+//     user message and returns its text + any image parts. The failed turn's
+//     entries become orphaned (still on disk, off-branch) so they will not
+//     be re-sent to the LLM.
+//  2. The visible message list is rebuilt from the truncated branch so the
+//     prior user message + any partial assistant + error rendering vanish.
+//  3. The prompt is resubmitted via Run/RunWithFiles, mirroring the normal
+//     SubmitMsg display path (badge formatting, pending-prints flush,
+//     stateWorking transition).
+func (m *AppModel) handleRetryCommand() tea.Cmd {
+	if m.appCtrl == nil {
+		m.printSystemMessage("App controller unavailable.")
+		return nil
+	}
+
+	prompt, files, err := m.appCtrl.PopLastUserMessage()
+	if err != nil {
+		m.printSystemMessage(fmt.Sprintf("Cannot retry: %v", err))
+		return nil
+	}
+
+	// Rebuild the visible ScrollList from the truncated branch so the failed
+	// turn's user message and any partial assistant/error rendering disappear
+	// before the resubmit prints a fresh user message.
+	m.messages = []MessageItem{}
+	m.renderSessionHistory()
+
+	// Mirror SubmitMsg's badge formatting for the display text.
+	var imageCount, fileOnlyCount int
+	for _, f := range files {
+		if strings.HasPrefix(f.MediaType, "image/") {
+			imageCount++
+		} else {
+			fileOnlyCount++
+		}
+	}
+	displayText := prompt
+	if imageCount > 0 || fileOnlyCount > 0 {
+		var badges []string
+		if imageCount > 0 {
+			badges = append(badges, fmt.Sprintf("%d image(s) pasted", imageCount))
+		}
+		if fileOnlyCount > 0 {
+			badges = append(badges, fmt.Sprintf("%d file(s) attached", fileOnlyCount))
+		}
+		displayText = fmt.Sprintf("%s\n[%s]", prompt, strings.Join(badges, ", "))
+	}
+
+	var qLen int
+	if len(files) > 0 {
+		qLen = m.appCtrl.RunWithFiles(prompt, files)
+	} else {
+		qLen = m.appCtrl.Run(prompt)
+	}
+	if qLen > 0 {
+		m.queuedMessages = append(m.queuedMessages, displayText)
+		m.layoutDirty = true
+	} else {
+		m.pendingUserPrints = append(m.pendingUserPrints, displayText)
+		m.flushStreamAndPendingUserMessages()
+	}
+	if m.state != stateWorking {
+		m.state = stateWorking
+	}
+	return nil
+}
+
+// handleEditCommand opens the supplied path in $EDITOR via tea.ExecProcess,
+// pausing the TUI for the duration of the editor session. The path is
+// resolved relative to cwd; ~/ and absolute paths are honoured. Non-existent
+// paths are allowed — most editors will create the file on save.
+//
+// On exit an editFileMsg is emitted with the resolved path (or error) so the
+// Update loop can report the result. The textarea is not touched — use
+// Ctrl+X e if you want to round-trip a prompt through $EDITOR instead.
+func (m *AppModel) handleEditCommand(args string) tea.Cmd {
+	path := strings.TrimSpace(args)
+	if path == "" {
+		m.printSystemMessage("Usage: `/edit <path>` — or type `/edit ` and pick a file from the popup.")
+		return nil
+	}
+
+	// Strip optional surrounding double-quotes (the autocomplete inserts
+	// these when a path contains spaces).
+	if len(path) >= 2 && strings.HasPrefix(path, `"`) && strings.HasSuffix(path, `"`) {
+		path = path[1 : len(path)-1]
+	}
+
+	// Resolve ~/, relative, and absolute paths against cwd.
+	resolved := path
+	if strings.HasPrefix(resolved, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			resolved = filepath.Join(home, resolved[2:])
+		}
+	}
+	if !filepath.IsAbs(resolved) {
+		cwd, err := os.Getwd()
+		if err == nil {
+			resolved = filepath.Join(cwd, resolved)
+		}
+	}
+	resolved = filepath.Clean(resolved)
+
+	// Reject paths that exist but are directories — $EDITOR semantics vary.
+	if info, err := os.Stat(resolved); err == nil && info.IsDir() {
+		m.printSystemMessage(fmt.Sprintf("`%s` is a directory, not a file.", resolved))
+		return nil
+	}
+
+	editorApp := os.Getenv("VISUAL")
+	if editorApp == "" {
+		editorApp = os.Getenv("EDITOR")
+	}
+	if editorApp == "" {
+		m.printSystemMessage("Set `$EDITOR` or `$VISUAL` to use `/edit`")
+		return nil
+	}
+
+	editorCmd, cmdErr := editor.Command(editorApp, resolved)
+	if cmdErr != nil {
+		m.printSystemMessage(fmt.Sprintf("Failed to open editor: %v", cmdErr))
+		return nil
+	}
+
+	return tea.ExecProcess(editorCmd, func(err error) tea.Msg {
+		return editFileMsg{path: resolved, err: err}
+	})
+}
+
 // handleExportCommand exports the current session to a file.
 // Usage: /export          — copies the JSONL file to cwd with a descriptive name.
 //
@@ -4629,61 +4964,11 @@ func (m *AppModel) handleShareCommand() tea.Cmd {
 		return r
 	}, name)
 
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("kit-%s-*.jsonl", name))
+	tmpPath, err := buildShareFile(name, data, sysPromptJSON)
 	if err != nil {
-		m.printSystemMessage(fmt.Sprintf("Failed to create temp file: %v", err))
+		m.printSystemMessage(fmt.Sprintf("Failed to share session: %v", err))
 		return nil
 	}
-	tmpPath := tmpFile.Name()
-
-	// Write the session data with the system prompt entry inserted after the header.
-	// The header is the first line, so we write:
-	// 1. First line (header) from original data
-	// 2. System prompt entry
-	// 3. Remaining lines from original data
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1] // Remove trailing empty line
-	}
-
-	if len(lines) > 0 {
-		// Write header (first line)
-		if _, err := tmpFile.WriteString(lines[0] + "\n"); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpPath)
-			m.printSystemMessage(fmt.Sprintf("Failed to write temp file: %v", err))
-			return nil
-		}
-
-		// Write system prompt entry
-		if _, err := tmpFile.Write(sysPromptJSON); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpPath)
-			m.printSystemMessage(fmt.Sprintf("Failed to write system prompt: %v", err))
-			return nil
-		}
-		if _, err := tmpFile.WriteString("\n"); err != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpPath)
-			m.printSystemMessage(fmt.Sprintf("Failed to write temp file: %v", err))
-			return nil
-		}
-
-		// Write remaining lines
-		for i := 1; i < len(lines); i++ {
-			if lines[i] == "" {
-				continue // Skip empty lines
-			}
-			if _, err := tmpFile.WriteString(lines[i] + "\n"); err != nil {
-				_ = tmpFile.Close()
-				_ = os.Remove(tmpPath)
-				m.printSystemMessage(fmt.Sprintf("Failed to write temp file: %v", err))
-				return nil
-			}
-		}
-	}
-
-	_ = tmpFile.Close()
 
 	m.printSystemMessage("Uploading session to GitHub Gist...")
 
@@ -4707,6 +4992,56 @@ func (m *AppModel) handleShareCommand() tea.Cmd {
 		viewerURL := fmt.Sprintf("https://go-kit.dev/session/#%s", gistID)
 		return shareResultMsg{gistURL: gistURL, viewerURL: viewerURL}
 	}
+}
+
+// buildShareFile assembles a temp JSONL file containing the session data
+// with the system-prompt entry inserted after the header line. On success
+// the caller owns the returned file and must remove it when done; on error
+// any partially-written temp file has already been cleaned up.
+func buildShareFile(name string, data, sysPromptJSON []byte) (tmpPath string, err error) {
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("kit-%s-*.jsonl", name))
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath = tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	// Write the session data with the system prompt entry inserted after the
+	// header. The header is the first line, so we write:
+	// 1. First line (header) from original data
+	// 2. System prompt entry
+	// 3. Remaining lines from original data
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1] // Remove trailing empty line
+	}
+	if len(lines) == 0 {
+		return tmpPath, nil
+	}
+
+	if _, err = tmpFile.WriteString(lines[0] + "\n"); err != nil {
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	if _, err = tmpFile.Write(sysPromptJSON); err != nil {
+		return "", fmt.Errorf("write system prompt: %w", err)
+	}
+	if _, err = tmpFile.WriteString("\n"); err != nil {
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == "" {
+			continue // Skip empty lines
+		}
+		if _, err = tmpFile.WriteString(lines[i] + "\n"); err != nil {
+			return "", fmt.Errorf("write temp file: %w", err)
+		}
+	}
+	return tmpPath, nil
 }
 
 // handleImportCommand imports a session from a JSONL file.
@@ -4924,6 +5259,14 @@ type externalEditorMsg struct {
 	err  error
 }
 
+// editFileMsg is sent when the user returns from $EDITOR after invoking the
+// /edit slash command on a specific file. Unlike externalEditorMsg, no text
+// is read back — the user edited the file directly on disk.
+type editFileMsg struct {
+	path string
+	err  error
+}
+
 // shareResultMsg carries the result of an async gist upload.
 type shareResultMsg struct {
 	err       error
@@ -4959,8 +5302,9 @@ type mcpPromptResultMsg struct {
 // executed before-session-switch hook. The hook runs in a goroutine so that
 // blocking operations like ctx.PromptConfirm() do not deadlock the TUI.
 type beforeSessionSwitchResultMsg struct {
-	cancelled bool
-	reason    string
+	cancelled     bool
+	reason        string
+	initialPrompt string
 }
 
 // beforeForkResultMsg carries the result of an asynchronously executed

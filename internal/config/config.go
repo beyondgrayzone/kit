@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -227,16 +228,17 @@ type GenerationParams struct {
 // or other custom/ prefixed models. These models are loaded from the config file
 // and merged into the custom provider in the model registry.
 type CustomModelConfig struct {
-	Name        string      `json:"name" yaml:"name"`
-	BaseURL     string      `json:"baseUrl,omitempty" yaml:"baseUrl,omitempty"`
-	APIKey      string      `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
-	Family      string      `json:"family,omitempty" yaml:"family,omitempty"`
-	Attachment  bool        `json:"attachment,omitempty" yaml:"attachment,omitempty"`
-	Reasoning   bool        `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
-	Temperature bool        `json:"temperature,omitempty" yaml:"temperature,omitempty"`
-	Knowledge   string      `json:"knowledge,omitempty" yaml:"knowledge,omitempty"`
-	Cost        CostConfig  `json:"cost" yaml:"cost"`
-	Limit       LimitConfig `json:"limit" yaml:"limit"`
+	Name         string      `json:"name" yaml:"name"`
+	BaseURL      string      `json:"baseUrl,omitempty" yaml:"baseUrl,omitempty"`
+	APIKey       string      `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
+	APIModelName string      `json:"apiModelName,omitempty" yaml:"apiModelName,omitempty"`
+	Family       string      `json:"family,omitempty" yaml:"family,omitempty"`
+	Attachment   bool        `json:"attachment,omitempty" yaml:"attachment,omitempty"`
+	Reasoning    bool        `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
+	Temperature  bool        `json:"temperature,omitempty" yaml:"temperature,omitempty"`
+	Knowledge    string      `json:"knowledge,omitempty" yaml:"knowledge,omitempty"`
+	Cost         CostConfig  `json:"cost" yaml:"cost"`
+	Limit        LimitConfig `json:"limit" yaml:"limit"`
 
 	// Generation parameter defaults for this model.
 	// These are applied when the user hasn't explicitly set the corresponding
@@ -493,6 +495,27 @@ mcpServers:
 #     maxTokens: 16384
 #     systemPrompt: "You are a deep reasoning assistant."  # or a file path
 
+# Skills configuration (all optional)
+# no-skills: false                          # Set to true to disable all skill loading
+# skill:                                    # Explicit skill files/dirs (disables auto-discovery)
+#   - "/path/to/skill.md"
+# skills-dir: "/path/to/skills"            # Scan this directory directly for skills (overrides auto-discovery)
+# skill-disable:                            # Hide skills from the model catalog by name (still usable via /skill:)
+#   - "some-skill"
+#
+# Skill files follow the agentskills.io spec. A SKILL.md frontmatter block
+# supports these fields:
+#   name: my-skill                          # required
+#   description: Use when ...               # required (basis for model discovery)
+#   license: MIT                            # optional SPDX identifier
+#   compatibility: claude-code, cursor      # optional targeted-environment note
+#   allowed-tools: read, bash               # optional (experimental) tool restriction
+#   disable-model-invocation: false         # optional; true hides from the catalog
+#   metadata:                               # optional arbitrary key/value pairs
+#     author: you
+#   tags: [example]                         # Kit extension
+#   when: on-demand                         # Kit extension
+
 # API Configuration (can also use environment variables)
 # provider-api-key: "your-api-key"         # API key for OpenAI, Anthropic, or Google
 # provider-url: "https://api.openai.com/v1" # Base URL for OpenAI, Anthropic, or Ollama
@@ -547,7 +570,7 @@ func FilepathOr[T any](key string, value *T) error {
 				absPath = filepath.Join(home, absPath[2:])
 			}
 			if !filepath.IsAbs(absPath) {
-				base := configPath
+				base := GetConfigPath()
 				if base == "" {
 					fmt.Fprintf(os.Stderr, "unable to build relative path to config.")
 					os.Exit(1)
@@ -574,11 +597,24 @@ func FilepathOr[T any](key string, value *T) error {
 	return nil
 }
 
-var configPath string
+var (
+	configPathMu sync.RWMutex
+	configPath   string
+)
 
 // SetConfigPath sets the configuration file path for resolving relative paths
 // in configuration values. This should be called when the configuration file
-// location is known.
+// location is known. It is safe for concurrent use.
 func SetConfigPath(path string) {
+	configPathMu.Lock()
+	defer configPathMu.Unlock()
 	configPath = path
+}
+
+// GetConfigPath returns the configuration file path previously set via
+// SetConfigPath. It is safe for concurrent use.
+func GetConfigPath() string {
+	configPathMu.RLock()
+	defer configPathMu.RUnlock()
+	return configPath
 }

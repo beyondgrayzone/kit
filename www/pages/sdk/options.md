@@ -7,6 +7,16 @@ description: Configuration options for the Kit Go SDK.
 
 Pass an `Options` struct to `kit.New()` to configure the Kit instance.
 
+::: tip
+For simple setups, `kit.NewAgent(ctx, ...Option)` provides functional-options
+helpers (`WithModel`, `WithStreaming`, `Ephemeral`, ...) over the same `Options`
+struct. See [Functional options](/sdk/overview#functional-options-newagent).
+:::
+
+Each `kit.New` / `kit.NewAgent` call owns an isolated configuration store, so
+these options never leak between Kit instances in the same process. See
+[Per-instance config isolation](/sdk/overview#per-instance-config-isolation).
+
 ## Full options reference
 
 ```go
@@ -18,9 +28,10 @@ host, err := kit.New(ctx, &kit.Options{
 
     // Behavior
     MaxSteps:     10,
-    Streaming:    true,
+    Streaming:    ptrBool(true), // *bool: nil = unset (default true), &false = off
     Quiet:        true,
     Debug:        true,
+    DebugLogger:  myLogger,       // optional; overrides Debug + built-in logger when non-nil
 
     // Generation parameters (override env/config/per-model defaults)
     MaxTokens:        16384,              // 0 = auto-resolve; non-zero suppresses right-sizing
@@ -54,9 +65,10 @@ host, err := kit.New(ctx, &kit.Options{
     AutoCompact:  true,
 
     // Skills
-    Skills:       []string{"/path/to/skill.md"},
-    SkillsDir:    "/path/to/skills/",
-    NoSkills:     true,
+    Skills:        []string{"/path/to/skill.md"},
+    SkillsDir:     "/path/to/skills/",
+    SkillsDisable: []string{"noisy-skill"},
+    NoSkills:      true,
 
     // Feature toggles
     NoExtensions:   true,               // disable Yaegi extension loading
@@ -91,9 +103,10 @@ host, err := kit.New(ctx, &kit.Options{
 | `SystemPrompt` | `string` | — | System prompt text or file path |
 | `ConfigFile` | `string` | `~/.kit.yml` | Path to config file |
 | `MaxSteps` | `int` | `0` | Max agent steps (0 = unlimited) |
-| `Streaming` | `bool` | `true` | Enable streaming output |
+| `Streaming` | `*bool` | `nil` | Enable streaming output. `nil` leaves it to the precedence chain (env → config → default `true`); `&true`/`&false` forces it. Pointer so unset is distinct from explicit `false`. |
 | `Quiet` | `bool` | `false` | Suppress output |
-| `Debug` | `bool` | `false` | Enable debug logging |
+| `Debug` | `bool` | `false` | Enable debug logging via the built-in console / buffered logger. Ignored when `DebugLogger` is non-nil. |
+| `DebugLogger` | `DebugLogger` | `nil` | Caller-supplied logger that receives low-level engine + MCP tool plumbing debug output. When non-nil this overrides `Debug` — the supplied logger's `IsDebugEnabled()` controls downstream emission. See [Custom debug logger](#custom-debug-logger). |
 
 ### Generation parameters
 
@@ -114,9 +127,10 @@ defaults for samplers).
 | `FrequencyPenalty` | `*float32` | — | OpenAI-family frequency penalty. `nil` leaves provider default. |
 | `PresencePenalty` | `*float32` | — | OpenAI-family presence penalty. `nil` leaves provider default. |
 
-Pointer-typed samplers are populated via a tiny helper:
+Pointer-typed fields (`Streaming` and the samplers) are populated via tiny helpers:
 
 ```go
+func ptrBool(v bool) *bool          { return &v }
 func ptrFloat32(v float32) *float32 { return &v }
 ```
 
@@ -127,7 +141,7 @@ when embedding Kit as a library.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `ProviderAPIKey` | `string` | — | API key used to authenticate with the provider. `""` falls back to config / provider-specific env var (e.g. `ANTHROPIC_API_KEY`). When set, overrides any pre-existing viper state. |
+| `ProviderAPIKey` | `string` | — | API key used to authenticate with the provider. `""` falls back to config / provider-specific env var (e.g. `ANTHROPIC_API_KEY`). When set, it takes precedence over config and env values on this instance's store. |
 | `ProviderURL` | `string` | — | Override the provider endpoint (e.g. LiteLLM, vLLM, Azure OpenAI, internal proxy). `""` = provider default. |
 | `TLSSkipVerify` | `bool` | `false` | Disable TLS certificate verification on the provider HTTP client. Only effective when `true`; to force-disable, use config file or env var instead. For self-signed dev certs only. |
 
@@ -157,8 +171,51 @@ when embedding Kit as a library.
 |-------|------|---------|-------------|
 | `SkipConfig` | `bool` | `false` | Skip `.kit.yml` file loading (viper defaults + env vars still apply) |
 | `Skills` | `[]string` | — | Explicit skill files/dirs to load |
-| `SkillsDir` | `string` | — | Override default skills directory |
+| `SkillsDir` | `string` | — | Scan this directory directly for skills (overrides auto-discovery; scanned as-is) |
+| `SkillsDisable` | `[]string` | — | Skill names to hide from the model catalog (still usable via `/skill:`) |
+| `SkillTrustPrompt` | `func(projectDir string, skillCount int) TrustDecision` | `nil` | Callback gating project-local skill loading on a trust decision (see below) |
 | `NoSkills` | `bool` | `false` | Disable skill loading entirely |
+
+#### Project-skill trust gate
+
+Project-local skills (under `<project>/.agents/skills/` or `<project>/.kit/skills/`)
+are injected into the system prompt, so loading them from an untrusted, freshly
+cloned repository is a prompt-injection vector. Set `SkillTrustPrompt` to gate
+that first load on an explicit decision. When `nil` (the default), project
+skills load without prompting — preserving historical behaviour.
+
+```go
+opts := &kit.Options{
+    SkillTrustPrompt: func(projectDir string, skillCount int) kit.TrustDecision {
+        // Consult your own UI / policy here.
+        if userApproves(projectDir, skillCount) {
+            return kit.TrustProject     // load and persist the directory as trusted
+        }
+        return kit.SkipProjectSkills    // do not load project skills
+    },
+}
+```
+
+The callback returns one of three `TrustDecision` values:
+
+| Decision | Effect |
+|----------|--------|
+| `kit.TrustProject` | Load project skills and persist `projectDir` to `~/.config/kit/trusted-projects.json` (not prompted again) |
+| `kit.TrustProjectOnce` | Load project skills for this run only, without persisting |
+| `kit.SkipProjectSkills` | Do not load project skills |
+
+A directory already on the persisted allowlist is trusted without invoking the
+callback. The Kit CLI wires this to an interactive terminal prompt automatically
+for TTY sessions.
+
+These fields only control the **initial** skill and context-file set picked
+up by `New()`. To add, remove, or replace skills and `AGENTS.md`-style
+context files at runtime (e.g. per user or per session), use the
+`AddSkill` / `LoadAndAddSkill` / `RemoveSkill` / `SetSkills` /
+`DisableSkill` / `EnableSkill` and
+`AddContextFile` / `AddContextFileContent` / `RemoveContextFile` /
+`SetContextFiles` methods on `*kit.Kit`. See
+[Runtime skills and context files](/sdk/overview#runtime-skills-and-context-files).
 
 ### Compaction & MCP
 
@@ -326,6 +383,45 @@ loaded MCP server that advertises the corresponding capability.
 
 Context cancellation also works end-to-end: cancelling the `ctx` passed to a
 tool execution triggers a best-effort `tasks/cancel` before the call returns.
+
+## Custom debug logger
+
+Kit's engine and MCP tool plumbing emit low-level debug output through a
+`DebugLogger` interface. By default, setting `Debug: true` (or calling
+`WithDebug()`) installs the built-in console logger. To route the same output
+into your application's logging system instead, provide a custom
+implementation via `Options.DebugLogger` or `WithDebugLogger`.
+
+```go
+type DebugLogger interface {
+    LogDebug(message string)
+    IsDebugEnabled() bool
+}
+```
+
+When `DebugLogger` is non-nil it takes precedence over `Debug` — the
+supplied logger's `IsDebugEnabled()` reports whether downstream code should
+bother formatting messages.
+
+**Example: forward to `log/slog`:**
+
+```go
+import "log/slog"
+
+type slogDebugLogger struct{ l *slog.Logger }
+
+func (s *slogDebugLogger) LogDebug(m string)    { s.l.Debug(m) }
+func (s *slogDebugLogger) IsDebugEnabled() bool { return true }
+
+host, _ := kit.NewAgent(ctx,
+    kit.WithModel("anthropic/claude-sonnet-4-5-20250929"),
+    kit.WithDebugLogger(&slogDebugLogger{l: slog.Default()}),
+)
+```
+
+Implementations must be safe for concurrent use — messages can arrive
+from the engine goroutine, MCP connection pool, and tool execution paths
+simultaneously.
 
 ## Precedence
 

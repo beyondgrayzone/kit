@@ -1,5 +1,24 @@
 package extensions
 
+import (
+	"errors"
+)
+
+// ErrAgentBusy is returned (wrapped) when an extension API call that requires
+// the agent to be idle cannot proceed because the agent is still processing a
+// turn or post-turn hooks. Most notably, ctx.NewSession waits for idle
+// internally; if its wait deadline elapses it returns an error that wraps
+// this sentinel.
+//
+// Extensions can detect the condition with errors.Is:
+//
+//	if err := ctx.NewSession(prompt); err != nil {
+//	    if errors.Is(err, ext.ErrAgentBusy) {
+//	        // agent never settled — fall back to a queued message instead
+//	    }
+//	}
+var ErrAgentBusy = errors.New("agent is busy")
+
 // ---------------------------------------------------------------------------
 // Internal types (used by runner, NOT exposed to Yaegi)
 // ---------------------------------------------------------------------------
@@ -123,6 +142,48 @@ type Context struct {
 	//       {Filename: "photo.jpg", Data: data, MediaType: "image/jpeg"},
 	//   })
 	SendMultimodalMessage func(text string, files []FilePart)
+
+	// NewSession ends the current session and starts a fresh one (matching
+	// the /new slash command). When prompt is non-empty it is submitted as
+	// the first user turn of the new session, with @file references
+	// expanded the same way they are for normal user input. Pass an empty
+	// string to start an empty session.
+	//
+	// If the agent is currently busy when NewSession is called (for example,
+	// from an OnAgentEnd hook that fires before the agent fully settles, or
+	// while post-turn formatters/linters are still running), the call blocks
+	// until the agent transitions to idle. This avoids the v0.79.0
+	// phase-handoff race where NewSession from OnAgentEnd would fail with
+	// "agent is busy" because TurnEnd fires before the busy flag clears.
+	// The wait has a generous internal timeout; if it elapses the returned
+	// error wraps ErrAgentBusy (detectable with errors.Is).
+	//
+	// Returns an error if the agent does not become idle within the wait
+	// window, if a registered BeforeSessionSwitch handler cancels the
+	// switch, or if the new session file cannot be created. In
+	// non-interactive (ACP / headless) mode this is a no-op that returns
+	// an error.
+	//
+	// Because NewSession may block, call it from a goroutine — not
+	// directly from inside an event handler that the agent loop is waiting
+	// on.
+	//
+	// Typical pattern — start a fresh session at the end of a phase by
+	// reading a handoff file:
+	//
+	//   api.OnAgentEnd(func(e ext.AgentEndEvent, ctx ext.Context) {
+	//       msgs := ctx.GetMessages()
+	//       if len(msgs) == 0 {
+	//           return
+	//       }
+	//       last := msgs[len(msgs)-1].Content
+	//       if strings.Contains(last, "<HANDOFF_READY>") {
+	//           go func() {
+	//               _ = ctx.NewSession("Read @HANDOFF.md and continue the next phase.")
+	//           }()
+	//       }
+	//   })
+	NewSession func(prompt string) error
 
 	// GetSessionUsage returns aggregated token usage and cost statistics
 	// for the current session. This includes total input/output tokens,
@@ -347,6 +408,13 @@ type Context struct {
 	// The data survives across session restarts and can be retrieved via
 	// GetEntries. Use entryType to namespace your data (e.g. "myext:state").
 	//
+	// AppendEntry is append-only and lives in the conversation tree, which
+	// makes it the right tool for audit logs and event histories. For
+	// last-write-wins snapshot state — "what's the current value of X?" —
+	// prefer SetState / GetState instead. Those primitives store data in a
+	// sidecar file outside the conversation tree, are O(1) to read/write,
+	// and do not bloat branch reads or duplicate on fork.
+	//
 	// Example:
 	//
 	//   data, _ := json.Marshal(myState)
@@ -365,6 +433,45 @@ type Context struct {
 	//       json.Unmarshal([]byte(last.Data), &myState)
 	//   }
 	GetEntries func(entryType string) []ExtensionEntry
+
+	// SetState stores a key-value pair in session-scoped, last-write-wins
+	// extension state. Unlike AppendEntry the value is kept in a sidecar
+	// file outside the conversation tree, so:
+	//   - reads are O(1) (no branch walk)
+	//   - writes don't bloat the session JSONL
+	//   - state is not duplicated on fork (branches share the sidecar)
+	//   - state is invisible to the LLM
+	//
+	// Use SetState for snapshot state ("current value of X"); use
+	// AppendEntry for audit logs and event histories. Namespace keys with
+	// your extension name to avoid collisions (e.g. "myext:budget-cap").
+	//
+	// State persists for the lifetime of the session. For ephemeral or
+	// in-memory sessions the state lives only in memory.
+	//
+	// Example:
+	//
+	//   ctx.SetState("myext:budget-cap", "10.00")
+	SetState func(key string, value string)
+
+	// GetState returns the value previously stored via SetState. The bool
+	// is false when the key was never written. Returns ("", false) when
+	// state is unavailable.
+	//
+	// Example:
+	//
+	//   if cap, ok := ctx.GetState("myext:budget-cap"); ok {
+	//       fmt.Println("current cap:", cap)
+	//   }
+	GetState func(key string) (string, bool)
+
+	// DeleteState removes a key from session-scoped extension state.
+	// No-op when the key is missing.
+	DeleteState func(key string)
+
+	// ListState returns all keys currently stored in session-scoped
+	// extension state, in unspecified order.
+	ListState func() []string
 
 	// SetEditorText sets the text content of the input editor. This can
 	// be used to pre-fill the editor with suggested text (e.g. extracted
@@ -676,7 +783,8 @@ type Context struct {
 	LoadSkillsFromDir func(dir string) SkillLoadResult
 
 	// DiscoverSkills finds skills in standard locations.
-	// Checks ~/.config/kit/skills/, .kit/skills/, .agents/skills/
+	// Checks ~/.agents/skills/, ~/.config/kit/skills/, <project>/.agents/skills/,
+	// and <project>/.kit/skills/.
 	DiscoverSkills func() SkillLoadResult
 
 	// InjectSkillAsContext sends a skill's content as a system message.
@@ -808,9 +916,24 @@ type Skill struct {
 	Content string
 	// Path is the absolute filesystem path.
 	Path string
-	// Tags are optional labels for categorization.
+	// License is an optional SPDX license identifier (agentskills.io field).
+	License string
+	// Compatibility is an optional note describing targeted environments
+	// (agentskills.io field).
+	Compatibility string
+	// Metadata is an optional bag of arbitrary string key/value pairs
+	// (agentskills.io field).
+	Metadata map[string]string
+	// AllowedTools optionally restricts which tools the skill may use
+	// (experimental agentskills.io field).
+	AllowedTools string
+	// DisableModelInvocation hides the skill from the model-facing catalog
+	// while keeping it available via explicit activation (agentskills.io field).
+	DisableModelInvocation bool
+	// Tags are optional labels for categorization. Kit extension.
 	Tags []string
 	// When controls automatic inclusion: "always", "on-demand", or file-glob.
+	// Kit extension.
 	When string
 }
 
@@ -1108,6 +1231,7 @@ type API struct {
 	onError                   func(func(ErrorEvent, Context))
 	onRetry                   func(func(RetryEvent, Context))
 	onPrepareStep             func(func(PrepareStepEvent, Context) *PrepareStepResult)
+	onLLMUsage                func(func(LLMUsageEvent, Context))
 }
 
 // OnToolCall registers a handler that fires before a tool executes.
@@ -1363,6 +1487,19 @@ func (a *API) OnRetry(handler func(RetryEvent, Context)) {
 // Messages to replace the context window for this step.
 func (a *API) OnPrepareStep(handler func(PrepareStepEvent, Context) *PrepareStepResult) {
 	a.onPrepareStep(handler)
+}
+
+// OnLLMUsage registers a handler that fires after each LLM provider call
+// with the token and cost deltas for that single call. Use this for
+// per-call usage attribution, real-time budget enforcement, and cost
+// dashboards that need to react between calls within a single agent turn.
+//
+// Handlers receive an LLMUsageEvent describing the call's input/output
+// tokens, cache tokens, computed cost, model, and provider. A single agent
+// turn typically fires multiple LLMUsageEvents (one per tool-loop
+// iteration).
+func (a *API) OnLLMUsage(handler func(LLMUsageEvent, Context)) {
+	a.onLLMUsage(handler)
 }
 
 // RegisterToolRenderer registers a custom renderer for a specific tool's
@@ -2105,10 +2242,47 @@ type AgentStartEvent struct {
 
 func (e AgentStartEvent) Type() EventType { return AgentStart }
 
-// AgentEndEvent fires when the agent finishes responding.
+// AgentEndEvent fires when the agent finishes responding. In addition to the
+// final response and stop reason, the event carries per-turn aggregates so
+// observer-style extensions don't have to maintain parallel bookkeeping in
+// OnToolResult / OnStepFinish handlers.
 type AgentEndEvent struct {
 	Response   string
 	StopReason string // "completed", "cancelled", "error"
+
+	// ToolCallCount is the total number of tool invocations observed during
+	// this turn (sum across all steps).
+	ToolCallCount int
+
+	// ToolNames lists the tool names invoked during this turn, in call order.
+	// Duplicates are preserved (e.g. two bash calls produce ["bash", "bash"]).
+	ToolNames []string
+
+	// LLMCallCount is the number of LLM round-trips (tool-loop iterations)
+	// performed during this turn. Always >= 1 for a successful turn.
+	LLMCallCount int
+
+	// InputTokensDelta is the sum of input tokens consumed during this turn
+	// across every LLM call (including cache-hit input tokens).
+	InputTokensDelta int
+
+	// OutputTokensDelta is the sum of output tokens generated during this turn.
+	OutputTokensDelta int
+
+	// CacheReadTokensDelta is the sum of cache-read tokens during this turn.
+	CacheReadTokensDelta int
+
+	// CacheWriteTokensDelta is the sum of cache-write tokens during this turn.
+	CacheWriteTokensDelta int
+
+	// CostDelta is the total cost in USD attributable to this turn. Computed
+	// from per-step usage and current model pricing. Zero when pricing is
+	// unknown or OAuth credentials are in use.
+	CostDelta float64
+
+	// DurationMs is the elapsed wall-clock time from AgentStart to AgentEnd,
+	// in milliseconds.
+	DurationMs int64
 }
 
 func (e AgentEndEvent) Type() EventType { return AgentEnd }
@@ -2213,6 +2387,12 @@ type BeforeSessionSwitchEvent struct {
 	// Reason describes why the switch is happening: "new" for /new command,
 	// "clear" for /clear command.
 	Reason string
+	// InitialPrompt, when non-empty, is the prompt that will be submitted
+	// as the first user turn of the new session. Set when /new is invoked
+	// with an argument (e.g. "/new continue from HANDOFF.md") or when an
+	// extension calls ctx.NewSession(prompt). Extensions may inspect this
+	// to decide whether to allow the switch.
+	InitialPrompt string
 }
 
 func (e BeforeSessionSwitchEvent) Type() EventType { return BeforeSessionSwitch }
@@ -2416,6 +2596,43 @@ type PrepareStepResult struct {
 }
 
 func (PrepareStepResult) isResult() {}
+
+// LLMUsageEvent fires after each LLM provider call with the per-call token
+// and cost deltas. Use this for accurate budget tracking, cost dashboards,
+// and any logic that needs to react between LLM calls within a single agent
+// turn (rather than only at turn boundaries).
+//
+// A single agent turn typically produces multiple LLMUsageEvents (one per
+// tool-loop iteration). The Model and Provider fields reflect the model used
+// for that specific call, which may differ from earlier calls if the
+// extension switched models mid-turn via ctx.SetModel().
+type LLMUsageEvent struct {
+	// InputTokens is the number of input tokens for this call.
+	InputTokens int
+	// OutputTokens is the number of output tokens generated by this call.
+	OutputTokens int
+	// CacheReadTokens is the number of cache-hit input tokens (provider-specific).
+	CacheReadTokens int
+	// CacheWriteTokens is the number of cache-write tokens.
+	CacheWriteTokens int
+	// Cost is the USD cost of this call computed from the model's per-token
+	// pricing. Zero when pricing is unknown or OAuth credentials are in use.
+	Cost float64
+	// Model is the model identifier used for this call (e.g. "claude-sonnet-4-5-20250929").
+	Model string
+	// Provider is the provider identifier (e.g. "anthropic", "openai").
+	Provider string
+	// RequestID is an optional correlation id for the underlying provider
+	// call. May be empty when the provider does not surface one.
+	RequestID string
+	// StepNumber is the zero-based step index within the current agent turn.
+	StepNumber int
+	// FinishReason mirrors the provider's finish reason for this call
+	// (e.g. "stop", "tool_calls", "length"). May be empty.
+	FinishReason string
+}
+
+func (e LLMUsageEvent) Type() EventType { return LLMUsage }
 
 // ThemeColor is an adaptive color pair with light and dark hex values.
 // Either field may be empty to inherit from the default theme.

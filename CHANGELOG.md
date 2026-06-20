@@ -1,3 +1,77 @@
+# Changelog (Till 0.80.0)
+This changelog summarizes the changes found in the provided diff, categorized by
+functional area.
+
+⚠️ Breaking Changes & Refactors
+
+  - Extension Package Relocation: Moved internal/extensions to the top-level
+    extensions/ package. This allows external packages and unit tests to import
+    the extension API directly.
+      - Action Required: Update import paths from
+        github.com/mark3labs/kit/internal/extensions to
+        github.com/mark3labs/kit/extensions.
+  - Header/Footer API Update: SetHeader and SetFooter now require a
+    HeaderFooterConfig with a unique ID. RemoveHeader and RemoveFooter now
+    require an id string parameter.
+
+Extension System Improvements
+
+  - Multiple Headers/Footers: Extensions can now render multiple headers and
+    footers simultaneously.
+      - Added ID field to HeaderFooterConfig for tracking.
+      - Added Priority field (lower values render further left).
+      - The TUI now joins multiple widgets horizontally using
+        lipgloss.JoinHorizontal with gap spacing.
+  - Explicit Extension Loading: Added LoadExplicitExtensions to allow loading
+    specific extension paths even when automatic discovery is disabled (via
+    --no-extensions).
+  - Improved Reloading: Fixed a bug in Runner.Reload() to properly re-initialize
+    per-extension mutexes.
+  - Custom Events: Added a "reload" custom event emitted to extensions when they
+    are reloaded via the UI.
+
+UI & Navigation
+
+  - Input Word Navigation: Added Ctrl+Left and Ctrl+Right keybindings to
+    navigate by word boundaries in the input area.
+  - Input Mouse Support: Implemented "Crush-style" text selection within the
+    input component:
+      - Single-click to position cursor/start drag.
+      - Double-click to select word.
+      - Triple-click to select entire line.
+      - Automatic copying of selected text to clipboard on mouse release.
+  - End Key Support: Added End key binding to force-scroll to the bottom of the
+    scrollback buffer in all UI states.
+  - Clean Startup: Commented out the ASCII logo/banner to provide more vertical
+    real estate upon startup.
+  - Layout Fixes: Fixed a bug in setCursorOffset that caused incorrect cursor
+    positioning during multi-line navigation.
+
+Agent & Tool Improvements
+
+  - Enhanced Stop Reason Warnings: Added specific warning messages for
+    "suspicious" agent stops:
+      - Warns if the agent stops with an empty response (often indicating
+        MaxSteps reached).
+      - Warns if the agent stops while tool calls are still pending.
+  - Tool Documentation: Added CODE_WRITING_TOOL.md providing a detailed
+    implementation summary of the write and edit tools, including their fuzzy
+    matching logic and UI rendering.
+
+Testing & Internal
+
+  - Test Isolation: Improved TestLoadSkills_ProjectLocal by isolating it from
+    the user's real global skills using a temporary XDG_CONFIG_HOME.
+  - Mock Context Updates: Updated MockContext in the test package to support the
+    new ID-based multi-header/footer API.
+  - New Loader Tests: Added unit tests for explicit extension loading and
+    discovery skipping.
+
+Example Extensions
+
+  - Updated header-footer-demo.go, kit-kit.go, and minimal.go to implement the
+    new ID-based header/footer API.
+
 # Changelog (Till 0.70.2)
 
 # Merged upstream 0.70.2 and fix conflicts

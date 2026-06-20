@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/mark3labs/kit/internal/clipboard"
 	"github.com/mark3labs/kit/internal/ui/commands"
 	"github.com/mark3labs/kit/internal/ui/core"
+	"github.com/mark3labs/kit/internal/ui/imagepreview"
 	"github.com/mark3labs/kit/internal/ui/selection"
 	"github.com/mark3labs/kit/internal/ui/style"
 )
@@ -45,6 +47,12 @@ type InputComponent struct {
 	popupHeight int
 	submitNext  bool // defer submit one tick so popup dismisses cleanly
 
+	// popup is the shared PopupList used to render the / and @ autocomplete
+	// dropdowns. State (items, cursor, visible search-driven filter) is
+	// driven externally by InputComponent — we only use PopupList for the
+	// rendering chrome so all popups in the app look identical.
+	popup *PopupList
+
 	// Argument completion state. When the user types "/cmd " followed by
 	// a partial argument and the command has a Complete function, the popup
 	// switches to argument-completion mode showing suggestions from Complete.
@@ -56,9 +64,15 @@ type InputComponent struct {
 	// file path, the popup shows file/directory suggestions from the cwd.
 	fileMode        bool                    // true when showing @file completions
 	filePrefix      string                  // current text after @ being matched
-	fileAtStartIdx  int                     // byte offset of @ in the textarea value
+	fileAtStartIdx  int                     // byte offset of @ (or path start in /edit mode) in the textarea value
 	fileSuggestions []FileSuggestion        // backing storage for file entries
 	fileSynthCmds   []commands.SlashCommand // synthetic commands.SlashCommands wrapping file entries
+
+	// fileEditMode is true when fileMode was activated by the /edit slash
+	// command rather than an @ trigger. Selecting a file submits the line
+	// (running $EDITOR on it); selecting a directory drills further like @
+	// does. MCP resources are excluded in this mode.
+	fileEditMode bool
 
 	// cwd is the working directory used for @file path resolution and
 	// autocomplete suggestions. Set by the parent via SetCwd.
@@ -82,6 +96,23 @@ type InputComponent struct {
 	// pendingImages holds clipboard images attached to the next submission.
 	// Images are added via Ctrl+V and cleared on submit or Ctrl+U.
 	pendingImages []core.ImageAttachment
+
+	// imageThumbs caches the rendered half-block thumbnail for each entry in
+	// pendingImages (1:1 index correspondence). Thumbnails are rendered
+	// asynchronously off the Bubble Tea event loop (decode + resample is too
+	// slow to run inside Update), so an entry starts as the empty string
+	// placeholder and is filled in when the matching thumbnailReadyMsg
+	// arrives. An entry stays empty when the terminal cannot display a
+	// half-block preview, in which case the text pill is shown alone.
+	// See internal/ui/imagepreview.
+	imageThumbs []string
+
+	// imageGen is a monotonic generation counter incremented whenever the
+	// pending image set is cleared. Async thumbnail results carry the
+	// generation they were enqueued under and are discarded if it no longer
+	// matches, preventing a stale thumbnail from landing on the wrong slot
+	// after a clear + re-attach.
+	imageGen int
 
 	// history stores previously submitted prompts (most recent last).
 	// Limited to maxHistory entries; duplicates of the previous entry are
@@ -113,6 +144,16 @@ const maxHistory = 100
 type clipboardImageMsg struct {
 	image *core.ImageAttachment
 	err   error
+}
+
+// thumbnailReadyMsg carries the result of an async thumbnail render back to
+// the Update loop. gen and index identify the pendingImages slot the
+// thumbnail belongs to; the result is dropped if the generation no longer
+// matches (the pending set was cleared) or the index is out of range.
+type thumbnailReadyMsg struct {
+	gen   int
+	index int
+	thumb string
 }
 
 // NewInputComponent creates a new InputComponent with the given width and
@@ -155,7 +196,7 @@ func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 	styles.Focused.CursorLine = lipgloss.NewStyle()
 	ta.SetStyles(styles)
 
-	return &InputComponent{
+	ic := &InputComponent{
 		textarea:    ta,
 		commands:    commands.SlashCommands,
 		width:       width,
@@ -163,6 +204,12 @@ func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 		appCtrl:     appCtrl,
 		hideHint:    true,
 	}
+	ic.popup = NewPopupList("", nil, width, 0)
+	ic.popup.ShowSearch = false
+	ic.popup.HideCount = true
+	ic.popup.MaxVisible = ic.popupHeight
+	ic.popup.FooterHint = "↑↓ navigate • tab complete • ↵ select • esc dismiss"
+	return ic
 }
 
 // SetCwd sets the working directory used for @file autocomplete suggestions
@@ -379,7 +426,23 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return s, nil
 		}
 		if msg.image != nil {
-			s.pendingImages = append(s.pendingImages, *msg.image)
+			img := *msg.image
+			index := len(s.pendingImages)
+			s.pendingImages = append(s.pendingImages, img)
+			// Reserve a placeholder; the async render fills it in via
+			// thumbnailReadyMsg so Update never blocks on decode/resample.
+			s.imageThumbs = append(s.imageThumbs, "")
+			cols := s.thumbCols()
+			if cols < 1 {
+				return s, nil
+			}
+			return s, renderThumbnailCmd(img, cols, thumbMaxRows, style.GetTheme().Background, s.imageGen, index)
+		}
+		return s, nil
+
+	case thumbnailReadyMsg:
+		if msg.gen == s.imageGen && msg.index >= 0 && msg.index < len(s.imageThumbs) {
+			s.imageThumbs[msg.index] = msg.thumb
 		}
 		return s, nil
 
@@ -452,6 +515,8 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Clear all pending image attachments.
 				if len(s.pendingImages) > 0 {
 					s.pendingImages = nil
+					s.imageThumbs = nil
+					s.imageGen++
 					return s, nil
 				}
 			}
@@ -607,10 +672,17 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					s.showPopup = false
 					s.fileMode = false
+					s.fileEditMode = false
 				}
 			} else if len(lines) == 1 && strings.HasPrefix(lines[0], "/") {
 				s.fileMode = false
-				if !strings.Contains(lines[0], " ") {
+				s.fileEditMode = false
+				if cmdLen, pathPrefix, isEdit := ExtractEditPrefix(lines[0]); isEdit {
+					// /edit fuzzy-file picker. Behaves like @ except
+					// MCP resources are excluded and selecting a file
+					// submits the line (running $EDITOR).
+					s.updateEditFilePopup(cmdLen, pathPrefix)
+				} else if !strings.Contains(lines[0], " ") {
 					// Command name completion.
 					s.showPopup = true
 					s.argMode = false
@@ -630,6 +702,7 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				s.showPopup = false
 				s.argMode = false
 				s.fileMode = false
+				s.fileEditMode = false
 			}
 		}
 		return s, cmd
@@ -688,6 +761,8 @@ func (s *InputComponent) handleSubmit(value string) tea.Cmd {
 	// images and clear them.
 	images := s.pendingImages
 	s.pendingImages = nil
+	s.imageThumbs = nil
+	s.imageGen++
 	return func() tea.Msg {
 		return core.SubmitMsg{Text: trimmed, Images: images}
 	}
@@ -719,6 +794,42 @@ func (s *InputComponent) resetHistoryBrowsing() {
 	s.historyIndex = len(s.history)
 	s.browsingHistory = false
 	s.savedInput = ""
+}
+
+// thumbMaxCols and thumbMaxRows cap the size, in terminal cells, of pending
+// image previews. Kept small for the low-res look and to keep scrollback
+// light.
+const (
+	thumbMaxCols = 40
+	thumbMaxRows = 12
+)
+
+// thumbCols returns the thumbnail width in terminal cells given the current
+// input width, or 0 when there is no room to render a preview.
+func (s *InputComponent) thumbCols() int {
+	if s.width <= 6 {
+		return 0
+	}
+	cols := min(thumbMaxCols, s.width-6)
+	if cols < 1 {
+		return 0
+	}
+	return cols
+}
+
+// renderThumbnailCmd returns a tea.Cmd that renders a half-block ANSI preview
+// off the Bubble Tea event loop. The decode + resample work runs in the Cmd
+// goroutine, and the result is delivered as a thumbnailReadyMsg tagged with
+// the generation and slot index it was enqueued for. An empty thumbnail
+// (terminal unsupported or render error) leaves the text pill in place.
+func renderThumbnailCmd(img core.ImageAttachment, cols, rows int, bg color.Color, gen, index int) tea.Cmd {
+	return func() tea.Msg {
+		thumb, err := imagepreview.Render(img.Data, img.MediaType, cols, rows, bg)
+		if err != nil {
+			thumb = ""
+		}
+		return thumbnailReadyMsg{gen: gen, index: index, thumb: thumb}
+	}
 }
 
 // View implements tea.Model. Renders the textarea, autocomplete popup
@@ -764,7 +875,9 @@ func (s *InputComponent) View() tea.View {
 	// Popup is now rendered as a centered overlay in AppModel.View()
 	// instead of inline here to prevent bottom overflow
 
-	// Show image attachment indicator when images are pending.
+	// Show image attachment previews when images are pending. A cached
+	// half-block thumbnail is rendered when the terminal supports it;
+	// otherwise the text pill alone is shown.
 	if len(s.pendingImages) > 0 {
 		imgStyle := lipgloss.NewStyle().
 			Foreground(theme.Secondary).
@@ -773,6 +886,14 @@ func (s *InputComponent) View() tea.View {
 		label := fmt.Sprintf("[%d image(s) attached] ctrl+u to clear", len(s.pendingImages))
 		view.WriteString("\n")
 		view.WriteString(imgStyle.Render(label))
+
+		thumbStyle := lipgloss.NewStyle().PaddingLeft(3)
+		for i := range s.pendingImages {
+			if i < len(s.imageThumbs) && s.imageThumbs[i] != "" {
+				view.WriteString("\n")
+				view.WriteString(thumbStyle.Render(s.imageThumbs[i]))
+			}
+		}
 	}
 
 	if !s.hideHint {
@@ -811,191 +932,37 @@ func (s *InputComponent) View() tea.View {
 	return tea.NewView(containerStyle.Render(view.String()))
 }
 
-// renderPopup renders the autocomplete popup for slash command suggestions.
-// When rendered inline (not centered), returns the styled popup content.
-// RenderPopupCentered renders the popup as a centered overlay.
+// RenderPopupCentered renders the autocomplete popup for / or @ as a
+// centered overlay. Returns "" when the popup is not currently shown.
+// The actual filtering / selection state lives on InputComponent — this
+// method merely converts the filtered FuzzyMatch list into PopupItems
+// and asks the shared PopupList to draw it. As a result the / popup, the
+// @ popup, the model picker, the tree selector and the session selector
+// all share identical chrome.
 func (s *InputComponent) RenderPopupCentered(termWidth, termHeight int) string {
 	if !s.showPopup || len(s.filtered) == 0 {
 		return ""
 	}
 
-	popupContent := s.renderPopupWithOptions(true)
-
-	// Center popup using lipgloss.Place
-	positioned := lipgloss.Place(
-		termWidth,
-		termHeight,
-		lipgloss.Center,
-		lipgloss.Center,
-		popupContent,
-	)
-
-	return positioned
-}
-
-// renderPopupWithOptions renders the popup content with optional center styling.
-func (s *InputComponent) renderPopupWithOptions(centered bool) string {
-	theme := style.GetTheme()
-	popupWidth := max(s.width-4, 20)
-
-	// Use the theme background for the popup - the full-width item backgrounds
-	// and primary-colored selection will provide sufficient contrast
-	popupBg := theme.Background
-
-	popupStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Primary).
-		Background(popupBg).
-		Padding(1, 2).
-		Width(popupWidth).
-		MarginLeft(0).
-		MarginBottom(1) // Visual depth/shadow effect
-
-	// Inner content width: popup minus border (2) and horizontal padding (4).
-	innerWidth := max(popupWidth-6, 10)
-
-	// Item background styles for high contrast
-	normalItemBg := lipgloss.NewStyle().
-		Background(popupBg).
-		Foreground(theme.Text).
-		Width(innerWidth).
-		Padding(0, 1)
-
-	selectedItemBg := lipgloss.NewStyle().
-		Background(theme.Primary).
-		Foreground(theme.Background).
-		Width(innerWidth).
-		Padding(0, 1).
-		Bold(true)
-
-	var items []string
-
-	visibleItems := min(len(s.filtered), s.popupHeight)
-	startIdx := 0
-	if s.selected >= s.popupHeight {
-		startIdx = s.selected - s.popupHeight + 1
-	}
-	endIdx := min(startIdx+visibleItems, len(s.filtered))
-
-	for i := startIdx; i < endIdx; i++ {
-		match := s.filtered[i]
-		sc := match.Command
-
-		// Choose the appropriate background style
-		itemStyle := normalItemBg
-		if i == s.selected {
-			itemStyle = selectedItemBg
+	items := make([]PopupItem, len(s.filtered))
+	for i, m := range s.filtered {
+		desc := ""
+		if m.Command != nil {
+			desc = m.Command.Description
 		}
-
-		// Build indicator with proper coloring
-		var indicator string
-		if i == s.selected {
-			indicator = "> "
-		} else {
-			indicator = "  "
+		name := ""
+		if m.Command != nil {
+			name = m.Command.Name
 		}
-
-		// Build content with name and description
-		var content string
-		if s.fileMode {
-			// File mode: use full width for the path, show description inline
-			maxNameLen := max(innerWidth-16, 8)
-			displayName := sc.Name
-			if len(displayName) > maxNameLen && maxNameLen > 3 {
-				displayName = displayName[:maxNameLen-3] + "..."
-			}
-
-			if sc.Description != "" && innerWidth > 30 {
-				content = indicator + displayName + "  " + sc.Description
-			} else {
-				content = indicator + displayName
-			}
-		} else {
-			// Line layout: indicator(2) + name(nameWidth-2 visual) + desc
-			if innerWidth < 20 {
-				// Very narrow: show truncated name only
-				displayName := sc.Name
-				maxName := max(innerWidth-2, 3)
-				if len(displayName) > maxName {
-					displayName = displayName[:maxName-1] + "…"
-				}
-				content = indicator + displayName
-			} else {
-				// Compute nameWidth from the longest command name in the
-				// visible slice so we never truncate unnecessarily.
-				nameWidth := 0
-				for _, fm := range s.filtered {
-					if n := len([]rune(fm.Command.Name)); n > nameWidth {
-						nameWidth = n
-					}
-				}
-				nameWidth += 3 // account for indicator prefix (2) + gap before description (1)
-				// Ensure descriptions still get at least 20 chars when possible.
-				maxForName := innerWidth - 20
-				if maxForName < 8 {
-					maxForName = innerWidth * 2 / 3
-				}
-				if nameWidth > maxForName {
-					nameWidth = maxForName
-				}
-				if nameWidth < 8 {
-					nameWidth = 8
-				}
-				maxNameChars := nameWidth - 2
-				displayName := sc.Name
-				if len(displayName) > maxNameChars {
-					displayName = displayName[:maxNameChars-1] + "…"
-				}
-
-				// Description gets remaining space
-				maxDescLen := max(innerWidth-nameWidth, 0)
-				desc := sc.Description
-				if maxDescLen >= 4 && desc != "" {
-					if len(desc) > maxDescLen {
-						desc = desc[:maxDescLen-3] + "..."
-					}
-					content = indicator + lipgloss.NewStyle().Width(maxNameChars).Render(displayName) + desc
-				} else {
-					content = indicator + displayName
-				}
-			}
+		items[i] = PopupItem{
+			Label:       name,
+			Description: desc,
 		}
-
-		items = append(items, itemStyle.Render(content))
 	}
-
-	// Add scroll indicators with background
-	scrollStyle := lipgloss.NewStyle().
-		Background(popupBg).
-		Foreground(theme.VeryMuted).
-		Width(innerWidth).
-		Padding(0, 1)
-
-	if startIdx > 0 {
-		items = append([]string{scrollStyle.Render("  ↑ more above")}, items...)
-	}
-	if endIdx < len(s.filtered) {
-		items = append(items, scrollStyle.Render("  ↓ more below"))
-	}
-
-	content := strings.Join(items, "\n")
-
-	// Adapt footer text to available width with background
-	var footerText string
-	if innerWidth >= 50 {
-		footerText = "↑↓ navigate • tab complete • ↵ select • esc dismiss"
-	} else if innerWidth >= 30 {
-		footerText = "↑↓ nav • tab • ↵ select • esc"
-	} else {
-		footerText = "↑↓ tab ↵ esc"
-	}
-	footer := lipgloss.NewStyle().
-		Background(popupBg).
-		Foreground(theme.VeryMuted).
-		Italic(true).
-		Render(footerText)
-
-	return popupStyle.Render(content + "\n\n" + footer)
+	s.popup.SetSize(termWidth, termHeight)
+	s.popup.SetItems(items)
+	s.popup.SetCursor(s.selected)
+	return s.popup.RenderCentered(termWidth, termHeight)
 }
 
 // completeArgs checks whether the input line matches a command with a Complete
@@ -1064,6 +1031,8 @@ func readClipboardImageCmd() tea.Cmd {
 func (s *InputComponent) ClearPendingImages() []core.ImageAttachment {
 	images := s.pendingImages
 	s.pendingImages = nil
+	s.imageThumbs = nil
+	s.imageGen++
 	return images
 }
 
@@ -1216,6 +1185,7 @@ func (s *InputComponent) Clear() bool {
 	s.showPopup = false
 	s.argMode = false
 	s.fileMode = false
+	s.fileEditMode = false
 	s.browsingHistory = false
 	s.savedInput = ""
 	return hadContent
@@ -1225,6 +1195,11 @@ func (s *InputComponent) Clear() bool {
 // file or MCP resource suggestion. For directories, it keeps the popup open
 // for further drilling. For files and resources, it closes the popup and adds
 // a trailing space.
+//
+// When fileEditMode is active the same path-replacement happens against the
+// /edit (or alias) command prefix instead of an @ trigger. Selecting a file
+// also arms submitNext so the next tick runs $EDITOR on it; selecting a
+// directory keeps the popup open for drill-down.
 func (s *InputComponent) applyFileCompletion(idx int) {
 	if idx >= len(s.fileSuggestions) {
 		return
@@ -1243,7 +1218,17 @@ func (s *InputComponent) applyFileCompletion(idx int) {
 	beforeAt := lastLine[:s.fileAtStartIdx]
 
 	var replacement string
-	if suggestion.IsMCPResource {
+	switch {
+	case s.fileEditMode:
+		// /edit path mode — no @ prefix; the path is the bare argument.
+		// MCP resources are excluded upstream, so only file/dir entries reach here.
+		needsQuote := strings.Contains(suggestion.RelPath, " ")
+		if needsQuote {
+			replacement = `"` + suggestion.RelPath + `"`
+		} else {
+			replacement = suggestion.RelPath
+		}
+	case suggestion.IsMCPResource:
 		// MCP resources use @mcp:server:uri format.
 		// Quote if the URI contains spaces.
 		ref := "mcp:" + suggestion.MCPServerName + ":" + suggestion.MCPResourceURI
@@ -1253,7 +1238,7 @@ func (s *InputComponent) applyFileCompletion(idx int) {
 			replacement = "@" + ref
 		}
 		replacement += " "
-	} else {
+	default:
 		needsQuote := strings.Contains(suggestion.RelPath, " ")
 		if needsQuote {
 			replacement = `@"` + suggestion.RelPath + `"`
@@ -1279,9 +1264,61 @@ func (s *InputComponent) applyFileCompletion(idx int) {
 	if suggestion.IsDir && !suggestion.IsMCPResource {
 		// Keep popup open — trigger a refresh for the new directory.
 		s.lastValue = "" // force re-evaluation on next update tick
-	} else {
+		return
+	}
+
+	s.showPopup = false
+	s.fileMode = false
+	s.selected = 0
+
+	if s.fileEditMode {
+		// A file was selected via /edit — submit on the next tick so the
+		// popup dismisses cleanly before $EDITOR takes the terminal.
+		s.fileEditMode = false
+		s.submitNext = true
+	}
+}
+
+// updateEditFilePopup queries the file-suggestion engine for the /edit path
+// prefix and populates the popup state. cmdLen is the byte offset of the path
+// argument within the current line (i.e. length of "/edit " or "/ed ").
+// Directories are kept so the user can drill down; MCP resources are skipped.
+func (s *InputComponent) updateEditFilePopup(cmdLen int, pathPrefix string) {
+	var suggestions []FileSuggestion
+	if s.cwd != "" {
+		suggestions = GetFileSuggestions(pathPrefix, s.cwd)
+	}
+	if len(suggestions) == 0 {
 		s.showPopup = false
 		s.fileMode = false
-		s.selected = 0
+		s.fileEditMode = false
+		return
 	}
+
+	sort.Slice(suggestions, func(i, j int) bool {
+		return suggestions[i].Score > suggestions[j].Score
+	})
+	if len(suggestions) > maxFileSuggestions {
+		suggestions = suggestions[:maxFileSuggestions]
+	}
+
+	s.showPopup = true
+	s.fileMode = true
+	s.fileEditMode = true
+	s.argMode = false
+	s.filePrefix = pathPrefix
+	s.fileAtStartIdx = cmdLen
+	s.fileSuggestions = suggestions
+	s.fileSynthCmds = make([]commands.SlashCommand, len(suggestions))
+	s.filtered = make([]FuzzyMatch, len(suggestions))
+	for i, fs := range suggestions {
+		name := fs.RelPath
+		desc := ""
+		if fs.IsDir {
+			desc = "directory"
+		}
+		s.fileSynthCmds[i] = commands.SlashCommand{Name: name, Description: desc}
+		s.filtered[i] = FuzzyMatch{Command: &s.fileSynthCmds[i], Score: fs.Score}
+	}
+	s.selected = 0
 }

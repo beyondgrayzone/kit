@@ -11,12 +11,12 @@ import (
 // treeManagerAdapter adapts TreeManager to SessionManager interface.
 // This is unexported - users don't interact with it directly.
 type treeManagerAdapter struct {
-	inner *session.TreeManager
+	inner *TreeManager
 }
 
 // NewTreeManagerAdapter creates an adapter (exported for use in New function).
 // This is used by the SDK when no custom SessionManager is provided.
-func NewTreeManagerAdapter(tm *session.TreeManager) SessionManager {
+func NewTreeManagerAdapter(tm *TreeManager) SessionManager {
 	return &treeManagerAdapter{inner: tm}
 }
 
@@ -151,6 +151,11 @@ func (a *treeManagerAdapter) AppendModelChange(provider, modelID string) (string
 // GetContextEntryIDs implements SessionManager.
 func (a *treeManagerAdapter) GetContextEntryIDs() []string {
 	return a.inner.GetContextEntryIDs()
+}
+
+// AppendBranchSummary implements SessionManager.
+func (a *treeManagerAdapter) AppendBranchSummary(fromID, summary string) (string, error) {
+	return a.inner.AppendBranchSummary(fromID, summary)
 }
 
 // Close implements SessionManager.

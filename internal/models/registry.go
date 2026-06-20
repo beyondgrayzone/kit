@@ -16,17 +16,18 @@ var embeddedModelsJSON []byte
 
 // ModelInfo represents information about a specific model.
 type ModelInfo struct {
-	ID          string
-	Name        string
-	Family      string // Model family (e.g., "claude", "gpt", "gemini")
-	Attachment  bool
-	Reasoning   bool
-	Temperature bool
-	Cost        Cost
-	Limit       Limit
-	ProviderNPM string // Model-specific provider npm override (e.g. "@ai-sdk/anthropic")
-	BaseURL     string // Per-model base URL override (custom models only)
-	APIKey      string // Per-model API key override (custom models only)
+	ID           string
+	Name         string
+	Family       string // Model family (e.g., "claude", "gpt", "gemini")
+	Attachment   bool
+	Reasoning    bool
+	Temperature  bool
+	Cost         Cost
+	Limit        Limit
+	ProviderNPM  string // Model-specific provider npm override (e.g. "@ai-sdk/anthropic")
+	BaseURL      string // Per-model base URL override (custom models only)
+	APIKey       string // Per-model API key override (custom models only)
+	APIModelName string // Per-model API model name override (custom models only)
 
 	// Params holds per-model generation parameter defaults. These are applied
 	// when the user hasn't explicitly set the corresponding CLI flag or global
@@ -246,6 +247,7 @@ func loadEmbeddedProviders() map[string]modelsDBProvider {
 // doesn't track yet. Callers should treat a nil return as "unknown model"
 // and continue with sensible defaults.
 func (r *ModelsRegistry) LookupModel(provider, modelID string) *ModelInfo {
+	provider = catalogProviderID(provider)
 	providerInfo, exists := r.providers[provider]
 	if !exists {
 		return nil
@@ -273,6 +275,7 @@ func LookupModelForSettings(modelString string) *ModelInfo {
 
 // getRequiredEnvVars returns the required environment variables for a provider.
 func (r *ModelsRegistry) getRequiredEnvVars(provider string) ([]string, error) {
+	provider = catalogProviderID(provider)
 	providerInfo, exists := r.providers[provider]
 	if !exists {
 		return nil, fmt.Errorf("unsupported provider: %s", provider)
@@ -287,6 +290,7 @@ func (r *ModelsRegistry) getRequiredEnvVars(provider string) ([]string, error) {
 // variables. Returns nil for providers not in the registry (unknown
 // providers are assumed to handle auth themselves or via --provider-api-key).
 func (r *ModelsRegistry) ValidateEnvironment(provider string, apiKey string) error {
+	provider = catalogProviderID(provider)
 	if apiKey != "" {
 		return nil
 	}
@@ -306,6 +310,15 @@ func (r *ModelsRegistry) ValidateEnvironment(provider string, apiKey string) err
 	if provider == "openai" {
 		if cm, err := auth.NewCredentialManager(); err == nil {
 			if has, _ := cm.HasOpenAICredentials(); has {
+				return nil
+			}
+		}
+	}
+
+	// For GitHub Copilot, check stored GitHub OAuth credentials.
+	if provider == copilotProviderID {
+		if cm, err := auth.NewCredentialManager(); err == nil {
+			if has, _ := cm.HasCopilotCredentials(); has {
 				return nil
 			}
 		}
@@ -350,6 +363,7 @@ func (r *ModelsRegistry) ValidateEnvironment(provider string, apiKey string) err
 
 // SuggestModels returns similar model names when an invalid model is provided.
 func (r *ModelsRegistry) SuggestModels(provider, invalidModel string) []string {
+	provider = catalogProviderID(provider)
 	providerInfo, exists := r.providers[provider]
 	if !exists {
 		return nil
@@ -404,8 +418,8 @@ func isProviderLLMSupported(providerID string, info *ProviderInfo) bool {
 		return true
 	}
 
-	// Check if npm maps to an LLM provider
-	if _, ok := npmToLLMProvider[info.NPM]; ok {
+	// Check if npm maps to a known wire protocol
+	if _, ok := npmToWireProtocol[info.NPM]; ok {
 		return true
 	}
 
@@ -415,6 +429,7 @@ func isProviderLLMSupported(providerID string, info *ProviderInfo) bool {
 
 // GetModelsForProvider returns all models for a specific provider.
 func (r *ModelsRegistry) GetModelsForProvider(provider string) (map[string]ModelInfo, error) {
+	provider = catalogProviderID(provider)
 	providerInfo, exists := r.providers[provider]
 	if !exists {
 		return nil, fmt.Errorf("unsupported provider: %s", provider)
@@ -425,6 +440,7 @@ func (r *ModelsRegistry) GetModelsForProvider(provider string) (map[string]Model
 
 // GetProviderInfo returns the full provider info, or nil if not found.
 func (r *ModelsRegistry) GetProviderInfo(provider string) *ProviderInfo {
+	provider = catalogProviderID(provider)
 	info, exists := r.providers[provider]
 	if !exists {
 		return nil

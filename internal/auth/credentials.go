@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,11 +10,11 @@ import (
 	"time"
 )
 
-// CredentialStore holds all stored credentials for various providers.
-// Currently supports Anthropic and OpenAI credentials with both OAuth and API key authentication methods.
+// CredentialStore holds stored credentials for Anthropic, OpenAI, and GitHub Copilot.
 type CredentialStore struct {
 	Anthropic *AnthropicCredentials `json:"anthropic,omitempty"`
 	OpenAI    *OpenAICredentials    `json:"openai,omitempty"`
+	Copilot   *CopilotCredentials   `json:"copilot,omitempty"`
 }
 
 // AnthropicCredentials holds Anthropic API credentials supporting both OAuth
@@ -41,6 +42,16 @@ type OpenAICredentials struct {
 	ExpiresAt    int64     `json:"expires_at,omitempty"`    // For OAuth
 	AccountID    string    `json:"account_id,omitempty"`    // For OAuth (ChatGPT account ID)
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+// CopilotCredentials holds GitHub OAuth credentials and the short-lived
+// GitHub Copilot API token derived from them.
+type CopilotCredentials struct {
+	Type               string    `json:"type"`                           // "oauth"
+	GitHubToken        string    `json:"github_token,omitempty"`         // GitHub device-flow OAuth token
+	CopilotAccessToken string    `json:"copilot_access_token,omitempty"` // Short-lived Copilot API token
+	ExpiresAt          int64     `json:"expires_at,omitempty"`           // Copilot token expiry
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // oauthTokenExpired reports whether an OAuth token with the given type and
@@ -88,6 +99,16 @@ func (c *OpenAICredentials) IsExpired() bool {
 // to avoid authentication failures during operations. Returns false for API key
 // authentication or if no expiration is set.
 func (c *OpenAICredentials) NeedsRefresh() bool {
+	return oauthTokenNeedsRefresh(c.Type, c.ExpiresAt)
+}
+
+// IsExpired checks if the Copilot API token is expired.
+func (c *CopilotCredentials) IsExpired() bool {
+	return oauthTokenExpired(c.Type, c.ExpiresAt)
+}
+
+// NeedsRefresh reports whether the Copilot API token should be renewed.
+func (c *CopilotCredentials) NeedsRefresh() bool {
 	return oauthTokenNeedsRefresh(c.Type, c.ExpiresAt)
 }
 
@@ -222,7 +243,7 @@ func (cm *CredentialManager) RemoveAnthropicCredentials() error {
 	store.Anthropic = nil
 
 	// If store is empty, remove the file entirely
-	if store.Anthropic == nil {
+	if store.Anthropic == nil && store.OpenAI == nil && store.Copilot == nil {
 		if err := os.Remove(cm.credentialsPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove credentials file: %w", err)
 		}
@@ -255,29 +276,6 @@ func (cm *CredentialManager) HasAnthropicCredentials() (bool, error) {
 	}
 }
 
-// SetOpenAICredentials stores OpenAI API key credentials. It validates the
-// API key format before storing. The API key must start with "sk-" and be
-// at least 20 characters long. Returns an error if the API key is invalid or
-// if storage fails.
-func (cm *CredentialManager) SetOpenAICredentials(apiKey string) error {
-	if err := validateOpenAIAPIKey(apiKey); err != nil {
-		return err
-	}
-
-	store, err := cm.LoadCredentials()
-	if err != nil {
-		return err
-	}
-
-	store.OpenAI = &OpenAICredentials{
-		Type:      "api_key",
-		APIKey:    apiKey,
-		CreatedAt: time.Now(),
-	}
-
-	return cm.SaveCredentials(store)
-}
-
 // GetOpenAICredentials retrieves stored OpenAI credentials. Returns nil if
 // no credentials are stored. The returned credentials may be either OAuth or API
 // key type, check the Type field to determine which.
@@ -302,7 +300,7 @@ func (cm *CredentialManager) RemoveOpenAICredentials() error {
 	store.OpenAI = nil
 
 	// If store is empty, remove the file entirely
-	if store.Anthropic == nil && store.OpenAI == nil {
+	if store.Anthropic == nil && store.OpenAI == nil && store.Copilot == nil {
 		if err := os.Remove(cm.credentialsPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove credentials file: %w", err)
 		}
@@ -310,6 +308,104 @@ func (cm *CredentialManager) RemoveOpenAICredentials() error {
 	}
 
 	return cm.SaveCredentials(store)
+}
+
+// GetCopilotCredentials retrieves stored GitHub Copilot credentials.
+func (cm *CredentialManager) GetCopilotCredentials() (*CopilotCredentials, error) {
+	store, err := cm.LoadCredentials()
+	if err != nil {
+		return nil, err
+	}
+
+	return store.Copilot, nil
+}
+
+// RemoveCopilotCredentials removes stored GitHub Copilot credentials.
+func (cm *CredentialManager) RemoveCopilotCredentials() error {
+	store, err := cm.LoadCredentials()
+	if err != nil {
+		return err
+	}
+
+	store.Copilot = nil
+
+	if store.Anthropic == nil && store.OpenAI == nil && store.Copilot == nil {
+		if err := os.Remove(cm.credentialsPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove credentials file: %w", err)
+		}
+		return nil
+	}
+
+	return cm.SaveCredentials(store)
+}
+
+// HasCopilotCredentials checks if valid GitHub Copilot credentials are stored.
+func (cm *CredentialManager) HasCopilotCredentials() (bool, error) {
+	creds, err := cm.GetCopilotCredentials()
+	if err != nil {
+		return false, err
+	}
+	if creds == nil {
+		return false, nil
+	}
+
+	return creds.Type == "oauth" && creds.GitHubToken != "", nil
+}
+
+// SetCopilotOAuthCredentials stores GitHub Copilot OAuth credentials.
+func (cm *CredentialManager) SetCopilotOAuthCredentials(creds *CopilotCredentials) error {
+	store, err := cm.LoadCredentials()
+	if err != nil {
+		return err
+	}
+
+	store.Copilot = creds
+	return cm.SaveCredentials(store)
+}
+
+// GetValidCopilotAccessToken returns a fresh Copilot API token, renewing it
+// with the stored GitHub OAuth token when needed.
+func (cm *CredentialManager) GetValidCopilotAccessToken() (string, error) {
+	return cm.GetValidCopilotAccessTokenContext(context.Background())
+}
+
+// GetValidCopilotAccessTokenContext returns a fresh Copilot API token, renewing
+// it with the stored GitHub OAuth token when needed.
+func (cm *CredentialManager) GetValidCopilotAccessTokenContext(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	creds, err := cm.GetCopilotCredentials()
+	if err != nil {
+		return "", err
+	}
+	if creds == nil {
+		return "", fmt.Errorf("no Copilot credentials found")
+	}
+	if creds.Type != "oauth" {
+		return "", fmt.Errorf("unknown credential type: %s", creds.Type)
+	}
+	if creds.GitHubToken == "" {
+		return "", fmt.Errorf("GitHub OAuth token missing from Copilot credentials")
+	}
+
+	if creds.CopilotAccessToken == "" || creds.NeedsRefresh() {
+		client := NewCopilotOAuthClient()
+		newCreds, err := client.RefreshCopilotToken(ctx, creds.GitHubToken)
+		if err != nil {
+			return "", fmt.Errorf("failed to refresh Copilot token: %w", err)
+		}
+		newCreds.CreatedAt = creds.CreatedAt
+
+		if err := cm.SetCopilotOAuthCredentials(newCreds); err != nil {
+			return "", fmt.Errorf("failed to save refreshed Copilot token: %w", err)
+		}
+
+		return newCreds.CopilotAccessToken, nil
+	}
+
+	return creds.CopilotAccessToken, nil
 }
 
 // HasOpenAICredentials checks if valid OpenAI credentials are stored.
@@ -417,24 +513,18 @@ func validateAnthropicAPIKey(apiKey string) error {
 	return nil
 }
 
-// validateOpenAIAPIKey validates the format of an OpenAI API key
-func validateOpenAIAPIKey(apiKey string) error {
-	apiKey = strings.TrimSpace(apiKey)
+// CredentialSourceOAuth is the source description returned by
+// GetAnthropicAPIKey when the key resolves to stored OAuth credentials.
+// Consumers should compare against this constant (or use IsAnthropicOAuth)
+// rather than matching the string literal.
+const CredentialSourceOAuth = "stored OAuth credentials"
 
-	if apiKey == "" {
-		return fmt.Errorf("API key cannot be empty")
-	}
-
-	// OpenAI API keys typically start with "sk-" and are quite long
-	if !strings.HasPrefix(apiKey, "sk-") {
-		return fmt.Errorf("invalid OpenAI API key format (should start with 'sk-')")
-	}
-
-	if len(apiKey) < 20 {
-		return fmt.Errorf("API key appears to be too short")
-	}
-
-	return nil
+// IsAnthropicOAuth reports whether the active Anthropic credential resolves
+// to a stored OAuth token (in which case the user is not billed per-token).
+// flagValue is the --provider-api-key flag value (may be empty).
+func IsAnthropicOAuth(flagValue string) bool {
+	_, source, err := GetAnthropicAPIKey(flagValue)
+	return err == nil && source == CredentialSourceOAuth
 }
 
 // GetAnthropicAPIKey retrieves an Anthropic API key from multiple sources in priority order:
@@ -459,7 +549,7 @@ func GetAnthropicAPIKey(flagValue string) (string, string, error) {
 				if err != nil {
 					return "", "", fmt.Errorf("failed to get valid OAuth token: %w", err)
 				}
-				return token, "stored OAuth credentials", nil
+				return token, CredentialSourceOAuth, nil
 			} else if creds.Type == "api_key" && creds.APIKey != "" {
 				return creds.APIKey, "stored API key", nil
 			}

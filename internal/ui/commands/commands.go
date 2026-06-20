@@ -146,9 +146,10 @@ var SlashCommands = []SlashCommand{
 	},
 	{
 		Name:        "/new",
-		Description: "Start a new session",
+		Description: "Start a new session (optionally with an initial prompt)",
 		Category:    "Navigation",
 		Aliases:     []string{"/n"},
+		HasArgs:     true,
 	},
 	{
 		Name:        "/name",
@@ -166,6 +167,21 @@ var SlashCommands = []SlashCommand{
 		Description: "Copy the last message to the system clipboard",
 		Category:    "System",
 		Aliases:     []string{"/cp"},
+	},
+	{
+		Name:        "/retry",
+		Description: "Resubmit the last user message (e.g. after a provider error)",
+		Category:    "System",
+		Aliases:     []string{"/rt"},
+	},
+	{
+		Name:        "/edit",
+		Description: "Open a file in $EDITOR (fuzzy-find a path, then edit)",
+		Category:    "System",
+		Aliases:     []string{"/ed"},
+		HasArgs:     true,
+		// Note: no Complete callback — file fuzzy-finding is driven directly
+		// by InputComponent (mirroring the @file popup with directory drill).
 	},
 	{
 		Name:        "/export",

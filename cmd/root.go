@@ -13,7 +13,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/app"
-	"github.com/mark3labs/kit/internal/auth"
 	"github.com/mark3labs/kit/internal/config"
 	"github.com/mark3labs/kit/internal/models"
 	"github.com/mark3labs/kit/internal/prompts"
@@ -71,7 +70,14 @@ var (
 
 	// Extensions control
 	noExtensionsFlag bool
+	noCoreToolsFlag  bool
 	extensionPaths   []string
+
+	// Skills control
+	noSkillsFlag  bool
+	skillsPaths   []string
+	skillsDir     string
+	skillsDisable []string
 
 	// TLS configuration
 	tlsSkipVerify bool
@@ -279,7 +285,19 @@ func init() {
 	rootCmd.PersistentFlags().
 		BoolVar(&noExtensionsFlag, "no-extensions", false, "disable all extensions")
 	rootCmd.PersistentFlags().
+		BoolVar(&noCoreToolsFlag, "no-core-tools", false, "disable all built-in core tools (bash, read, write, edit, grep, find, ls, subagent)")
+	rootCmd.PersistentFlags().
 		StringSliceVarP(&extensionPaths, "extension", "e", nil, "load additional extension file(s)")
+
+	// Skills flags
+	rootCmd.PersistentFlags().
+		BoolVar(&noSkillsFlag, "no-skills", false, "disable skill loading (auto-discovery and explicit)")
+	rootCmd.PersistentFlags().
+		StringSliceVar(&skillsPaths, "skill", nil, "load skill file or directory (repeatable)")
+	rootCmd.PersistentFlags().
+		StringVar(&skillsDir, "skills-dir", "", "scan this directory directly for skills (overrides auto-discovery)")
+	rootCmd.PersistentFlags().
+		StringSliceVar(&skillsDisable, "skill-disable", nil, "hide a skill from the model catalog by name (repeatable); still usable via /skill:")
 
 	flags := rootCmd.PersistentFlags()
 	flags.StringVar(&providerURL, "provider-url", "", "base URL for the provider API (applies to OpenAI, Anthropic, Ollama, and Google)")
@@ -327,9 +345,14 @@ func init() {
 	_ = viper.BindPFlag("main-gpu", rootCmd.PersistentFlags().Lookup("main-gpu"))
 	_ = viper.BindPFlag("tls-skip-verify", rootCmd.PersistentFlags().Lookup("tls-skip-verify"))
 	_ = viper.BindPFlag("no-extensions", rootCmd.PersistentFlags().Lookup("no-extensions"))
+	_ = viper.BindPFlag("no-core-tools", rootCmd.PersistentFlags().Lookup("no-core-tools"))
 	_ = viper.BindPFlag("extension", rootCmd.PersistentFlags().Lookup("extension"))
 	_ = viper.BindPFlag("prompt-template", rootCmd.PersistentFlags().Lookup("prompt-template"))
 	_ = viper.BindPFlag("no-prompt-templates", rootCmd.PersistentFlags().Lookup("no-prompt-templates"))
+	_ = viper.BindPFlag("no-skills", rootCmd.PersistentFlags().Lookup("no-skills"))
+	_ = viper.BindPFlag("skill", rootCmd.PersistentFlags().Lookup("skill"))
+	_ = viper.BindPFlag("skills-dir", rootCmd.PersistentFlags().Lookup("skills-dir"))
+	_ = viper.BindPFlag("skill-disable", rootCmd.PersistentFlags().Lookup("skill-disable"))
 
 	// Defaults are already set in flag definitions, no need to duplicate in viper
 
@@ -514,7 +537,7 @@ func headerFooterProviderForUI(k *kit.Kit, getter func() []extensions.HeaderFoot
 	}
 }
 
-// headerProviderForUI returns a function that converts the extension header
+// headersProviderForUI returns a function that converts the extension header
 // to a []ui.WidgetData for the TUI. Returns nil if extensions are disabled,
 // which is safe — the UI treats a nil GetHeader as "no header".
 func headersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
@@ -523,7 +546,7 @@ func headersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
 	})
 }
 
-// footerProviderForUI returns a function that converts the extension footer
+// footersProviderForUI returns a function that converts the extension footer
 // to a []ui.WidgetData for the TUI. Returns nil if extensions are disabled,
 // which is safe — the UI treats a nil GetFooter as "no footer".
 func footersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
@@ -655,13 +678,16 @@ func beforeForkProviderForUI(k *kit.Kit) func(string, bool, string) (bool, strin
 
 // beforeSessionSwitchProviderForUI returns a callback that emits a
 // BeforeSessionSwitch event and returns (cancelled, reason). Returns nil
-// if extensions are disabled — the UI treats nil as "no hook".
-func beforeSessionSwitchProviderForUI(k *kit.Kit) func(string) (bool, string) {
+// if extensions are disabled — the UI treats nil as "no hook". The
+// initialPrompt argument is forwarded to the event so extensions can
+// inspect the prompt that will be submitted as the first turn of the
+// new session.
+func beforeSessionSwitchProviderForUI(k *kit.Kit) func(switchReason, initialPrompt string) (bool, string) {
 	if !k.Extensions().HasExtensions() {
 		return nil
 	}
-	return func(switchReason string) (bool, string) {
-		return k.Extensions().EmitBeforeSessionSwitch(switchReason)
+	return func(switchReason, initialPrompt string) (bool, string) {
+		return k.Extensions().EmitBeforeSessionSwitchWithPrompt(switchReason, initialPrompt)
 	}
 }
 
@@ -677,8 +703,8 @@ func globalShortcutsProviderForUI(k *kit.Kit) func() map[string]func() {
 	}
 }
 
-func runNormalMode(ctx context.Context) error {
-	// Validate flag combinations
+// validateModeFlags rejects invalid flag combinations for the root command.
+func validateModeFlags() error {
 	if quietFlag && positionalPrompt == "" {
 		return fmt.Errorf("--quiet requires a prompt (e.g. kit \"your question\" --quiet)")
 	}
@@ -691,21 +717,14 @@ func runNormalMode(ctx context.Context) error {
 	if noExitFlag && positionalPrompt == "" {
 		return fmt.Errorf("--no-exit requires a prompt (e.g. kit \"your question\" --no-exit)")
 	}
+	return nil
+}
 
-	// Set up logging
-	if debugMode {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	// Update debug mode from viper
-	if viper.GetBool("debug") && !debugMode {
-		debugMode = viper.GetBool("debug")
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	// Restore persisted model preference when no explicit --model flag or
-	// config file model is set. Precedence: CLI flag > config file > saved
-	// preference > built-in default. This mirrors how themes are persisted.
+// restorePersistedPreferences applies saved model / thinking-level
+// preferences into viper when neither a CLI flag nor a config-file value
+// takes precedence. Precedence: CLI flag > config file > saved preference >
+// built-in default. This mirrors how themes are persisted.
+func restorePersistedPreferences() {
 	// Skip custom/* models unless --provider-url is also provided, since the
 	// custom provider requires a URL that was only valid for the previous session.
 	if !modelFlagChanged && !viper.InConfig("model") {
@@ -724,6 +743,15 @@ func runNormalMode(ctx context.Context) error {
 			viper.Set("thinking-level", pref)
 		}
 	}
+}
+
+// applyProviderURLRouting rewrites the model in viper when --provider-url
+// is set, routing requests through the "custom" (OpenAI-compatible)
+// provider. Must run after restorePersistedPreferences.
+func applyProviderURLRouting() {
+	if viper.GetString("provider-url") == "" {
+		return
+	}
 
 	// When --provider-url is set but no explicit --model was provided,
 	// default to "custom/custom" so the user doesn't need to remember a
@@ -731,18 +759,53 @@ func runNormalMode(ctx context.Context) error {
 	// This intentionally overrides saved preferences but respects config-file
 	// models — if you specify a model in ~/.kit.yml, it will be used with
 	// custom/custom's provider routing.
-	if viper.GetString("provider-url") != "" && !modelFlagChanged && !viper.InConfig("model") {
+	if !modelFlagChanged && !viper.InConfig("model") {
 		viper.Set("model", "custom/custom")
 	}
 
-	// When --provider-url is set with an explicit --model that lacks a provider
-	// prefix (no "/"), auto-prefix with "custom/" for OpenAI-compatible endpoints.
-	if viper.GetString("provider-url") != "" && modelFlagChanged {
+	// When --provider-url is set with an explicit --model, route through the
+	// "custom" provider (OpenAI-compatible wire). This honors the user's
+	// intent: passing a custom URL means "use THIS endpoint", not "speak
+	// the Google/Anthropic/etc. wire protocol against this endpoint".
+	//
+	// Any provider prefix on the model is stripped so a model name that
+	// happens to collide with a known provider (e.g. `google/gemma-4-12b`
+	// served by LM Studio) still resolves correctly. If you genuinely need
+	// to point a non-OpenAI wire (Anthropic, Google, ...) at a proxy URL,
+	// use the explicit `custom/<name>` form to opt out of the rewrite by
+	// configuring the proxy as that provider in your config file instead.
+	if modelFlagChanged {
 		model := viper.GetString("model")
-		if model != "" && !strings.Contains(model, "/") {
-			viper.Set("model", "custom/"+model)
+		if model != "" {
+			name := model
+			if _, after, ok := strings.Cut(model, "/"); ok {
+				name = after
+			}
+			if !strings.HasPrefix(model, "custom/") {
+				viper.Set("model", "custom/"+name)
+			}
 		}
 	}
+}
+
+func runNormalMode(ctx context.Context) error {
+	if err := validateModeFlags(); err != nil {
+		return err
+	}
+
+	// Set up logging
+	if debugMode {
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	}
+
+	// Update debug mode from viper
+	if viper.GetBool("debug") && !debugMode {
+		debugMode = viper.GetBool("debug")
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	}
+
+	restorePersistedPreferences()
+	applyProviderURLRouting()
 
 	// Load MCP configuration.
 	mcpConfig, err := config.LoadAndValidateConfig()
@@ -776,13 +839,19 @@ func runNormalMode(ctx context.Context) error {
 	var appInstancePtr *app.App
 
 	kitOpts := &kit.Options{
-		Quiet:          quietFlag,
-		Debug:          debugMode,
-		NoSession:      noSessionFlag,
-		Continue:       continueFlag,
-		SessionPath:    sessionPath,
-		AutoCompact:    autoCompactFlag,
-		MCPAuthHandler: authHandler,
+		Quiet:            quietFlag,
+		Debug:            debugMode,
+		NoSession:        noSessionFlag,
+		Continue:         continueFlag,
+		SessionPath:      sessionPath,
+		AutoCompact:      autoCompactFlag,
+		MCPAuthHandler:   authHandler,
+		DisableCoreTools: viper.GetBool("no-core-tools"),
+		NoSkills:         noSkillsFlag,
+		Skills:           skillsPaths,
+		SkillsDir:        skillsDir,
+		SkillsDisable:    skillsDisable,
+		SkillTrustPrompt: skillTrustPrompt(),
 		// This callback is called when each MCP server finishes loading.
 		// We use a closure that captures appInstancePtr which is set after
 		// app.New() is called below.
@@ -903,8 +972,9 @@ func runNormalMode(ctx context.Context) error {
 			appInstance:  appInstance,
 			usageTracker: usageTracker,
 		})
+
+		// During startup, buffer extension messages so they appear after the banner.
 		extCtx.Print = func(text string) {
-			// Capture messages during startup, print after startup banner.
 			startupExtensionMessages = append(startupExtensionMessages, text)
 		}
 		extCtx.PrintInfo = func(text string) {
@@ -914,18 +984,12 @@ func runNormalMode(ctx context.Context) error {
 			startupExtensionMessages = append(startupExtensionMessages, text)
 		}
 		kitInstance.Extensions().SetContext(extCtx)
+		if err := kitInstance.Extensions().InitStatePersistence(); err != nil {
+			log.Printf("WARN extension state init failed: %v", err)
+		}
 		kitInstance.Extensions().EmitSessionStart()
 
 		// Restore normal print functions for runtime use.
-		extCtx = buildInteractiveExtensionContext(extensionContextDeps{
-			ctx:          ctx,
-			cwd:          cwd,
-			modelName:    modelName,
-			interactive:  positionalPrompt == "",
-			kitInstance:  kitInstance,
-			appInstance:  appInstance,
-			usageTracker: usageTracker,
-		})
 		extCtx.Print = func(text string) { appInstance.PrintFromExtension("", text) }
 		extCtx.PrintInfo = func(text string) { appInstance.PrintFromExtension("info", text) }
 		extCtx.PrintError = func(text string) { appInstance.PrintFromExtension("error", text) }
@@ -1153,23 +1217,7 @@ func runNormalMode(ctx context.Context) error {
 		// NotifyModelChanged calls prog.Send() which deadlocks. The UI layer
 		// updates m.providerName and m.modelName directly after setModel returns.
 		// Update usage tracker with new model info for correct token counting.
-		if usageTracker != nil {
-			newProvider, newModel, _ := models.ParseModelString(modelString)
-			if newProvider != "unknown" && newModel != "unknown" && newProvider != "ollama" {
-				registry := models.GetGlobalRegistry()
-				if modelInfo := registry.LookupModel(newProvider, newModel); modelInfo != nil {
-					// Check OAuth status for Anthropic models
-					isOAuth := false
-					if newProvider == "anthropic" {
-						_, source, err := auth.GetAnthropicAPIKey(viper.GetString("provider-api-key"))
-						if err == nil && strings.HasPrefix(source, "stored OAuth") {
-							isOAuth = true
-						}
-					}
-					usageTracker.UpdateModelInfo(modelInfo, newProvider, isOAuth)
-				}
-			}
-		}
+		ui.UpdateUsageTrackerForModel(usageTracker, modelString, viper.GetString("provider-api-key"))
 		return nil
 	}
 	emitModelChangeForUI := func(newModel, previousModel, source string) {
@@ -1271,9 +1319,57 @@ func runNormalMode(ctx context.Context) error {
 		}
 	}
 
+	// Bundle all the shared dependencies into a single struct that both
+	// run-mode entry points consume. This keeps the dispatch site and the
+	// function signatures readable.
+	deps := runModeDeps{
+		appInstance:              appInstance,
+		cli:                      cli,
+		modelName:                modelName,
+		providerName:             parsedProvider,
+		loadingMessage:           kitInstance.GetLoadingMessage(),
+		serverNames:              serverNames,
+		toolNames:                toolNames,
+		mcpToolCount:             mcpToolCount,
+		extensionToolCount:       extensionToolCount,
+		usageTracker:             usageTracker,
+		extCommands:              extCommands,
+		promptTemplates:          promptTemplates,
+		contextPaths:             contextPaths,
+		skillItems:               skillItems,
+		extensionItems:           extensionItems,
+		getPromptTemplates:       getPromptTemplates,
+		getSkillItems:            getSkillItems,
+		getExtensionItems:        getExtensionItems,
+		getToolNames:             getToolNames,
+		getMCPToolCount:          getMCPToolCount,
+		mcpPrompts:               mcpPrompts,
+		getMCPPrompts:            getMCPPrompts,
+		expandMCPPrompt:          expandMCPPrompt,
+		getWidgets:               getWidgets,
+		getHeaders:               getHeaders,
+		getFooters:               getFooters,
+		getToolRenderer:          getToolRenderer,
+		getEditorInterceptor:     getEditorInterceptor,
+		getUIVisibility:          getUIVisibility,
+		getStatusBarEntries:      getStatusBarEntries,
+		emitBeforeFork:           emitBeforeFork,
+		emitBeforeSessionSwitch:  emitBeforeSessionSwitch,
+		getGlobalShortcuts:       getGlobalShortcuts,
+		getExtensionCommands:     getExtensionCommands,
+		setModel:                 setModelForUI,
+		emitModelChange:          emitModelChangeForUI,
+		isReasoningModel:         kitInstance.IsReasoningModel(),
+		thinkingLevel:            kitInstance.GetThinkingLevel(),
+		setThinkingLevel:         setThinkingLevelForUI,
+		switchSession:            switchSessionForUI,
+		reloadExtensions:         reloadExtensionsForUI,
+		startupExtensionMessages: startupExtensionMessages,
+	}
+
 	// Check if running in non-interactive mode
 	if positionalPrompt != "" {
-		return runNonInteractiveModeApp(ctx, appInstance, cli, positionalPrompt, quietFlag, jsonFlag, noExitFlag, modelName, parsedProvider, kitInstance.GetLoadingMessage(), serverNames, toolNames, mcpToolCount, extensionToolCount, usageTracker, extCommands, promptTemplates, contextPaths, skillItems, extensionItems, getPromptTemplates, getSkillItems, getExtensionItems, getToolNames, getMCPToolCount, mcpPrompts, getMCPPrompts, expandMCPPrompt, getWidgets, getHeaders, getFooters, getToolRenderer, getEditorInterceptor, getUIVisibility, getStatusBarEntries, emitBeforeFork, emitBeforeSessionSwitch, getGlobalShortcuts, getExtensionCommands, setModelForUI, emitModelChangeForUI, kitInstance.IsReasoningModel(), kitInstance.GetThinkingLevel(), setThinkingLevelForUI, switchSessionForUI, reloadExtensionsForUI)
+		return runNonInteractiveModeApp(ctx, deps, positionalPrompt, quietFlag, jsonFlag, noExitFlag)
 	}
 
 	// Quiet mode is not allowed in interactive mode
@@ -1281,7 +1377,7 @@ func runNormalMode(ctx context.Context) error {
 		return fmt.Errorf("--quiet requires a prompt")
 	}
 
-	return runInteractiveModeBubbleTea(ctx, appInstance, modelName, parsedProvider, kitInstance.GetLoadingMessage(), serverNames, toolNames, mcpToolCount, extensionToolCount, usageTracker, extCommands, promptTemplates, contextPaths, skillItems, extensionItems, getPromptTemplates, getSkillItems, getExtensionItems, getToolNames, getMCPToolCount, mcpPrompts, getMCPPrompts, expandMCPPrompt, getWidgets, getHeaders, getFooters, getToolRenderer, getEditorInterceptor, getUIVisibility, getStatusBarEntries, emitBeforeFork, emitBeforeSessionSwitch, getGlobalShortcuts, getExtensionCommands, setModelForUI, emitModelChangeForUI, kitInstance.IsReasoningModel(), kitInstance.GetThinkingLevel(), setThinkingLevelForUI, switchSessionForUI, reloadExtensionsForUI, startupExtensionMessages)
+	return runInteractiveModeBubbleTea(ctx, deps)
 }
 
 // runNonInteractiveModeApp executes a single prompt via the app layer and exits,
@@ -1294,7 +1390,11 @@ func runNormalMode(ctx context.Context) error {
 //
 // When --no-exit is set, after the prompt completes the interactive BubbleTea
 // TUI is started so the user can continue the conversation.
-func runNonInteractiveModeApp(ctx context.Context, appInstance *app.App, cli *ui.CLI, prompt string, quiet, jsonOutput, noExit bool, modelName, providerName, loadingMessage string, serverNames, toolNames []string, mcpToolCount, extensionToolCount int, usageTracker *ui.UsageTracker, extCommands []commands.ExtensionCommand, promptTemplates []*prompts.PromptTemplate, contextPaths []string, skillItems []ui.SkillItem, extensionItems []ui.ExtensionItem, getPromptTemplates func() []*prompts.PromptTemplate, getSkillItems func() []ui.SkillItem, getExtensionItems func() []ui.ExtensionItem, getToolNames func() []string, getMCPToolCount func() int, mcpPrompts []ui.MCPPromptInfo, getMCPPrompts func() []ui.MCPPromptInfo, expandMCPPrompt func(string, string, map[string]string) (*ui.MCPPromptExpandResult, error), getWidgets func(string) []ui.WidgetData, getHeaders, getFooters func() []ui.WidgetData, getToolRenderer func(string) *ui.ToolRendererData, getEditorInterceptor func() *ui.EditorInterceptor, getUIVisibility func() *ui.UIVisibility, getStatusBarEntries func() []ui.StatusBarEntryData, emitBeforeFork func(string, bool, string) (bool, string), emitBeforeSessionSwitch func(string) (bool, string), getGlobalShortcuts func() map[string]func(), getExtensionCommands func() []commands.ExtensionCommand, setModel func(string) error, emitModelChange func(string, string, string), isReasoningModel bool, thinkingLevel string, setThinkingLevel func(string) error, switchSession func(string) error, reloadExtensions func() error) error {
+func runNonInteractiveModeApp(ctx context.Context, deps runModeDeps, prompt string, quiet, jsonOutput, noExit bool) error {
+	appInstance := deps.appInstance
+	cli := deps.cli
+	modelName := deps.modelName
+
 	// Expand @file references in the prompt before sending to the agent.
 	// Text files are XML-inlined; binary files are extracted as multimodal parts.
 	var fileParts []kit.LLMFilePart
@@ -1355,10 +1455,65 @@ func runNonInteractiveModeApp(ctx context.Context, appInstance *app.App, cli *ui
 
 	// If --no-exit was requested, hand off to the interactive TUI.
 	if noExit {
-		return runInteractiveModeBubbleTea(ctx, appInstance, modelName, providerName, loadingMessage, serverNames, toolNames, mcpToolCount, extensionToolCount, usageTracker, extCommands, promptTemplates, contextPaths, skillItems, extensionItems,  getPromptTemplates, getSkillItems, getExtensionItems,getToolNames, getMCPToolCount, mcpPrompts, getMCPPrompts, expandMCPPrompt, getWidgets, getHeaders, getFooters, getToolRenderer, getEditorInterceptor, getUIVisibility, getStatusBarEntries, emitBeforeFork, emitBeforeSessionSwitch, getGlobalShortcuts, getExtensionCommands, setModel, emitModelChange, isReasoningModel, thinkingLevel, setThinkingLevel, switchSession, reloadExtensions, nil)
+		// Drop the cli (interactive mode doesn't use it) and clear the
+		// interactive-only fields explicitly; deps carries everything else.
+		interactive := deps
+		interactive.cli = nil
+		interactive.startupExtensionMessages = nil
+		return runInteractiveModeBubbleTea(ctx, interactive)
 	}
 
 	return nil
+}
+
+// runModeDeps bundles the shared dependencies that runNormalMode wires up
+// once and threads to both runNonInteractiveModeApp and
+// runInteractiveModeBubbleTea. Grouping them into a single struct keeps the
+// call sites and signatures readable and makes it trivial to add a new
+// provider callback without touching every call chain.
+type runModeDeps struct {
+	appInstance              *app.App
+	cli                      *ui.CLI // non-interactive only
+	modelName                string
+	providerName             string
+	loadingMessage           string
+	serverNames              []string
+	toolNames                []string
+	mcpToolCount             int
+	extensionToolCount       int
+	usageTracker             *ui.UsageTracker
+	extCommands              []commands.ExtensionCommand
+	promptTemplates          []*prompts.PromptTemplate
+	contextPaths             []string
+	skillItems               []ui.SkillItem
+	extensionItems           []ui.ExtensionItem
+	getPromptTemplates       func() []*prompts.PromptTemplate
+	getSkillItems            func() []ui.SkillItem
+	getExtensionItems        func() []ui.ExtensionItem
+	getToolNames             func() []string
+	getMCPToolCount          func() int
+	mcpPrompts               []ui.MCPPromptInfo
+	getMCPPrompts            func() []ui.MCPPromptInfo
+	expandMCPPrompt          func(string, string, map[string]string) (*ui.MCPPromptExpandResult, error)
+	getWidgets               func(string) []ui.WidgetData
+	getHeaders               func() []ui.WidgetData
+	getFooters               func() []ui.WidgetData
+	getToolRenderer          func(string) *ui.ToolRendererData
+	getEditorInterceptor     func() *ui.EditorInterceptor
+	getUIVisibility          func() *ui.UIVisibility
+	getStatusBarEntries      func() []ui.StatusBarEntryData
+	emitBeforeFork           func(string, bool, string) (bool, string)
+	emitBeforeSessionSwitch  func(string, string) (bool, string)
+	getGlobalShortcuts       func() map[string]func()
+	getExtensionCommands     func() []commands.ExtensionCommand
+	setModel                 func(string) error
+	emitModelChange          func(string, string, string)
+	isReasoningModel         bool
+	thinkingLevel            string
+	setThinkingLevel         func(string) error
+	switchSession            func(string) error
+	reloadExtensions         func() error
+	startupExtensionMessages []string // interactive only
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,7 +1608,9 @@ func writeJSONError(err error) {
 //  4. Calls program.Run() which blocks until the user quits (Ctrl+C or /quit).
 //
 // SetupCLI is not used for interactive mode; the TUI (AppModel) handles its own rendering.
-func runInteractiveModeBubbleTea(_ context.Context, appInstance *app.App, modelName, providerName, loadingMessage string, serverNames, toolNames []string, mcpToolCount, extensionToolCount int, usageTracker *ui.UsageTracker, extCommands []commands.ExtensionCommand, promptTemplates []*prompts.PromptTemplate, contextPaths []string, skillItems []ui.SkillItem, extensionItems []ui.ExtensionItem, getPromptTemplates func() []*prompts.PromptTemplate, getSkillItems func() []ui.SkillItem,  getExtensionItems func() []ui.ExtensionItem, getToolNames func() []string, getMCPToolCount func() int, mcpPrompts []ui.MCPPromptInfo, getMCPPrompts func() []ui.MCPPromptInfo, expandMCPPrompt func(string, string, map[string]string) (*ui.MCPPromptExpandResult, error), getWidgets func(string) []ui.WidgetData, getHeaders, getFooters func() []ui.WidgetData, getToolRenderer func(string) *ui.ToolRendererData, getEditorInterceptor func() *ui.EditorInterceptor, getUIVisibility func() *ui.UIVisibility, getStatusBarEntries func() []ui.StatusBarEntryData, emitBeforeFork func(string, bool, string) (bool, string), emitBeforeSessionSwitch func(string) (bool, string), getGlobalShortcuts func() map[string]func(), getExtensionCommands func() []commands.ExtensionCommand, setModel func(string) error, emitModelChange func(string, string, string), isReasoningModel bool, thinkingLevel string, setThinkingLevel func(string) error, switchSession func(string) error, reloadExtensions func() error, startupExtensionMessages []string) error {
+func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
+	appInstance := deps.appInstance
+
 	// Redirect all log output (stdlib and charm) to a file so that log
 	// messages don't write to stderr and corrupt the TUI. Bubble Tea
 	// captures stdout for rendering; any stray stderr output from
@@ -1476,49 +1633,49 @@ func runInteractiveModeBubbleTea(_ context.Context, appInstance *app.App, modelN
 	cwd, _ := os.Getwd()
 
 	appModel := ui.NewAppModel(appInstance, ui.AppModelOptions{
-		ModelName:                modelName,
-		ProviderName:             providerName,
-		LoadingMessage:           loadingMessage,
+		ModelName:                deps.modelName,
+		ProviderName:             deps.providerName,
+		LoadingMessage:           deps.loadingMessage,
 		Cwd:                      cwd,
 		Width:                    termWidth,
 		Height:                   termHeight,
-		ServerNames:              serverNames,
-		ToolNames:                toolNames,
-		GetToolNames:             getToolNames,
-		GetMCPToolCount:          getMCPToolCount,
-		MCPToolCount:             mcpToolCount,
-		ExtensionToolCount:       extensionToolCount,
-		UsageTracker:             usageTracker,
-		ExtensionCommands:        extCommands,
-		PromptTemplates:          promptTemplates,
-		GetPromptTemplates:       getPromptTemplates,
-		MCPPrompts:               mcpPrompts,
-		GetMCPPrompts:            getMCPPrompts,
-		ExpandMCPPrompt:          expandMCPPrompt,
-		ContextPaths:             contextPaths,
-		SkillItems:               skillItems,
-		GetSkillItems:            getSkillItems,
-		ExtensionItems:           extensionItems,
-		GetExtensionItems:        getExtensionItems,
-		StartupExtensionMessages: startupExtensionMessages,
-		GetWidgets:               getWidgets,
-		GetHeaders:               getHeaders,
-		GetFooters:               getFooters,
-		GetToolRenderer:          getToolRenderer,
-		GetEditorInterceptor:     getEditorInterceptor,
-		GetUIVisibility:          getUIVisibility,
-		GetStatusBarEntries:      getStatusBarEntries,
-		EmitBeforeFork:           emitBeforeFork,
-		EmitBeforeSessionSwitch:  emitBeforeSessionSwitch,
-		GetGlobalShortcuts:       getGlobalShortcuts,
-		GetExtensionCommands:     getExtensionCommands,
-		SetModel:                 setModel,
-		EmitModelChange:          emitModelChange,
-		ThinkingLevel:            thinkingLevel,
-		IsReasoningModel:         isReasoningModel,
-		SetThinkingLevel:         setThinkingLevel,
-		SwitchSession:            switchSession,
-		ReloadExtensions:         reloadExtensions,
+		ServerNames:              deps.serverNames,
+		ToolNames:                deps.toolNames,
+		GetToolNames:             deps.getToolNames,
+		GetMCPToolCount:          deps.getMCPToolCount,
+		MCPToolCount:             deps.mcpToolCount,
+		ExtensionToolCount:       deps.extensionToolCount,
+		UsageTracker:             deps.usageTracker,
+		ExtensionCommands:        deps.extCommands,
+		PromptTemplates:          deps.promptTemplates,
+		GetPromptTemplates:       deps.getPromptTemplates,
+		MCPPrompts:               deps.mcpPrompts,
+		GetMCPPrompts:            deps.getMCPPrompts,
+		ExpandMCPPrompt:          deps.expandMCPPrompt,
+		ContextPaths:             deps.contextPaths,
+		SkillItems:               deps.skillItems,
+		GetSkillItems:            deps.getSkillItems,
+		ExtensionItems:           deps.extensionItems,
+		GetExtensionItems:        deps.getExtensionItems,
+		StartupExtensionMessages: deps.startupExtensionMessages,
+		GetWidgets:               deps.getWidgets,
+		GetHeaders:               deps.getHeaders,
+		GetFooters:               deps.getFooters,
+		GetToolRenderer:          deps.getToolRenderer,
+		GetEditorInterceptor:     deps.getEditorInterceptor,
+		GetUIVisibility:          deps.getUIVisibility,
+		GetStatusBarEntries:      deps.getStatusBarEntries,
+		EmitBeforeFork:           deps.emitBeforeFork,
+		EmitBeforeSessionSwitch:  deps.emitBeforeSessionSwitch,
+		GetGlobalShortcuts:       deps.getGlobalShortcuts,
+		GetExtensionCommands:     deps.getExtensionCommands,
+		SetModel:                 deps.setModel,
+		EmitModelChange:          deps.emitModelChange,
+		ThinkingLevel:            deps.thinkingLevel,
+		IsReasoningModel:         deps.isReasoningModel,
+		SetThinkingLevel:         deps.setThinkingLevel,
+		SwitchSession:            deps.switchSession,
+		ReloadExtensions:         deps.reloadExtensions,
 		ShowSessionPicker:        resumeFlag,
 		GetMCPResources:          mcpGetResources,
 		MCPResourceReader:        mcpResourceReader,

@@ -28,6 +28,7 @@ A powerful, extensible AI coding agent CLI with multi-provider support, built-in
 - **Interactive TUI**: Rich terminal interface powered by Bubble Tea with streaming, syntax highlighting, and custom rendering
 - **Session Management**: Tree-based conversation history with branching support
 - **Non-Interactive Mode**: Script-friendly positional args with JSON output
+- **GitHub Integration**: Scaffold a GitHub Actions workflow with `kit github install` to run Kit as a collaborator/reviewer on `/kit` comments
 - **ACP Server**: Run Kit as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio
 - **Go SDK**: Embed Kit in your own applications with full agent lifecycle events (30+ event types) and behavior-modifying hooks
 
@@ -127,6 +128,15 @@ max-tokens: 4096
 temperature: 0.7
 stream: true
 thinking-level: off       # off, none, minimal, low, medium, high
+no-core-tools: false      # set to true to disable all built-in core tools
+
+# Skills — all keys are optional
+no-skills: false          # set to true to disable all skill loading
+skill:                    # explicit skill files/dirs (disables auto-discovery)
+  - /path/to/skill.md
+skills-dir: ""            # scan this directory directly for skills (overrides auto-discovery)
+skill-disable:            # hide skills from the model catalog by name (still usable via /skill:)
+  - some-skill
 ```
 
 All of the above keys can also be set programmatically via the SDK
@@ -195,11 +205,18 @@ mcpServers:
 --compact                Enable compact output mode
 --auto-compact           Auto-compact conversation near context limit
 
-# Extensions
+# Extensions and tools
 --extension, -e          Load additional extension file(s) (repeatable)
 --no-extensions          Disable all extensions
+--no-core-tools          Disable all built-in core tools (bash, read, write, edit, grep, find, ls, subagent)
 --prompt-template        Load a specific prompt template by name
 --no-prompt-templates    Disable prompt template loading
+
+# Skills
+--skill                  Load skill file or directory (repeatable)
+--skills-dir             Scan this directory directly for skills (overrides auto-discovery)
+--skill-disable          Hide a skill from the model catalog by name (repeatable); still usable via /skill:
+--no-skills              Disable skill loading (auto-discovery and explicit)
 
 # Generation parameters
 --max-tokens             Maximum tokens in response (default: 8192, auto-raised up to 32768 for models with larger known output limits)
@@ -226,6 +243,10 @@ kit auth login [provider] --set-default  # Set provider's default model as syste
 kit auth logout [provider]         # Remove credentials for provider
 kit auth status                    # Check authentication status
 
+# GitHub Copilot login (experimental; requires active Copilot subscription)
+kit auth login copilot
+kit --model copilot/gpt-5.5 "Hello"
+
 # Model database
 kit models [provider]        # List available models (optionally filter by provider)
 kit models --all             # Show all providers (not just LLM-compatible)
@@ -242,6 +263,12 @@ kit install --uninstall <pkg> # Remove an installed package
 
 # Skills
 kit skill                    # Install the Kit extensions skill via skills.sh
+
+# GitHub integration
+kit github install           # Scaffold .github/workflows/kit.yml (run Kit on '/kit' comments)
+kit github install --model anthropic/claude-sonnet-4-5-20250929
+kit github install --force   # Overwrite an existing workflow file
+kit github install --no-secret # Skip the offer to set the provider secret via the gh CLI
 
 # ACP server
 kit acp                      # Start as ACP agent (stdio JSON-RPC)
@@ -306,12 +333,15 @@ kit -e examples/extensions/minimal.go
 
 ### Extension Capabilities
 
-**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
+**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnLLMUsage, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
+
+`OnAgentEnd` carries per-turn aggregates (`ToolCallCount`, `ToolNames`, `LLMCallCount`, `InputTokensDelta`, `OutputTokensDelta`, `CostDelta`, `DurationMs`) so observers don't need to maintain parallel bookkeeping. `OnLLMUsage` fires after each LLM provider call with token + cost deltas attributed to that specific call/model — use it for accurate budget enforcement *between* calls instead of waiting for the turn to finish.
 
 **Custom Components**:
 - **Tools**: Add new tools the LLM can invoke
 - **Commands**: Register slash commands (e.g., `/mycommand`)
 - **Options**: Register configurable extension options
+- **Session State**: Last-write-wins key-value store via `ctx.SetState` / `GetState` / `DeleteState` / `ListState`, persisted to a per-session sidecar file outside the conversation tree
 - **Widgets**: Persistent status displays above/below input
 - **Headers/Footers**: Persistent content above/below the conversation
 - **Status Bar**: Custom status bar entries
@@ -367,6 +397,7 @@ See the `examples/extensions/` directory:
 - [`tool-logger.go`](examples/extensions/tool-logger.go) - Log all tool calls
 - [`neon-theme.go`](examples/extensions/neon-theme.go) - Custom theme registration and switching
 - [`tool-renderer-demo.go`](examples/extensions/tool-renderer-demo.go) - Custom tool call rendering
+- [`usage-budget.go`](examples/extensions/usage-budget.go) - Per-call usage callback (`OnLLMUsage`), session state, and enriched `OnAgentEnd` per-turn report
 - [`widget-status.go`](examples/extensions/widget-status.go) - Persistent status widgets
 
 Also see [`.kit/extensions/go-edit-lint.go`](.kit/extensions/go-edit-lint.go) (in this repo) for a project-local extension example that runs gopls and golangci-lint on Go file edits.
@@ -457,6 +488,48 @@ Placeholders inside fenced code blocks (```) and inline code spans are ignored.
 
 Disable templates with `--no-prompt-templates` or load a specific template with `--prompt-template <name>`.
 
+## GitHub Integration
+
+Kit can run as an automated collaborator/reviewer inside GitHub Actions. The
+`kit github install` command scaffolds a workflow that triggers when someone
+comments `/kit ...` on an issue or pull request review, runs the agent
+non-interactively in the runner, and lets it respond.
+
+```bash
+kit github install
+```
+
+This writes `.github/workflows/kit.yml`. By default the command prompts for the
+model (pre-filled with a sensible default); pass `--model` to skip the prompt.
+If the [`gh` CLI](https://cli.github.com/) is detected on your `PATH` and the
+provider API key is present in your environment, you'll be offered the option to
+store it as a repository secret automatically.
+
+The generated workflow:
+
+- Triggers only on `issue_comment` and `pull_request_review_comment` (`types: [created]`).
+- Runs only when the comment begins with the `/kit` command token.
+- Restricts triggers to repository owners, members, and collaborators (via `author_association`).
+- Uses least-privilege `permissions` and `persist-credentials: false`.
+- Authenticates git/PR operations with the built-in `secrets.GITHUB_TOKEN` and
+  the provider via a repository secret (e.g. `ANTHROPIC_API_KEY`).
+
+After committing the workflow and setting the provider secret, comment
+`/kit <your request>` on any issue or pull request to trigger Kit.
+
+The generated workflow uses the bundled [`mark3labs/kit`](action.yml) composite
+action, which installs the Kit binary and runs `kit github run`. That command
+reads the triggering event, enforces permissions, reacts with an emoji, runs the
+agent against the issue thread or pull request, posts the response as a comment,
+and — if the agent changed files — pushes a `kit-agent[bot]` branch and opens a
+pull request.
+
+| Flag | Description |
+| --- | --- |
+| `--model` | Provider/model to write into the workflow |
+| `--force` | Overwrite an existing workflow file |
+| `--no-secret` | Skip the offer to set the provider secret via the `gh` CLI |
+
 ## Session Management
 
 Kit uses a tree-based session model that supports branching and forking conversations.
@@ -507,6 +580,8 @@ During an interactive session, use these slash commands:
 
 | Shortcut | Description |
 |----------|-------------|
+| `Ctrl+V` | Paste an image from the clipboard — shows an inline low-res thumbnail preview (tmux/zellij-safe) |
+| `Ctrl+U` | Clear all pending image attachments |
 | `Ctrl+X e` | Open `$VISUAL`/`$EDITOR` to compose or edit your prompt |
 | `Ctrl+X s` | Steer — inject a system-level instruction mid-turn |
 | `ESC ESC` | Cancel the current operation (tool call or streaming) |
@@ -554,7 +629,7 @@ host, err := kit.New(ctx, &kit.Options{
     SystemPrompt: "You are a helpful bot",
     ConfigFile:   "/path/to/config.yml",
     MaxSteps:     10,
-    Streaming:    true,
+    Streaming:    ptr(true), // *bool: nil = unset (default true), &false = off
     Quiet:        true,
 
     // Generation parameters (override env/config/per-model defaults)
@@ -579,7 +654,9 @@ host, err := kit.New(ctx, &kit.Options{
     // Tool options
     Tools:            []kit.Tool{...},     // Replace default tool set entirely
     ExtraTools:       []kit.Tool{...},     // Add tools alongside defaults
-    DisableCoreTools: true,                // Use no core tools (0 tools, for chat-only)
+    DisableCoreTools: true,                // Disable all built-in core tools; also controllable via
+                                           // --no-core-tools flag, KIT_NO_CORE_TOOLS env var,
+                                           // or no-core-tools: true in .kit.yml
 
     // Configuration
     SkipConfig:   true,                   // Skip .kit.yml files (viper defaults + env vars still apply)
@@ -598,6 +675,38 @@ Precedence is `Options` > `KIT_*` env vars > `.kit.yml` > per-model defaults
 are pointer types so explicit `0.0` is distinguishable from "leave alone"; a
 non-zero `MaxTokens` suppresses automatic right-sizing the same way `--max-tokens`
 does on the CLI.
+
+### Functional options (`NewAgent`)
+
+For simple programmatic setups, `kit.NewAgent` offers an ergonomic
+functional-options front door over `kit.New`. Streaming is **enabled by
+default**; pass `kit.WithStreaming(false)` to opt out.
+
+```go
+host, err := kit.NewAgent(ctx,
+    kit.WithModel("anthropic/claude-sonnet-4-5-20250929"),
+    kit.WithSystemPrompt("You are a helpful assistant."),
+    kit.WithMaxTokens(8192),
+    kit.WithThinkingLevel("medium"),
+    kit.Ephemeral(), // in-memory session, no persistence
+)
+```
+
+Available options: `WithModel`, `WithSystemPrompt`, `WithStreaming`,
+`WithMaxTokens`, `WithThinkingLevel`, `WithTools`, `WithExtraTools`,
+`WithProviderAPIKey`, `WithProviderURL`, `WithConfigFile`, `WithDebug`,
+`WithDebugLogger`, and `Ephemeral`. For advanced configuration not covered by
+the helpers (custom MCP config, in-process MCP servers, session backends, MCP
+task tuning) construct an `Options` value explicitly and call `kit.New`.
+
+### Per-instance config isolation
+
+Each `kit.New` / `kit.NewAgent` call owns an **isolated configuration store**,
+so constructing multiple Kit instances in the same process is safe: setting the
+model, thinking level, or generation parameters on one never affects another,
+and runtime mutators (`SetModel`, `SetThinkingLevel`) only touch the owning
+instance. This makes subagent spawning and multi-Kit embedding race-free with
+no external synchronization required.
 
 ### MCP OAuth (remote MCP servers)
 
@@ -756,6 +865,50 @@ host, _ := kit.New(ctx, &kit.Options{
 })
 ```
 
+### Runtime Skills & Context Files
+
+For multi-tenant hosts (chatbots, per-user agents, web services), the SDK
+lets you swap skills and `AGENTS.md`-style context files **after** Kit
+construction. Every mutation recomposes the system prompt and applies it to
+the agent so the next turn picks up the new instructions — no restart needed.
+
+```go
+// Programmatic skill (no file on disk required).
+host.AddSkill(&kit.Skill{
+    Name:        "polite-french",
+    Description: "Respond in French and always greet the user.",
+    Content:     "Always reply in French. Open every response with 'Bonjour'.",
+})
+
+// Or load one from disk.
+host.LoadAndAddSkill("/var/skills/refund-policy.md")
+
+// Per-user AGENTS.md content pulled from a database.
+host.AddContextFileContent(
+    fmt.Sprintf("session://%s/AGENTS.md", userID),
+    rulesFromDB,
+)
+
+// Tear down session-specific state on logout.
+host.RemoveSkill("polite-french")
+host.RemoveContextFile(fmt.Sprintf("session://%s/AGENTS.md", userID))
+
+// Hide a skill from the model catalog without unloading it (still usable
+// via /skill:); EnableSkill reverses it.
+host.DisableSkill("refund-policy")
+host.EnableSkill("refund-policy")
+
+// Or replace the whole set atomically.
+host.SetSkills(activeSkillsForUser)
+host.SetContextFiles(activeContextForUser)
+```
+
+Skills dedupe by `Name`, context files dedupe by `Path` (which can be any
+opaque identifier — it doesn't have to be a real filesystem path). All
+mutators and readers (`GetSkills`, `GetContextFiles`) are safe to call
+concurrently from multiple goroutines. See the [SDK overview docs](/sdk/overview#runtime-skills-and-context-files)
+for the full reference.
+
 ## Advanced Usage
 
 ### Subagent Pattern
@@ -872,6 +1025,7 @@ npm/                 - NPM package wrapper for distribution
 
 - **Anthropic** - Claude models (native, prompt caching, OAuth)
 - **OpenAI** - GPT models
+- **Copilot** - GitHub Copilot models (`copilot`, requires active Copilot subscription)
 - **Google** - Gemini models
 - **Ollama** - Local models
 - **Azure OpenAI** - Azure-hosted OpenAI
@@ -896,6 +1050,31 @@ This automatically defaults to `custom/custom` without needing to specify a mode
 - 262K context window, 65K output limit
 - Reasoning and temperature support
 - Optional `CUSTOM_API_KEY` environment variable or `--provider-api-key` flag
+
+### Auto-routed Providers
+
+Any provider in the [models.dev](https://models.dev) database can be used as
+`provider/model` without a dedicated native integration. Kit auto-routes the
+request through the matching **wire protocol** based on the provider's npm package
+(or per-model override), using its `api` URL as the base:
+
+| npm package | Wire protocol |
+|-------------|---------------|
+| `@ai-sdk/openai` | OpenAI (Responses API) |
+| `@ai-sdk/openai-compatible` | OpenAI (chat completions) |
+| `@ai-sdk/anthropic` | Anthropic |
+| `@ai-sdk/google` | Google Gemini |
+
+Providers with an `api` URL but an unrecognized npm package fall back to the
+OpenAI-compatible wire. Because routing follows the wire protocol, aggregator/proxy
+providers work across all of their models — including Claude, GPT, *and* Gemini
+routes:
+
+```bash
+kit --model opencode/claude-haiku-4-5 "Hello"     # → Anthropic wire
+kit --model opencode/gpt-5 "Hello"                # → OpenAI wire
+kit --model opencode/gemini-3.5-flash "Hello"     # → Google wire
+```
 
 ### Model String Format
 

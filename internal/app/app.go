@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"charm.land/fantasy"
 
 	"github.com/mark3labs/kit/extensions"
+	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/session"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
@@ -22,6 +24,26 @@ type queueItem struct {
 	Prompt string
 	Files  []kit.LLMFilePart
 }
+
+// ErrAgentBusy is returned when an operation cannot proceed because the agent
+// is still processing a turn (including any post-turn extension hooks) and did
+// not become idle before the operation's deadline.
+//
+// This is an alias for extensions.ErrAgentBusy so the extension API and the
+// app layer share a single sentinel value — callers can detect the condition
+// with errors.Is(err, app.ErrAgentBusy) without substring-matching the error
+// message.
+var ErrAgentBusy = extensions.ErrAgentBusy
+
+// DefaultNewSessionIdleWait bounds how long RequestNewSessionFromExtension
+// will block waiting for the agent to settle. It needs to be generous enough
+// to cover real-world post-turn tooling (project formatters, on-save linters,
+// hidden tool calls) which routinely hold the busy flag for seconds and
+// occasionally minutes — yet still short enough to surface a wedged agent.
+//
+// Issue #63 reported workloads where the busy window regularly exceeded
+// 6 seconds; ten minutes is the same bound the workaround in that issue used.
+const DefaultNewSessionIdleWait = 10 * time.Minute
 
 // App is the application-layer orchestrator. It owns the agentic loop,
 // conversation history (via MessageStore), and queue management. It is
@@ -54,10 +76,24 @@ type App struct {
 	// each new step and called by CancelCurrentStep().
 	cancelStep context.CancelFunc
 
-	// mu protects busy, queue, and cancelStep.
+	// mu protects busy, queue, cancelStep, and idleCh.
 	mu    sync.Mutex
 	busy  bool
 	queue []queueItem
+
+	// idleCh is closed when the agent transitions from busy back to idle.
+	// While the agent is idle the channel is already closed (recv returns
+	// immediately). When busy transitions to true a fresh open channel is
+	// allocated so callers blocked on the previous one are released. All
+	// transitions are funnelled through setBusyLocked to keep the channel
+	// pointer in sync with the busy flag.
+	//
+	// This is the underlying primitive WaitForIdle and
+	// RequestNewSessionFromExtension wait on to fix the AgentEnd→NewSession
+	// race described in issue #63: AgentEnd is emitted from inside the agent
+	// loop, before drainQueue clears busy, so any extension hook that calls
+	// ctx.NewSession synchronously would otherwise observe busy==true.
+	idleCh chan struct{}
 
 	// wg tracks in-flight goroutines; Close() waits on it.
 	wg sync.WaitGroup
@@ -94,6 +130,10 @@ type App struct {
 // initialMessages may be nil or empty for a fresh session.
 func New(opts Options, initialMessages []kit.LLMMessage) *App {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
+	// idleCh starts already closed: the freshly constructed App is idle, so
+	// any caller blocking on it via WaitForIdle should be released immediately.
+	idleCh := make(chan struct{})
+	close(idleCh)
 	return &App{
 		opts:       opts,
 		store:      NewMessageStoreWithMessages(initialMessages),
@@ -101,6 +141,90 @@ func New(opts Options, initialMessages []kit.LLMMessage) *App {
 		rootCancel: rootCancel,
 		// cancelStep starts as a no-op so CancelCurrentStep() is always safe.
 		cancelStep: func() {},
+		idleCh:     idleCh,
+	}
+}
+
+// setBusyLocked is the single chokepoint for mutating a.busy. It keeps the
+// idleCh signalling channel in sync with the busy flag:
+//
+//   - false → true: allocate a fresh open channel so future WaitForIdle
+//     callers block until the next idle transition.
+//   - true  → false: close the current channel so any waiters wake up.
+//
+// No-op when the requested state already matches. The caller must hold a.mu.
+func (a *App) setBusyLocked(busy bool) {
+	if a.busy == busy {
+		return
+	}
+	a.busy = busy
+	if busy {
+		a.idleCh = make(chan struct{})
+	} else {
+		close(a.idleCh)
+	}
+}
+
+// idleSnapshot returns the current busy state and the channel that will be
+// closed on the next idle transition. The snapshot is taken under a.mu so the
+// pair is consistent (busy==true ⇒ ch is the open channel for *this* busy
+// cycle, not a stale one).
+func (a *App) idleSnapshot() (busy bool, ch chan struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.busy, a.idleCh
+}
+
+// WaitForIdle blocks until the agent is idle, the given timeout elapses, or
+// the app shuts down. Returns nil on idle, ErrAgentBusy on timeout, or the
+// rootCtx error if the app is closing.
+//
+// A non-positive timeout disables the deadline and waits indefinitely (until
+// idle or app shutdown). Safe to call from any goroutine, but never from
+// inside the Bubble Tea Update() loop — it blocks.
+//
+// Idiomatic use from extensions:
+//
+//	if err := app.WaitForIdle(0); err != nil { /* shutdown */ }
+//
+// The loop guards against the agent re-arming itself between wakeups: if
+// another prompt is queued (or a steer message lands) while we're waiting,
+// setBusyLocked allocates a fresh idleCh and we wait again.
+func (a *App) WaitForIdle(timeout time.Duration) error {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		busy, ch := a.idleSnapshot()
+		if !busy {
+			return nil
+		}
+		var timer *time.Timer
+		var timerCh <-chan time.Time
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return ErrAgentBusy
+			}
+			timer = time.NewTimer(remaining)
+			timerCh = timer.C
+		}
+		select {
+		case <-ch:
+			// Idle transition observed — loop and re-check under the
+			// mutex in case a new busy cycle started immediately after.
+		case <-timerCh:
+			return ErrAgentBusy
+		case <-a.rootCtx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return a.rootCtx.Err()
+		}
+		if timer != nil {
+			timer.Stop()
+		}
 	}
 }
 
@@ -154,7 +278,7 @@ func (a *App) RunWithFiles(prompt string, files []kit.LLMFilePart) int {
 		return qLen
 	}
 
-	a.busy = true
+	a.setBusyLocked(true)
 	a.wg.Add(1)
 	a.mu.Unlock()
 	go a.drainQueue(item)
@@ -234,7 +358,7 @@ func (a *App) SteerWithFiles(prompt string, files []kit.LLMFilePart) int {
 	if !a.busy {
 		// Not busy — start immediately, same as RunWithFiles().
 		item := queueItem{Prompt: prompt, Files: files}
-		a.busy = true
+		a.setBusyLocked(true)
 		a.wg.Add(1)
 		a.mu.Unlock()
 		go a.drainQueue(item)
@@ -270,7 +394,7 @@ func (a *App) InterruptAndSend(prompt string) {
 
 	if !a.busy {
 		// Not busy — start immediately, same as Run().
-		a.busy = true
+		a.setBusyLocked(true)
 		a.wg.Add(1)
 		a.mu.Unlock()
 		go a.drainQueue(item)
@@ -343,6 +467,90 @@ func (a *App) SwitchTreeSession(ts *session.TreeManager) {
 	}
 }
 
+// PopLastUserMessage truncates the tree session back to the parent of the
+// most recent user message on the current branch, syncs the in-memory
+// message store, and returns the user prompt text plus any image file
+// parts so the caller can resubmit via Run/RunWithFiles.
+//
+// This is the building block for /retry: the user message and any orphaned
+// assistant/tool entries produced by a failed turn become unreachable on
+// the current branch (they remain in the session file under a different
+// leaf) and are excluded from the next LLM context.
+//
+// Returns an error when:
+//   - the agent is currently working (busy)
+//   - the app has been closed
+//   - no tree session is active (sessions disabled via --no-session)
+//   - no user message exists on the current branch
+//
+// Satisfies ui.AppController.
+func (a *App) PopLastUserMessage() (string, []kit.LLMFilePart, error) {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return "", nil, fmt.Errorf("app is closed")
+	}
+	if a.busy {
+		a.mu.Unlock()
+		return "", nil, fmt.Errorf("cannot retry while the agent is working")
+	}
+	a.mu.Unlock()
+
+	ts := a.opts.TreeSession
+	if ts == nil {
+		return "", nil, fmt.Errorf("no tree session active; /retry requires a session")
+	}
+
+	// Walk the current branch backwards to find the most recent user message.
+	branch := ts.GetBranch("")
+	var target *session.MessageEntry
+	for i := len(branch) - 1; i >= 0; i-- {
+		me, ok := branch[i].(*session.MessageEntry)
+		if !ok {
+			continue
+		}
+		if me.Role == string(message.RoleUser) {
+			target = me
+			break
+		}
+	}
+	if target == nil {
+		return "", nil, fmt.Errorf("no user message to retry")
+	}
+
+	// Extract the prompt text and any image parts from the target entry.
+	msg, err := target.ToMessage()
+	if err != nil {
+		return "", nil, fmt.Errorf("decode user message: %w", err)
+	}
+	prompt := msg.Content()
+	var files []kit.LLMFilePart
+	for _, part := range msg.Parts {
+		if ic, ok := part.(message.ImageContent); ok {
+			files = append(files, kit.LLMFilePart{
+				Data:      ic.Data,
+				MediaType: ic.MediaType,
+			})
+		}
+	}
+
+	// Move the leaf to the parent of the user message. The failed turn's
+	// entries (user message + any partial assistant/tool entries) are still
+	// in the tree file but no longer on the active branch, so they will not
+	// be re-sent to the LLM. runTurn() will append a fresh user message on
+	// the next call.
+	if err := ts.Branch(target.ParentID); err != nil {
+		return "", nil, fmt.Errorf("branch to parent: %w", err)
+	}
+
+	// Sync the in-memory store with the new branch position so subsequent
+	// reads (and ReloadMessagesFromTree() consumers) see the truncated view.
+	a.store.Clear()
+	a.store.Replace(ts.GetLLMMessages())
+
+	return prompt, files, nil
+}
+
 // AddContextMessage adds a user-role message to the conversation history
 // without triggering an LLM response. Used by the ! shell command prefix
 // to inject command output into context so the LLM can reference it in
@@ -385,7 +593,7 @@ func (a *App) CompactConversation(customInstructions string) error {
 		a.mu.Unlock()
 		return fmt.Errorf("SDK instance not available")
 	}
-	a.busy = true
+	a.setBusyLocked(true)
 	a.wg.Add(1)
 	a.mu.Unlock()
 
@@ -447,7 +655,7 @@ func (a *App) CompactAsync(customInstructions string, onComplete func(), onError
 		a.mu.Unlock()
 		return fmt.Errorf("SDK instance not available")
 	}
-	a.busy = true
+	a.setBusyLocked(true)
 	a.wg.Add(1)
 	a.mu.Unlock()
 
@@ -536,7 +744,7 @@ func (a *App) releaseBusyAfterCompact() {
 	// in just before closed was set.
 	if a.closed {
 		a.queue = a.queue[:0]
-		a.busy = false
+		a.setBusyLocked(false)
 		a.mu.Unlock()
 		return
 	}
@@ -548,7 +756,7 @@ func (a *App) releaseBusyAfterCompact() {
 	a.queue = a.queue[:0]
 
 	if len(pending) == 0 {
-		a.busy = false
+		a.setBusyLocked(false)
 		a.mu.Unlock()
 		return
 	}
@@ -765,7 +973,7 @@ func (a *App) drainQueue(first queueItem) {
 
 	// Mark as no longer busy
 	a.mu.Lock()
-	a.busy = false
+	a.setBusyLocked(false)
 	a.mu.Unlock()
 }
 
@@ -1169,6 +1377,42 @@ func (a *App) SetEditorTextFromExtension(text string) {
 	if prog != nil {
 		prog.Send(EditorTextSetEvent{Text: text})
 	}
+}
+
+// RequestNewSessionFromExtension sends a NewSessionRequestEvent to the TUI
+// to end the current session and start a fresh one. If initialPrompt is
+// non-empty it is submitted as the first user turn of the new session.
+//
+// If the agent is currently busy (e.g. the caller is an OnAgentEnd hook that
+// fires before drainQueue clears the busy flag, or there are queued prompts
+// still being processed) the call blocks until the agent becomes idle, up to
+// DefaultNewSessionIdleWait. If that deadline elapses, ErrAgentBusy is
+// returned and callers can detect it with errors.Is. This wait-then-send
+// behavior fixes the v0.79.0 phase-handoff race documented in issue #63.
+//
+// Returns an error when running headless (no TUI attached), when the wait
+// for idle times out (ErrAgentBusy), when the app is shutting down, or when
+// a BeforeSessionSwitch extension hook cancels the switch.
+//
+// This is the implementation behind ctx.NewSession(prompt) for the
+// interactive TUI. It blocks the caller until the TUI processes the
+// switch, so it must be invoked from a goroutine outside Update().
+func (a *App) RequestNewSessionFromExtension(initialPrompt string) error {
+	a.mu.Lock()
+	prog := a.program
+	a.mu.Unlock()
+	if prog == nil {
+		return fmt.Errorf("new session unavailable: no interactive TUI attached")
+	}
+	if err := a.WaitForIdle(DefaultNewSessionIdleWait); err != nil {
+		if errors.Is(err, ErrAgentBusy) {
+			return fmt.Errorf("cannot start new session: %w", err)
+		}
+		return err
+	}
+	ch := make(chan error, 1)
+	prog.Send(NewSessionRequestEvent{InitialPrompt: initialPrompt, ResponseCh: ch})
+	return <-ch
 }
 
 // NotifyModelChanged sends a ModelChangedEvent to the TUI so it updates
