@@ -4,6 +4,10 @@ functional area.
 
 ⚠️ Breaking Changes & Refactors
 
+Extension System
+
+  - Expose Kit's thinking API to track token usage more accurately
+
   - Extension Package Relocation: Moved internal/extensions to the top-level
     extensions/ package. This allows external packages and unit tests to import
     the extension API directly.
