@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"sync"
 
-	"charm.land/lipgloss/v2"
 	"image/color"
+
+	"charm.land/lipgloss/v2"
 
 	"github.com/mark3labs/kit/internal/models"
 )

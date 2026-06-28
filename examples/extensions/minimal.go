@@ -43,7 +43,7 @@ func Init(api ext.API) {
 		}
 
 		ctx.SetFooter(ext.HeaderFooterConfig{
-			ID: "minimal:footer",
+			ID:      "minimal:footer",
 			Content: ext.WidgetContent{Text: text},
 			Style:   ext.WidgetStyle{BorderColor: "#585b70"},
 		})

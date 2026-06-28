@@ -369,6 +369,10 @@ func (m *Kit) bridgeExtensions(runner *extensions.Runner) {
 		return extensions.ReasoningStartEvent{ID: ev.ID}
 	})
 
+	bridgeObserve(m, runner, extensions.ReasoningDelta, func(ev ReasoningDeltaEvent) extensions.Event {
+		return extensions.ReasoningDeltaEvent{Delta: ev.Delta}
+	})
+
 	bridgeObserve(m, runner, extensions.Warnings, func(ev WarningsEvent) extensions.Event {
 		return extensions.WarningsEvent{Warnings: ev.Warnings}
 	})

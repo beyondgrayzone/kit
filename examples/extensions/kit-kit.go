@@ -396,7 +396,7 @@ func updateFooter() {
 	text := fmt.Sprintf("%s  |  Kit Kit%s", ctx.Model, mid)
 
 	ctx.SetFooter(ext.HeaderFooterConfig{
-		ID: "kit-kit:footer",
+		ID:      "kit-kit:footer",
 		Content: ext.WidgetContent{Text: text},
 		Style:   ext.WidgetStyle{BorderColor: "#89b4fa"},
 	})

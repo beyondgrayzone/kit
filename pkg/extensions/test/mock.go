@@ -21,10 +21,10 @@ type MockContext struct {
 	CancelSends []string
 
 	// Widget state
-	Widgets       map[string]extensions.WidgetConfig
-	RemovedIDs    []string
-	Headers       map[string]extensions.HeaderFooterConfig
-	Footers       map[string]extensions.HeaderFooterConfig
+	Widgets          map[string]extensions.WidgetConfig
+	RemovedIDs       []string
+	Headers          map[string]extensions.HeaderFooterConfig
+	Footers          map[string]extensions.HeaderFooterConfig
 	RemovedHeaderIDs []string
 	RemovedFooterIDs []string
 

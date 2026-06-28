@@ -713,6 +713,12 @@ func loadSingleExtension(path string) (*LoadedExtension, error) {
 				return nil
 			})
 		},
+		onReasoningDelta: func(h func(ReasoningDeltaEvent, Context)) {
+			reg(ReasoningDelta, func(e Event, c Context) Result {
+				h(e.(ReasoningDeltaEvent), c)
+				return nil
+			})
+		},
 		onWarnings: func(h func(WarningsEvent, Context)) {
 			reg(Warnings, func(e Event, c Context) Result {
 				h(e.(WarningsEvent), c)

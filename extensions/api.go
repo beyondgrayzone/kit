@@ -1227,11 +1227,17 @@ type API struct {
 	onStepFinish              func(func(StepFinishEvent, Context))
 	onReasoningStart          func(func(ReasoningStartEvent, Context))
 	onWarnings                func(func(WarningsEvent, Context))
+	onReasoningDelta          func(func(ReasoningDeltaEvent, Context))
 	onSource                  func(func(SourceEvent, Context))
 	onError                   func(func(ErrorEvent, Context))
 	onRetry                   func(func(RetryEvent, Context))
 	onPrepareStep             func(func(PrepareStepEvent, Context) *PrepareStepResult)
 	onLLMUsage                func(func(LLMUsageEvent, Context))
+}
+
+// OnReasoningDelta registers a handler that fires for each streaming reasoning/thinking chunk.
+func (a *API) OnReasoningDelta(handler func(ReasoningDeltaEvent, Context)) {
+	a.onReasoningDelta(handler)
 }
 
 // OnToolCall registers a handler that fires before a tool executes.
@@ -2530,6 +2536,13 @@ type StepFinishEvent struct {
 }
 
 func (e StepFinishEvent) Type() EventType { return StepFinish }
+
+// ReasoningDeltaEvent fires for each streaming reasoning/thinking chunk.
+type ReasoningDeltaEvent struct {
+	Delta string
+}
+
+func (e ReasoningDeltaEvent) Type() EventType { return ReasoningDelta }
 
 // ReasoningStartEvent fires when the LLM begins reasoning/thinking.
 type ReasoningStartEvent struct {

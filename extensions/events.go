@@ -108,6 +108,9 @@ const (
 	// ReasoningStart fires when the LLM begins reasoning/thinking.
 	ReasoningStart EventType = "reasoning_start"
 
+	// ReasoningDelta fires for each streaming reasoning/thinking chunk.
+	ReasoningDelta EventType = "reasoning_delta"
+
 	// Warnings fires when the LLM provider returns warnings.
 	Warnings EventType = "warnings"
 
@@ -143,7 +146,7 @@ func AllEventTypes() []EventType {
 		ModelChange, ContextPrepare,
 		BeforeFork, BeforeSessionSwitch, BeforeCompact,
 		SubagentStart, SubagentChunk, SubagentEnd,
-		StepStart, StepFinish, ReasoningStart, Warnings, Source, Error, Retry,
+		StepStart, StepFinish, ReasoningStart, ReasoningDelta, Warnings, Source, Error, Retry,
 		PrepareStep, LLMUsage,
 	}
 }

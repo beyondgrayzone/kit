@@ -182,6 +182,7 @@ func Symbols() interp.Exports {
 			"StepStartEvent":      reflect.ValueOf((*StepStartEvent)(nil)),
 			"StepFinishEvent":     reflect.ValueOf((*StepFinishEvent)(nil)),
 			"ReasoningStartEvent": reflect.ValueOf((*ReasoningStartEvent)(nil)),
+			"ReasoningDeltaEvent": reflect.ValueOf((*ReasoningDeltaEvent)(nil)),
 			"WarningsEvent":       reflect.ValueOf((*WarningsEvent)(nil)),
 			"SourceEvent":         reflect.ValueOf((*SourceEvent)(nil)),
 			"ErrorEvent":          reflect.ValueOf((*ErrorEvent)(nil)),
