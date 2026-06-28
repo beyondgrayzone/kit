@@ -832,6 +832,13 @@ func (m *Kit) GetSystemPromptSource() string {
 	return m.systemPromptSource
 }
 
+func (m *Kit) GetComposedSystemPrompt() string {
+	m.runtimeMu.RLock()
+	base := m.basePrompt
+	m.runtimeMu.RUnlock()
+	return m.composeSystemPrompt(base)
+}
+
 // composeSystemPrompt takes a base system prompt and composes it with the
 // current runtime context: AGENTS.md content, skills metadata, and date/cwd.
 // This mirrors the composition done during Kit.New() initialization.
