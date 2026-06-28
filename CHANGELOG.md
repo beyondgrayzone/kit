@@ -1,3 +1,6 @@
+# Changelog (Till 0.82.1)
+- Git merge only 
+
 # Changelog (Till 0.80.0)
 This changelog summarizes the changes found in the provided diff, categorized by
 functional area.

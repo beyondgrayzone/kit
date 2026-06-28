@@ -129,6 +129,9 @@ temperature: 0.7
 stream: true
 thinking-level: off       # off, none, minimal, low, medium, high
 no-core-tools: false      # set to true to disable all built-in core tools
+exclude-core-tools:       # List of core tools to exclude, mutually exclusive to `include-core-tools`
+#include-core-tools:
+# - "bash"                # List of core tools to exclude, mutually exclusive to `exclude-core-tools`
 
 # Skills — all keys are optional
 no-skills: false          # set to true to disable all skill loading
@@ -209,6 +212,9 @@ mcpServers:
 --extension, -e          Load additional extension file(s) (repeatable)
 --no-extensions          Disable all extensions
 --no-core-tools          Disable all built-in core tools (bash, read, write, edit, grep, find, ls, subagent)
+--include-core-tools
+--exclude-core-tools     Mutually exclusive lists of core tool names to include or not to include in agent
+
 --prompt-template        Load a specific prompt template by name
 --no-prompt-templates    Disable prompt template loading
 
@@ -657,6 +663,8 @@ host, err := kit.New(ctx, &kit.Options{
     DisableCoreTools: true,                // Disable all built-in core tools; also controllable via
                                            // --no-core-tools flag, KIT_NO_CORE_TOOLS env var,
                                            // or no-core-tools: true in .kit.yml
+    CoreToolList      []string,            // List of core tool names to  register. If empty (default), include all.
+                                           // DisableCoreTools has precedence.
 
     // Configuration
     SkipConfig:   true,                   // Skip .kit.yml files (viper defaults + env vars still apply)
@@ -908,6 +916,34 @@ opaque identifier — it doesn't have to be a real filesystem path). All
 mutators and readers (`GetSkills`, `GetContextFiles`) are safe to call
 concurrently from multiple goroutines. See the [SDK overview docs](/sdk/overview#runtime-skills-and-context-files)
 for the full reference.
+
+### Runtime Native Tools
+
+Native Go tools can also be added and removed on a live host, mirroring the
+runtime MCP-server and skill APIs. This is useful for progressive disclosure
+(dynamically loading a domain toolset only when the model asks for it) and for
+multi-tenant hosts that need to swap tool catalogs without rebuilding the host.
+
+```go
+// Add tools that persist for the session.
+host.AddTools(crmTools...)
+
+// Drop a domain when it is no longer needed.
+if err := host.RemoveTools("crm_search_contacts", "crm_create_deal"); err != nil {
+    log.Printf("remove tools: %v", err)
+}
+
+// Replace the entire extra-tool set wholesale.
+host.SetExtraTools(activeTools...)
+
+// Read back the currently registered extra tools.
+extra := host.GetExtraTools()
+```
+
+`AddTools` replaces existing extra tools by name (last-write-wins) and appends
+new ones. `RemoveTools` is atomic: if any supplied name is not currently
+registered, it returns an error and leaves the tool set unchanged. Core tools
+and MCP tools are unaffected. Mutations take effect on the next LLM step.
 
 ## Advanced Usage
 
