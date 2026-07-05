@@ -134,7 +134,7 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 
 	// Get the branch from root to target (root-to-leaf order).
 	branch := tm.getBranchLocked(targetID)
-	if len(branch) == 0 {
+	if len(branch) == 0 && targetID != "" {
 		return nil, fmt.Errorf("target entry %q not found", targetID)
 	}
 
