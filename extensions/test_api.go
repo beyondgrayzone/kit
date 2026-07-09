@@ -9,6 +9,12 @@ func NewTestAPI(ext *LoadedExtension) API {
 	}
 
 	return API{
+		onRawInput: func(h func(RawInputEvent, Context)) {
+			reg(RawInput, func(e Event, c Context) Result {
+				h(e.(RawInputEvent), c)
+				return nil
+			})
+		},
 		onToolCall: func(h func(ToolCallEvent, Context) *ToolCallResult) {
 			reg(ToolCall, func(e Event, c Context) Result {
 				r := h(e.(ToolCallEvent), c)
@@ -170,6 +176,18 @@ func NewTestAPI(ext *LoadedExtension) API {
 		},
 		registerMessageRendererFn: func(config MessageRendererConfig) {
 			ext.MessageRenderers = append(ext.MessageRenderers, config)
+		},
+		onStepStart: func(h func(StepStartEvent, Context)) {
+			reg(StepStart, func(e Event, c Context) Result {
+				h(e.(StepStartEvent), c)
+				return nil
+			})
+		},
+		onStepFinish: func(h func(StepFinishEvent, Context)) {
+			reg(StepFinish, func(e Event, c Context) Result {
+				h(e.(StepFinishEvent), c)
+				return nil
+			})
 		},
 		onSubagentStart: func(h func(SubagentStartEvent, Context)) {
 			reg(SubagentStart, func(e Event, c Context) Result {

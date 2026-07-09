@@ -497,6 +497,12 @@ func loadSingleExtension(path string) (*LoadedExtension, error) {
 	}
 
 	api := API{
+		onRawInput: func(h func(RawInputEvent, Context)) {
+			reg(RawInput, func(e Event, c Context) Result {
+				h(e.(RawInputEvent), c)
+				return nil
+			})
+		},
 		onToolCall: func(h func(ToolCallEvent, Context) *ToolCallResult) {
 			reg(ToolCall, func(e Event, c Context) Result {
 				r := h(e.(ToolCallEvent), c)

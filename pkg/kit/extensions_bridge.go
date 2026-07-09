@@ -130,15 +130,16 @@ func (m *Kit) bridgeExtensions(runner *extensions.Runner) {
 	if runner.HasHandlers(extensions.AgentEnd) {
 		m.Subscribe(func(e Event) {
 			if ev, ok := e.(TurnEndEvent); ok {
-				stopReason, response := ev.StopReason, ev.Response
-				if ev.Error != nil {
-					stopReason, response = "error", ""
+				stopReason, response, err := ev.StopReason, ev.Response, ev.Error
+				if err != nil {
+					stopReason = "error"
 				} else if stopReason == "" {
 					stopReason = "completed"
 				}
 				agg := turnAgg.consume()
 				_, _ = runner.Emit(extensions.AgentEndEvent{
 					Response:              response,
+					Error:                 err,
 					StopReason:            stopReason,
 					ToolCallCount:         agg.toolCallCount,
 					ToolNames:             agg.toolNames,

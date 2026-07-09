@@ -38,6 +38,13 @@ const (
 	// ToolResult fires after a tool executes. Handlers can modify the result.
 	ToolResult EventType = "tool_result"
 
+	// RawInput fires when user input is first received, BEFORE @file
+	// expansion or any other processing. The Text field contains the
+	// original user input exactly as typed (e.g. "When @file.txt"
+	// rather than the expanded content). This is useful for extensions
+	// that need to capture or log the raw prompt.
+	RawInput EventType = "raw_input"
+
 	// Input fires when user input is received. Handlers can transform or handle it.
 	Input EventType = "input"
 
@@ -140,7 +147,7 @@ func AllEventTypes() []EventType {
 	return []EventType{
 		ToolCall, ToolCallInputStart, ToolCallInputDelta, ToolCallInputEnd,
 		ToolExecutionStart, ToolExecutionEnd, ToolResult,
-		Input, BeforeAgentStart, AgentStart, AgentEnd,
+		RawInput, Input, BeforeAgentStart, AgentStart, AgentEnd,
 		MessageStart, MessageUpdate, MessageEnd,
 		SessionStart, SessionShutdown,
 		ModelChange, ContextPrepare,

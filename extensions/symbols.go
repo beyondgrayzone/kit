@@ -167,6 +167,7 @@ func Symbols() interp.Exports {
 			"ToolResultResult":        reflect.ValueOf((*ToolResultResult)(nil)),
 			"InputEvent":              reflect.ValueOf((*InputEvent)(nil)),
 			"InputResult":             reflect.ValueOf((*InputResult)(nil)),
+			"RawInputEvent":          reflect.ValueOf((*RawInputEvent)(nil)),
 			"BeforeAgentStartEvent":   reflect.ValueOf((*BeforeAgentStartEvent)(nil)),
 			"BeforeAgentStartResult":  reflect.ValueOf((*BeforeAgentStartResult)(nil)),
 			"AgentStartEvent":         reflect.ValueOf((*AgentStartEvent)(nil)),

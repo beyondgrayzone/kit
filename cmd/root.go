@@ -711,6 +711,17 @@ func globalShortcutsProviderForUI(k *kit.Kit) func() map[string]func() {
 	}
 }
 
+// rawInputProviderForUI returns a callback that emits a RawInput event
+// to extensions. Returns nil if extensions are disabled.
+func rawInputProviderForUI(k *kit.Kit) func(rawText string, source string) {
+	if !k.Extensions().HasExtensions() {
+		return nil
+	}
+	return func(rawText string, source string) {
+		k.Extensions().EmitRawInput(rawText, source)
+	}
+}
+
 // validateModeFlags rejects invalid flag combinations for the root command.
 func validateModeFlags() error {
 	if quietFlag && positionalPrompt == "" {
@@ -1118,6 +1129,7 @@ func runNormalMode(ctx context.Context) error {
 	getStatusBarEntries := statusBarProviderForUI(kitInstance)
 	emitBeforeFork := beforeForkProviderForUI(kitInstance)
 	emitBeforeSessionSwitch := beforeSessionSwitchProviderForUI(kitInstance)
+	emitRawInput := rawInputProviderForUI(kitInstance)
 	getGlobalShortcuts := globalShortcutsProviderForUI(kitInstance)
 	getExtensionCommands := func() []commands.ExtensionCommand {
 		return extensionCommandsForUI(kitInstance)
@@ -1368,6 +1380,7 @@ func runNormalMode(ctx context.Context) error {
 		getStatusBarEntries:      getStatusBarEntries,
 		emitBeforeFork:           emitBeforeFork,
 		emitBeforeSessionSwitch:  emitBeforeSessionSwitch,
+		emitRawInput:             emitRawInput,
 		getGlobalShortcuts:       getGlobalShortcuts,
 		getExtensionCommands:     getExtensionCommands,
 		setModel:                 setModelForUI,
@@ -1407,6 +1420,15 @@ func runNonInteractiveModeApp(ctx context.Context, deps runModeDeps, prompt stri
 	appInstance := deps.appInstance
 	cli := deps.cli
 	modelName := deps.modelName
+
+	ctx = kit.ContextWithSource(ctx, "non-interactive")
+	// Emit RawInput event BEFORE any processing (@file expansion,
+	// template expansion, etc.) so extensions can capture the
+	// original user input. Source is "non-interactive" since this
+	// is the CLI/quiet path (--prompt, --quiet, --json).
+	if deps.emitRawInput != nil {
+		deps.emitRawInput(prompt, "non-interactive")
+	}
 
 	// Expand @file references in the prompt before sending to the agent.
 	// Text files are XML-inlined; binary files are extracted as multimodal parts.
@@ -1521,6 +1543,7 @@ type runModeDeps struct {
 	getExtensionCommands     func() []commands.ExtensionCommand
 	setModel                 func(string) error
 	emitModelChange          func(string, string, string)
+	emitRawInput             func(string, string)
 	isReasoningModel         bool
 	thinkingLevel            string
 	setThinkingLevel         func(string) error
@@ -1680,6 +1703,7 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 		GetStatusBarEntries:      deps.getStatusBarEntries,
 		EmitBeforeFork:           deps.emitBeforeFork,
 		EmitBeforeSessionSwitch:  deps.emitBeforeSessionSwitch,
+		EmitRawInput:             deps.emitRawInput,
 		GetGlobalShortcuts:       deps.getGlobalShortcuts,
 		GetExtensionCommands:     deps.getExtensionCommands,
 		SetModel:                 deps.setModel,

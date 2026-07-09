@@ -1191,6 +1191,7 @@ type PrintBlockOpts struct {
 // register typed event handlers, custom tools, and slash commands.
 type API struct {
 	// Event-specific registration functions (wired by the loader).
+	onRawInput               func(func(RawInputEvent, Context))
 	onToolCall                func(func(ToolCallEvent, Context) *ToolCallResult)
 	onToolCallInputStart      func(func(ToolCallInputStartEvent, Context))
 	onToolCallInputDelta      func(func(ToolCallInputDeltaEvent, Context))
@@ -1237,13 +1238,17 @@ type API struct {
 
 // OnReasoningDelta registers a handler that fires for each streaming reasoning/thinking chunk.
 func (a *API) OnReasoningDelta(handler func(ReasoningDeltaEvent, Context)) {
-	a.onReasoningDelta(handler)
+	if a.onReasoningDelta != nil {
+		a.onReasoningDelta(handler)
+	}
 }
 
 // OnToolCall registers a handler that fires before a tool executes.
 // Return a non-nil ToolCallResult with Block=true to prevent execution.
 func (a *API) OnToolCall(handler func(ToolCallEvent, Context) *ToolCallResult) {
-	a.onToolCall(handler)
+	if a.onToolCall != nil {
+		a.onToolCall(handler)
+	}
 }
 
 // OnToolCallInputStart registers a handler that fires when the LLM begins
@@ -1251,49 +1256,65 @@ func (a *API) OnToolCall(handler func(ToolCallEvent, Context) *ToolCallResult) {
 // argument JSON is still being streamed. Useful for showing a "running"
 // indicator immediately without waiting for the full arguments.
 func (a *API) OnToolCallInputStart(handler func(ToolCallInputStartEvent, Context)) {
-	a.onToolCallInputStart(handler)
+	if a.onToolCallInputStart != nil {
+		a.onToolCallInputStart(handler)
+	}
 }
 
 // OnToolCallInputDelta registers a handler that fires for each streamed
 // fragment of tool call arguments as they arrive from the LLM.
 func (a *API) OnToolCallInputDelta(handler func(ToolCallInputDeltaEvent, Context)) {
-	a.onToolCallInputDelta(handler)
+	if a.onToolCallInputDelta != nil {
+		a.onToolCallInputDelta(handler)
+	}
 }
 
 // OnToolCallInputEnd registers a handler that fires when tool argument
 // streaming is complete, before the tool call is parsed and execution begins.
 func (a *API) OnToolCallInputEnd(handler func(ToolCallInputEndEvent, Context)) {
-	a.onToolCallInputEnd(handler)
+	if a.onToolCallInputEnd != nil {
+		a.onToolCallInputEnd(handler)
+	}
 }
 
 // OnToolExecutionStart registers a handler for tool execution start.
 func (a *API) OnToolExecutionStart(handler func(ToolExecutionStartEvent, Context)) {
-	a.onToolExecStart(handler)
+	if a.onToolExecStart != nil {
+		a.onToolExecStart(handler)
+	}
 }
 
 // OnToolExecutionEnd registers a handler for tool execution end.
 func (a *API) OnToolExecutionEnd(handler func(ToolExecutionEndEvent, Context)) {
-	a.onToolExecEnd(handler)
+	if a.onToolExecEnd != nil {
+		a.onToolExecEnd(handler)
+	}
 }
 
 // OnToolOutput registers a handler for streaming tool output chunks.
 // This fires for each output line as it arrives from tools like bash,
 // allowing extensions to observe or process output in real-time.
 func (a *API) OnToolOutput(handler func(ToolOutputEvent, Context)) {
-	a.onToolOutput(handler)
+	if a.onToolOutput != nil {
+		a.onToolOutput(handler)
+	}
 }
 
 // OnToolResult registers a handler that fires after tool execution.
 // Return a non-nil ToolResultResult to modify the output.
 func (a *API) OnToolResult(handler func(ToolResultEvent, Context) *ToolResultResult) {
-	a.onToolResult(handler)
+	if a.onToolResult != nil {
+		a.onToolResult(handler)
+	}
 }
 
 // OnSubagentStart registers a handler that fires when a subagent tool
 // call begins executing. Use the ToolCallID to correlate with subsequent
 // OnSubagentChunk and OnSubagentEnd events for the same subagent.
 func (a *API) OnSubagentStart(handler func(SubagentStartEvent, Context)) {
-	a.onSubagentStart(handler)
+	if a.onSubagentStart != nil {
+		a.onSubagentStart(handler)
+	}
 }
 
 // OnSubagentChunk registers a handler for real-time events from a running
@@ -1301,66 +1322,99 @@ func (a *API) OnSubagentStart(handler func(SubagentStartEvent, Context)) {
 // "tool_result", "tool_execution_start", "tool_execution_end", etc.).
 // Correlate with OnSubagentStart via the ToolCallID field.
 func (a *API) OnSubagentChunk(handler func(SubagentChunkEvent, Context)) {
-	a.onSubagentChunk(handler)
+	if a.onSubagentChunk != nil {
+		a.onSubagentChunk(handler)
+	}
 }
 
 // OnSubagentEnd registers a handler that fires when a subagent call
 // completes. ErrorMsg is non-empty when the subagent failed.
 func (a *API) OnSubagentEnd(handler func(SubagentEndEvent, Context)) {
-	a.onSubagentEnd(handler)
+	if a.onSubagentEnd != nil {
+		a.onSubagentEnd(handler)
+	}
+}
+
+// OnRawInput registers a handler that fires when user input is first
+// received, BEFORE @file expansion or any other processing. The
+// handler receives the original user input exactly as typed.
+func (a *API) OnRawInput(handler func(RawInputEvent, Context)) {
+	if a.onRawInput != nil {
+		a.onRawInput(handler)
+	}
 }
 
 // OnInput registers a handler that fires when user input is received.
 // Return a non-nil InputResult to transform or handle the input.
 func (a *API) OnInput(handler func(InputEvent, Context) *InputResult) {
-	a.onInput(handler)
+	if a.onInput != nil {
+		a.onInput(handler)
+	}
 }
 
 // OnBeforeAgentStart registers a handler that fires before the agent loop.
 func (a *API) OnBeforeAgentStart(handler func(BeforeAgentStartEvent, Context) *BeforeAgentStartResult) {
-	a.onBeforeAgentStart(handler)
+	if a.onBeforeAgentStart != nil {
+		a.onBeforeAgentStart(handler)
+	}
 }
 
 // OnAgentStart registers a handler for when the agent loop begins.
 func (a *API) OnAgentStart(handler func(AgentStartEvent, Context)) {
-	a.onAgentStart(handler)
+	if a.onAgentStart != nil {
+		a.onAgentStart(handler)
+	}
 }
 
 // OnAgentEnd registers a handler for when the agent finishes responding.
 func (a *API) OnAgentEnd(handler func(AgentEndEvent, Context)) {
-	a.onAgentEnd(handler)
+	if a.onAgentEnd != nil {
+		a.onAgentEnd(handler)
+	}
 }
 
 // OnMessageStart registers a handler for when an assistant message begins.
 func (a *API) OnMessageStart(handler func(MessageStartEvent, Context)) {
-	a.onMessageStart(handler)
+	if a.onMessageStart != nil {
+		a.onMessageStart(handler)
+	}
 }
 
 // OnMessageUpdate registers a handler for streaming text chunks.
 func (a *API) OnMessageUpdate(handler func(MessageUpdateEvent, Context)) {
-	a.onMessageUpdate(handler)
+	if a.onMessageUpdate != nil {
+		a.onMessageUpdate(handler)
+	}
 }
 
 // OnMessageEnd registers a handler for when the assistant message is complete.
 func (a *API) OnMessageEnd(handler func(MessageEndEvent, Context)) {
-	a.onMessageEnd(handler)
+	if a.onMessageEnd != nil {
+		a.onMessageEnd(handler)
+	}
 }
 
 // OnSessionStart registers a handler for when a session is loaded or created.
 func (a *API) OnSessionStart(handler func(SessionStartEvent, Context)) {
-	a.onSessionStart(handler)
+	if a.onSessionStart != nil {
+		a.onSessionStart(handler)
+	}
 }
 
 // OnSessionShutdown registers a handler for when the application is closing.
 func (a *API) OnSessionShutdown(handler func(SessionShutdownEvent, Context)) {
-	a.onSessionShutdown(handler)
+	if a.onSessionShutdown != nil {
+		a.onSessionShutdown(handler)
+	}
 }
 
 // OnModelChange registers a handler that fires after the active model is
 // changed via ctx.SetModel(). The handler receives the new and previous model
 // strings plus the source of the change.
 func (a *API) OnModelChange(handler func(ModelChangeEvent, Context)) {
-	a.onModelChange(handler)
+	if a.onModelChange != nil {
+		a.onModelChange(handler)
+	}
 }
 
 // OnContextPrepare registers a handler that fires after the context window is
@@ -1383,17 +1437,23 @@ func (a *API) OnModelChange(handler func(ModelChangeEvent, Context)) {
 //	    return &ext.ContextPrepareResult{Messages: msgs}
 //	})
 func (a *API) OnContextPrepare(handler func(ContextPrepareEvent, Context) *ContextPrepareResult) {
-	a.onContextPrepare(handler)
+	if a.onContextPrepare != nil {
+		a.onContextPrepare(handler)
+	}
 }
 
 // RegisterTool adds a custom tool that the LLM can invoke.
 func (a *API) RegisterTool(tool ToolDef) {
-	a.registerToolFn(tool)
+	if a.registerToolFn != nil {
+		a.registerToolFn(tool)
+	}
 }
 
 // RegisterCommand adds a slash command available in interactive mode.
 func (a *API) RegisterCommand(cmd CommandDef) {
-	a.registerCmdFn(cmd)
+	if a.registerCmdFn != nil {
+		a.registerCmdFn(cmd)
+	}
 }
 
 // RegisterOption declares a named configuration option. The option can be set
@@ -1401,7 +1461,9 @@ func (a *API) RegisterCommand(cmd CommandDef) {
 // Multiple extensions can register options with the same name; the last default
 // wins.
 func (a *API) RegisterOption(opt OptionDef) {
-	a.registerOption(opt)
+	if a.registerOption != nil {
+		a.registerOption(opt)
+	}
 }
 
 // RegisterShortcut registers a global keyboard shortcut that fires across
@@ -1421,70 +1483,92 @@ func (a *API) RegisterShortcut(def ShortcutDef, handler func(Context)) {
 // Multiple handlers can subscribe to the same event name; they execute
 // in registration order.
 func (a *API) OnCustomEvent(name string, handler func(string)) {
-	a.onCustomEvent(name, handler)
+	if a.onCustomEvent != nil {
+		a.onCustomEvent(name, handler)
+	}
 }
 
 // OnBeforeFork registers a handler that fires before the session tree is
 // branched to a different entry point. Return a non-nil BeforeForkResult
 // with Cancel=true to prevent the fork.
 func (a *API) OnBeforeFork(handler func(BeforeForkEvent, Context) *BeforeForkResult) {
-	a.onBeforeFork(handler)
+	if a.onBeforeFork != nil {
+		a.onBeforeFork(handler)
+	}
 }
 
 // OnBeforeSessionSwitch registers a handler that fires before the session
 // is switched to a new branch (e.g. /new command). Return a non-nil
 // BeforeSessionSwitchResult with Cancel=true to prevent the switch.
 func (a *API) OnBeforeSessionSwitch(handler func(BeforeSessionSwitchEvent, Context) *BeforeSessionSwitchResult) {
-	a.onBeforeSessionSwitch(handler)
+	if a.onBeforeSessionSwitch != nil {
+		a.onBeforeSessionSwitch(handler)
+	}
 }
 
 // OnBeforeCompact registers a handler that fires before context compaction
 // runs. Return a non-nil BeforeCompactResult with Cancel=true to prevent
 // compaction from proceeding.
 func (a *API) OnBeforeCompact(handler func(BeforeCompactEvent, Context) *BeforeCompactResult) {
-	a.onBeforeCompact(handler)
+	if a.onBeforeCompact != nil {
+		a.onBeforeCompact(handler)
+	}
 }
 
 // OnStepStart registers a handler that fires when a new LLM call begins
 // within a multi-step agent turn.
 func (a *API) OnStepStart(handler func(StepStartEvent, Context)) {
-	a.onStepStart(handler)
+	if a.onStepStart != nil {
+		a.onStepStart(handler)
+	}
 }
 
 // OnStepFinish registers a handler that fires when a step completes,
 // providing step number, finish reason, and decomposed token usage.
 func (a *API) OnStepFinish(handler func(StepFinishEvent, Context)) {
-	a.onStepFinish(handler)
+	if a.onStepFinish != nil {
+		a.onStepFinish(handler)
+	}
 }
 
 // OnReasoningStart registers a handler that fires when the LLM begins
 // reasoning/thinking.
 func (a *API) OnReasoningStart(handler func(ReasoningStartEvent, Context)) {
-	a.onReasoningStart(handler)
+	if a.onReasoningStart != nil {
+		a.onReasoningStart(handler)
+	}
 }
 
 // OnWarnings registers a handler that fires when the LLM provider returns
 // warnings about the request.
 func (a *API) OnWarnings(handler func(WarningsEvent, Context)) {
-	a.onWarnings(handler)
+	if a.onWarnings != nil {
+		a.onWarnings(handler)
+	}
 }
 
 // OnSource registers a handler that fires when the LLM references a source
 // (e.g. from web search tools).
 func (a *API) OnSource(handler func(SourceEvent, Context)) {
-	a.onSource(handler)
+	if a.onSource != nil {
+		a.onSource(handler)
+	}
 }
 
 // OnError registers a handler that fires when an agent-level error occurs
 // during streaming.
 func (a *API) OnError(handler func(ErrorEvent, Context)) {
-	a.onError(handler)
+	if a.onError != nil {
+		a.onError(handler)
+	}
 }
 
 // OnRetry registers a handler that fires when the LLM provider request is
 // retried after a transient error.
 func (a *API) OnRetry(handler func(RetryEvent, Context)) {
-	a.onRetry(handler)
+	if a.onRetry != nil {
+		a.onRetry(handler)
+	}
 }
 
 // OnPrepareStep registers a handler that fires between steps within a
@@ -1492,7 +1576,9 @@ func (a *API) OnRetry(handler func(RetryEvent, Context)) {
 // messages are sent to the LLM. Return a non-nil PrepareStepResult with
 // Messages to replace the context window for this step.
 func (a *API) OnPrepareStep(handler func(PrepareStepEvent, Context) *PrepareStepResult) {
-	a.onPrepareStep(handler)
+	if a.onPrepareStep != nil {
+		a.onPrepareStep(handler)
+	}
 }
 
 // OnLLMUsage registers a handler that fires after each LLM provider call
@@ -1505,7 +1591,9 @@ func (a *API) OnPrepareStep(handler func(PrepareStepEvent, Context) *PrepareStep
 // turn typically fires multiple LLMUsageEvents (one per tool-loop
 // iteration).
 func (a *API) OnLLMUsage(handler func(LLMUsageEvent, Context)) {
-	a.onLLMUsage(handler)
+	if a.onLLMUsage != nil {
+		a.onLLMUsage(handler)
+	}
 }
 
 // RegisterToolRenderer registers a custom renderer for a specific tool's
@@ -1513,7 +1601,9 @@ func (a *API) OnLLMUsage(handler func(LLMUsageEvent, Context)) {
 // and/or body (result display) of the tool's output block. If multiple
 // extensions register renderers for the same tool name, the last one wins.
 func (a *API) RegisterToolRenderer(config ToolRenderConfig) {
-	a.registerToolRendererFn(config)
+	if a.registerToolRendererFn != nil {
+		a.registerToolRendererFn(config)
+	}
 }
 
 // RegisterMessageRenderer registers a named message renderer that extensions
@@ -2208,6 +2298,16 @@ type ToolResultResult struct {
 
 func (ToolResultResult) isResult() {}
 
+// RawInputEvent fires when user input is first received, BEFORE @file
+// expansion or any other processing. Text contains the original user
+// input exactly as typed.
+type RawInputEvent struct {
+	Text   string
+	Source string // "interactive", "cli", "script", "queue"
+}
+
+func (e RawInputEvent) Type() EventType { return RawInput }
+
 // InputEvent fires when user input is received.
 type InputEvent struct {
 	Text   string
@@ -2254,6 +2354,7 @@ func (e AgentStartEvent) Type() EventType { return AgentStart }
 // OnToolResult / OnStepFinish handlers.
 type AgentEndEvent struct {
 	Response   string
+	Error      error  // non-nil when StopReason is "error"
 	StopReason string // "completed", "cancelled", "error"
 
 	// ToolCallCount is the total number of tool invocations observed during

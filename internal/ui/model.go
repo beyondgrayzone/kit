@@ -474,6 +474,11 @@ type AppModelOptions struct {
 	// May be nil if extensions are not loaded.
 	EmitModelChange func(newModel, previousModel, source string)
 
+	// EmitRawInput fires the OnRawInput extension event, delivering
+	// the original user input (before @file expansion etc.) to extensions.
+	// May be nil if extensions are not loaded.
+	EmitRawInput func(rawText string, source string)
+
 	// SwitchSession opens a session by JSONL file path, replacing the
 	// active tree session and reloading messages. Called when the user
 	// picks a session from /resume. May be nil if session switching is
@@ -688,6 +693,12 @@ type AppModel struct {
 	// emitBeforeSessionSwitch emits a before-session-switch event to extensions.
 	// Returns (cancelled, reason). May be nil if no extensions are loaded.
 	emitBeforeSessionSwitch func(reason, initialPrompt string) (bool, string)
+
+	// emitRawInput emits a RawInput event to extensions, firing BEFORE
+	// @file expansion or any other processing. The rawText is the
+	// original user input exactly as typed. May be nil if no
+	// extensions are loaded.
+	emitRawInput func(rawText string, source string)
 
 	// thinkingLevel is the current extended thinking level.
 	thinkingLevel string
@@ -1702,12 +1713,27 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ctrlCPressedOnce = false
 
-	// ── Input submitted ──────────────────────────────────────────────────────
+		// ── Input submitted ──────────────────────────────────────────────────────
 	case uicore.SubmitMsg:
 		// Re-enable auto-scroll when user submits a new message.
 		m.scrollList.autoScroll = true
 		// Reset Ctrl+C flag so next Ctrl+C clears input instead of quitting.
 		m.ctrlCPressedOnce = false
+
+		// Identify the input source for the SDK.
+		// ctx = kit.ContextWithSource(context.Background(), "interactive")
+
+		// Capture raw input BEFORE any processing (@file expansion,
+		// template expansion, etc.) for the RawInput extension event.
+		rawInputText := msg.Text
+
+		// Emit RawInput event BEFORE any processing (slash commands,
+		// @file expansion, template expansion, etc.) so extensions
+		// can capture the original user input. Source is "interactive"
+		// since this is the TUI input path.
+		if m.emitRawInput != nil {
+			m.emitRawInput(rawInputText, "interactive")
+		}
 
 		// Handle slash commands locally — they should never reach app.Run().
 		// Parse once: split on the first space so argument-bearing commands

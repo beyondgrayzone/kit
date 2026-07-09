@@ -138,6 +138,7 @@ type ExtensionAPI interface {
 	EmitBeforeFork(targetID string, isUserMsg bool, userText string) (cancelled bool, reason string)
 	EmitBeforeSessionSwitch(switchReason string) (cancelled bool, reason string)
 	EmitBeforeSessionSwitchWithPrompt(switchReason, initialPrompt string) (cancelled bool, reason string)
+	EmitRawInput(rawText string, source string)
 
 	// Commands
 	Commands() []ExtensionCommandDef
@@ -528,7 +529,9 @@ func (e *extensionAPI) SetOption(name, value string) {
 
 func (e *extensionAPI) EmitSessionStart() {
 	if e.kit.extRunner != nil && e.kit.extRunner.HasHandlers(extensions.SessionStart) {
-		_, _ = e.kit.extRunner.Emit(extensions.SessionStartEvent{})
+		_, _ = e.kit.extRunner.Emit(extensions.SessionStartEvent{
+			SessionID: e.kit.GetSessionID(),
+		})
 	}
 }
 
@@ -591,6 +594,19 @@ func (e *extensionAPI) EmitBeforeSessionSwitchWithPrompt(switchReason, initialPr
 		return true, reason
 	}
 	return false, ""
+}
+
+// EmitRawInput fires the RawInput event on the extension runner,
+// delivering the original user input (before @file expansion etc.)
+// to extensions that registered OnRawInput handlers.
+func (e *extensionAPI) EmitRawInput(rawText string, source string) {
+	if e.kit.extRunner == nil || !e.kit.extRunner.HasHandlers(extensions.RawInput) {
+		return
+	}
+	_, _ = e.kit.extRunner.Emit(extensions.RawInputEvent{
+		Text:   rawText,
+		Source: source,
+	})
 }
 
 // Commands

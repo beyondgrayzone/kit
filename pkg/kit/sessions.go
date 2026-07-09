@@ -3,6 +3,7 @@ package kit
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -64,6 +65,52 @@ func (m *Kit) GetTreeSession() *TreeManager {
 // SetSessionManager replaces the session manager on a Kit instance.
 func (m *Kit) SetSessionManager(sm SessionManager) {
 	m.session = sm
+
+	// Re-initialize extension state and notify handlers of the new session.
+	// Done in a goroutine so the caller (often the Bubble Tea Update loop)
+	// is not blocked by disk I/O or extension event handlers.
+	if m.Extensions().HasExtensions() {
+		go m.reinitExtensionsForSession(sm)
+	}
+}
+
+// reinitExtensionsForSession performs extension state re-linking and
+// SessionStart event emission for a newly-switched session. It must be
+// called in a goroutine by SetSessionManager; the sm parameter is captured
+// synchronously from the caller to avoid data races on m.session.
+func (m *Kit) reinitExtensionsForSession(sm SessionManager) {
+	// Capture session identity synchronously before any async work.
+	var sessionPath string
+	if adapter, ok := sm.(*treeManagerAdapter); ok {
+		sessionPath = adapter.inner.GetFilePath()
+	}
+	sessionID := sm.GetSessionID()
+
+	// Link extension state to the resumed session's sidecar file.
+	if m.extRunner != nil {
+		path := extStateSidecarPath(sessionPath)
+		if path != "" {
+			if err := m.extRunner.LoadStateFromFile(path); err != nil {
+				// Non-fatal: the sidecar may not exist yet for new sessions.
+				_ = err
+			}
+			runner := m.extRunner
+			runner.SetStateSaver(func() {
+				if err := runner.SaveStateToFile(path); err != nil {
+					log.Printf("WARN extension state save failed: path=%s err=%v", path, err)
+				}
+			})
+		} else {
+			m.extRunner.SetStateSaver(nil)
+		}
+	}
+
+	// Notify extensions that a new session is active.
+	if m.extRunner != nil && m.extRunner.HasHandlers(extensions.SessionStart) {
+		_, _ = m.extRunner.Emit(extensions.SessionStartEvent{
+			SessionID: sessionID,
+		})
+	}
 }
 
 // SetTreeSession replaces the tree session on a Kit instance. This is used by
@@ -71,7 +118,7 @@ func (m *Kit) SetSessionManager(sm SessionManager) {
 // TUI picker) and needs to inject the result into a Kit-like workflow.
 // Deprecated: Use SetSessionManager instead.
 func (m *Kit) SetTreeSession(ts *TreeManager) {
-	m.session = NewTreeManagerAdapter(ts)
+	m.SetSessionManager(NewTreeManagerAdapter(ts))
 }
 
 // GetSessionPath returns the file path of the active session, or empty

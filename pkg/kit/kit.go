@@ -30,6 +30,14 @@ import (
 	"github.com/spf13/viper"
 )
 
+type rawInputSourceKey struct{}
+
+// ContextWithSource returns a context carrying the source identifier for
+// RawInput events (e.g. "interactive", "non-interactive", "sdk").
+func ContextWithSource(ctx context.Context, source string) context.Context {
+	return context.WithValue(ctx, rawInputSourceKey{}, source)
+}
+
 // ContextFile represents a project context file (e.g. AGENTS.md) that was
 // loaded during initialization and injected into the system prompt.
 type ContextFile struct {
@@ -1064,7 +1072,7 @@ type Options struct {
 	// Streaming enables or disables streaming output. It is a pointer so the
 	// SDK can distinguish "unset" (nil) from an explicit choice, mirroring the
 	// sampling-parameter fields below. nil leaves streaming to the precedence
-	// chain (env → .kit.yml → default true); a non-nil value forces it. Prefer
+	// chain (env → config → default true); a non-nil value forces it. Prefer
 	// [WithStreaming] for the functional-options API.
 	Streaming *bool
 
@@ -1294,14 +1302,13 @@ type Options struct {
 	// means use the default (15 minutes).
 	MCPTaskTimeout time.Duration
 
-	// MCPTaskTTL is the TTL hint sent in TaskParams for every
-	// task-augmented tools/call. Zero omits the TTL and lets the server
+	// MCPTaskTTL is the TTL hint sent in TaskParams when augmenting a
+	// tools/call. Zero omits the TTL and lets the server
 	// pick its own retention policy.
 	MCPTaskTTL time.Duration
 
 	// MCPTaskPollInterval is the fallback interval between tasks/get
-	// requests when the server does not suggest one. Zero means use the
-	// default (1 second).
+	// requests when the server does not suggest one. Zero defaults to 1 second.
 	MCPTaskPollInterval time.Duration
 
 	// MCPTaskMaxPollInterval caps the polling interval (a server-supplied
@@ -1312,7 +1319,7 @@ type Options struct {
 	// MCPTaskProgress, if non-nil, is invoked once when a task is accepted
 	// and on every status transition observed by the polling loop. The
 	// final invocation always carries a terminal status. Implementations
-	// must not block; long work should run on a goroutine.
+	// must not block; long work should be dispatched on a goroutine.
 	MCPTaskProgress MCPTaskProgressHandler
 
 	// CLI is optional CLI-specific configuration. SDK users leave this nil.
@@ -2664,31 +2671,21 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 	})
 }
 
-// runTurn is the shared lifecycle for every prompt mode:
-//  1. Run BeforeTurn hooks (can modify prompt, inject messages).
-//  2. Persist pre-generation messages to the tree session.
-//  3. Build context from the tree (walks leaf-to-root for current branch).
-//  4. Emit turn/message start events.
-//  5. Run generation (messages are persisted incrementally per step).
-//  6. Persist any remaining messages not covered by incremental persistence.
-//  7. Emit turn/message end events.
-//  8. Run AfterTurn hooks.
-//
-// During generation, each completed step's messages are persisted immediately
-// via the onStepMessages callback. Tool calls are always persisted as
-// call/response pairs (assistant + tool messages together). Reasoning and
-// text-only assistant messages are persisted as soon as their step completes.
-// This ensures long-running turns don't lose progress on crash or cancellation.
-//
-// promptLabel is the human-readable label emitted in TurnStartEvent.Prompt.
-// prompt is the raw user text passed to BeforeTurn hooks.
+// runTurn is the shared lifecycle for every prompt turn:
+//  1. Emit RawInput event to extensions.
+//  2. Run BeforeTurn hooks (can modify prompt, inject messages).
+//  3. Persist pre-generation messages to the tree session.
+//  4. Build context from the tree (walks leaf-to-root for current branch).
+//  5. Emit turn/message start events.
+//  6. Run generation (messages are persisted incrementally per step).
+//  7. Persist any remaining messages not covered by incremental persistence.
+//  8. Emit turn/message end events.
+//  9. Run AfterTurn hooks.
 func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, preMessages []fantasy.Message) (*TurnResult, error) {
-	// Expand /skill:name commands — reads the skill file, wraps it in a
-	// <skill> block, and appends any trailing user args.
+	// Expand /skill:name commands.
 	if expanded := m.expandSkillCommand(prompt); expanded != prompt {
 		prompt = expanded
-		// Replace the last user message in preMessages with the expanded text,
-		// preserving any file parts (e.g. clipboard images).
+		// Replace the last user message in preMessages with the expanded text.
 		for i := len(preMessages) - 1; i >= 0; i-- {
 			if preMessages[i].Role == fantasy.MessageRoleUser {
 				files := extractFileParts(preMessages[i])
@@ -3293,5 +3290,3 @@ func (m *Kit) CloseContext(ctx context.Context) error {
 	}
 	return err
 }
-
-// Conversion helpers are defined in adapter.go.

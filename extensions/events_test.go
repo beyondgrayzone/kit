@@ -4,8 +4,8 @@ import "testing"
 
 func TestAllEventTypes_Count(t *testing.T) {
 	all := AllEventTypes()
-	if len(all) != 34 {
-		t.Fatalf("expected 33 event types, got %d", len(all))
+	if len(all) != 35 {
+		t.Fatalf("expected 35 event types, got %d", len(all))
 	}
 }
 
@@ -45,6 +45,7 @@ func TestEventType_TypeMethod(t *testing.T) {
 		{ToolExecutionEndEvent{ToolName: "test"}, ToolExecutionEnd},
 		{ToolResultEvent{ToolName: "test"}, ToolResult},
 		{InputEvent{Text: "hello"}, Input},
+		{RawInputEvent{Text: "hello", Source: "interactive"}, RawInput},
 		{BeforeAgentStartEvent{Prompt: "test"}, BeforeAgentStart},
 		{AgentStartEvent{Prompt: "test"}, AgentStart},
 		{AgentEndEvent{Response: "done"}, AgentEnd},
