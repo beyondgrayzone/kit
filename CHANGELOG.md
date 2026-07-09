@@ -1,3 +1,10 @@
+# Changelog (Till 0.82.2)
+- Fix resume token filling 
+- Fix Reasoning Delta check
+- RawInput attempt
+- Expose onStepStart and onStepFinish
+- Expose Agent Error
+
 # Changelog (Till 0.82.1)
 - Git merge only 
 
