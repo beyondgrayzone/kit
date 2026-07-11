@@ -19,16 +19,25 @@ Path separators in the working directory are replaced with `--`. For example, `/
 
 Each line in the session file is a JSON entry representing a message, tool call, model change, or extension data. The tree structure allows branching from any message to explore alternate paths.
 
+When a [subagent](/advanced/subagents) is spawned from a persisted parent session, the child records its parent in the file header (`parent_session_id`, `parent_session`, and the originating `subagent_task`), so delegated work can be traced back to the session that spawned it.
+
 ## Compaction
 
 When conversations grow long, Kit can compact them to free up context window space. The compaction system:
 
 - **Non-destructive**: Old messages remain on disk for history; only the LLM context is summarized
+- **Full-context token estimation**: Estimates count every message part — tool-call arguments, tool results, reasoning, and file attachments — not just plain text, so tool-heavy sessions trigger compaction on time
+- **Adaptive budgets**: The response reserve and keep-recent budgets scale with the model's context window and output limit instead of using fixed constants
+- **Anchored summaries**: When a session compacts more than once, the previous summary is fed back to the LLM and updated incrementally instead of being regenerated from scratch
 - **File tracking**: Tracks which files were read and modified across compactions
 - **Split-turn handling**: Can summarize large single turns by splitting them
 - **Tool result truncation**: Caps tool output during serialization to stay within token budgets
 
 Use `/compact [focus]` to manually compact, or enable `--auto-compact` to compact automatically near the context limit.
+
+### Reactive compaction on overflow
+
+Independent of `--auto-compact`, Kit always recovers from provider context-overflow errors reactively: it compacts the conversation and replays the failed turn once, replacing media attachments with text placeholders in the replayed request. Token estimates inevitably drift from real tokenizer counts, and a single huge mid-turn tool result can overflow the context even when the turn started under the limit — this safety net makes those cases non-fatal. Only when the replay also overflows does the turn fail, with a clear "conversation too large to compact" error.
 
 ## Auto-cleanup
 

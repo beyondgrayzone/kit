@@ -1,3 +1,6 @@
+# Changelog (Till 0.86.0)
+- Merge all upstream 0.86.0 changes
+
 # Changelog (Till 0.82.2)
 - Fix resume token filling 
 - Fix Reasoning Delta check

@@ -14,6 +14,7 @@ All flags can be passed to the root `kit` command.
 | `--model` | `-m` | `anthropic/claude-sonnet-latest` | Model to use (provider/model format) |
 | `--provider-api-key` | — | — | API key for the provider |
 | `--provider-url` | — | — | Base URL for provider API |
+| `--provider-wire` | — | — | Wire protocol for auto-routed providers: `openai`, `openai-compat`, `anthropic`, `google` ([overrides the model database](/providers#provider-overrides)) |
 | `--tls-skip-verify` | — | `false` | Skip TLS certificate verification |
 
 ## Session management
@@ -37,7 +38,7 @@ These flags control Kit's behavior. When a prompt is passed as a positional argu
 | `--max-steps` | — | `0` | Maximum agent steps (0 for unlimited) |
 | `--stream` | — | `true` | Enable streaming output |
 | `--compact` | — | `false` | Enable compact output mode |
-| `--auto-compact` | — | `false` | Auto-compact conversation near context limit |
+| `--auto-compact` | — | `false` | Compact proactively when near the context limit (reactive compact-and-retry on provider overflow errors is [always on](/sessions#reactive-compaction-on-overflow)) |
 
 ## Extensions
 
@@ -56,6 +57,7 @@ These flags control Kit's behavior. When a prompt is passed as a positional argu
 | `--skills-dir` | — | — | Scan this directory directly for skills (overrides auto-discovery) |
 | `--skill-disable` | — | — | Hide a skill from the model catalog by name (repeatable); still usable via `/skill:` |
 | `--no-skills` | — | `false` | Disable skill loading (auto-discovery and explicit) |
+| `--no-agents` | — | `false` | Disable named agent discovery (built-ins and [definition files](/advanced/subagents#named-agents)) |
 
 ## Generation parameters
 

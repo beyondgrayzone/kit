@@ -57,6 +57,7 @@ type Kit struct {
 	compactionOpts *CompactionOptions
 	contextFiles   []*ContextFile
 	skills         []*skills.Skill
+	namedAgents    []*AgentDefinition // named agent definitions discovered at construction
 	extRunner      *extensions.Runner
 	bufferedLogger *tools.BufferedDebugLogger
 	authHandler    MCPAuthHandler // OAuth handler for remote MCP servers (may need Close)
@@ -326,6 +327,13 @@ func (m *Kit) GetLoadedServerNames() []string {
 // of tools loaded so far (may be 0).
 func (m *Kit) GetMCPToolCount() int {
 	return m.agent.GetMCPToolCount()
+}
+
+// GetMCPToolNames returns the prefixed names (serverName__toolName) of all
+// tools currently loaded from external MCP servers. Returns nil when no MCP
+// servers are configured or none have finished loading yet.
+func (m *Kit) GetMCPToolNames() []string {
+	return m.agent.GetMCPToolNames()
 }
 
 // WaitForMCPTools blocks until background MCP tool loading completes.
@@ -760,6 +768,7 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 		SystemPrompt:   systemPrompt,
 		ProviderAPIKey: m.v.GetString("provider-api-key"),
 		ProviderURL:    m.v.GetString("provider-url"),
+		ProviderWire:   m.v.GetString("provider-wire"),
 		MaxTokens:      m.v.GetInt("max-tokens"),
 		TLSSkipVerify:  m.v.GetBool("tls-skip-verify"),
 		ThinkingLevel:  thinkingLevel,
@@ -1144,6 +1153,13 @@ type Options struct {
 	// default URL.
 	ProviderURL string
 
+	// ProviderWire overrides the wire protocol used for auto-routed
+	// providers: "openai" (Responses API), "openai-compat" (chat
+	// completions), "anthropic", or "google". "" = infer from the model
+	// database. Takes precedence over per-provider wire declarations in the
+	// `providers` config section.
+	ProviderWire string
+
 	// TLSSkipVerify disables TLS certificate verification on provider
 	// HTTP clients. Only set this for self-signed certificates in
 	// development. Once enabled here it cannot be disabled via Options
@@ -1198,6 +1214,12 @@ type Options struct {
 	// (e.g. AGENTS.md) from the working directory.
 	NoContextFiles bool
 
+	// NoAgents disables discovery of named agent definitions (built-ins and
+	// .agents/agents/ / .kit/agents/ / ~/.config/kit/agents/ files). When
+	// set, the subagent tool advertises no named agents and
+	// [SubagentConfig].Agent cannot resolve.
+	NoAgents bool
+
 	// MCPConfig provides a pre-loaded MCP configuration. When set,
 	// LoadAndValidateConfig is skipped during Kit creation — avoiding
 	// viper access entirely. This is set automatically for in-process
@@ -1228,7 +1250,11 @@ type Options struct {
 	InProcessMCPServers map[string]*MCPServer
 
 	// Compaction
-	AutoCompact       bool               // Auto-compact when near context limit
+	// AutoCompact enables proactive compaction before turns that near the
+	// context limit. Independent of this setting, the turn loop always
+	// compacts reactively and replays the turn once when a provider call
+	// fails with a context-overflow error.
+	AutoCompact       bool
 	CompactionOptions *CompactionOptions // Config for auto-compaction (nil = defaults)
 
 	// Debug enables debug logging for the SDK. When DebugLogger is nil this
@@ -1425,6 +1451,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		cwd                   string
 		contextFiles          []*ContextFile
 		loadedSkills          []*Skill
+		namedAgents           []*AgentDefinition
 		mcpConfig             *config.Config
 		debug                 bool
 		noExtensions          bool
@@ -1513,6 +1540,9 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		if opts.ProviderURL != "" {
 			v.Set("provider-url", opts.ProviderURL)
 		}
+		if opts.ProviderWire != "" {
+			v.Set("provider-wire", opts.ProviderWire)
+		}
 		if opts.TLSSkipVerify {
 			v.Set("tls-skip-verify", true)
 		}
@@ -1560,6 +1590,19 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 				disable = v.GetStringSlice("skill-disable")
 			}
 			applySkillDisableList(loadedSkills, disable)
+		}
+
+		// Discover named agent definitions (built-ins + .agents/agents/,
+		// .kit/agents/, ~/.config/kit/agents/). They are advertised in the
+		// subagent tool description and resolvable via SubagentConfig.Agent.
+		// Per-file parse failures are non-fatal: usable agents still load and
+		// a warning is printed unless quiet.
+		if !opts.NoAgents && !v.GetBool("no-agents") {
+			var agErr error
+			namedAgents, agErr = LoadAgentDefinitions(cwd)
+			if agErr != nil && !opts.Quiet {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load some agent definitions: %v\n", agErr)
+			}
 		}
 
 		// Always compose the system prompt with runtime context: base prompt +
@@ -1752,6 +1795,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		CoreTools:         opts.Tools,
 		CoreToolList:      toolList,
 		ExtraTools:        extraTools,
+		NamedAgents:       namedAgentSpecs(namedAgents),
 		ToolWrapper:       hookToolWrapper(beforeToolCall, afterToolResult),
 		ProviderConfig:    providerConfig,
 		Debug:             debug,
@@ -1833,6 +1877,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		compactionOpts:        opts.CompactionOptions,
 		contextFiles:          contextFiles,
 		skills:                loadedSkills,
+		namedAgents:           namedAgents,
 		extRunner:             agentResult.ExtRunner,
 		bufferedLogger:        agentResult.BufferedLogger,
 		authHandler:           setupOpts.AuthHandler,
@@ -2161,6 +2206,17 @@ type SubagentConfig struct {
 	// Prompt is the task/instruction for the subagent (required).
 	Prompt string
 
+	// Agent optionally names a discovered agent definition (see
+	// [Kit.GetAgents]) whose presets — model, system prompt, tool
+	// allowlist, temperature, and timeout — apply as defaults. Explicitly
+	// set scalar fields on this struct (Model, SystemPrompt, Timeout,
+	// Temperature) override the definition's values. Tools is the
+	// exception: when the definition declares a tool allowlist, Tools acts
+	// as the base set and is intersected with the allowlist — it can narrow
+	// the agent's tool access but never widen it. An unknown name is an
+	// error.
+	Agent string
+
 	// Model overrides the parent's model (e.g. "anthropic/claude-haiku-3-5-20241022").
 	// Empty string uses the parent's current model.
 	Model string
@@ -2177,6 +2233,10 @@ type SubagentConfig struct {
 	// Pass m.GetToolsForSubagent() explicitly to opt into inheritance from
 	// SDK call sites.
 	// (The subagent tool is dropped to prevent infinite recursion.)
+	//
+	// When Agent names a definition with a tool allowlist, this set is
+	// intersected with that allowlist rather than overriding it — see the
+	// Agent field documentation.
 	Tools []Tool
 
 	// NoSession, when true, uses an in-memory ephemeral session. When false
@@ -2184,8 +2244,28 @@ type SubagentConfig struct {
 	// replay/inspection.
 	NoSession bool
 
+	// SessionID resumes an existing subagent session instead of creating a
+	// new one. Set it to the SessionID returned by a previous Subagent call
+	// (SubagentResult.SessionID, also surfaced as subagent_session_id in the
+	// subagent tool's response metadata) so follow-up prompts reuse the
+	// subagent's accumulated context instead of re-establishing it from
+	// scratch. Mutually exclusive with NoSession. An unknown ID is an error.
+	SessionID string
+
+	// ParentSessionID overrides the parent session UUID recorded in the
+	// child session's header. Empty (default) uses the calling Kit's active
+	// session ID when one exists. The recorded link enables session-tree
+	// navigation of delegated work (subagent runs nested under the parent).
+	// Only applied when a new child session is created; resumed sessions
+	// (SessionID set) keep their original parent link.
+	ParentSessionID string
+
 	// Timeout limits execution time. Zero means 5 minute default.
 	Timeout time.Duration
+
+	// Temperature overrides the sampling temperature for the subagent.
+	// Nil inherits the parent's effective setting.
+	Temperature *float32
 
 	// OnEvent, when set, receives all events from the subagent's event bus.
 	// This enables the parent to stream subagent tool calls, text chunks,
@@ -2225,6 +2305,7 @@ func inheritProviderConfig(child *Options, v *viper.Viper) {
 	}
 	child.ProviderAPIKey = v.GetString("provider-api-key")
 	child.ProviderURL = v.GetString("provider-url")
+	child.ProviderWire = v.GetString("provider-wire")
 	child.TLSSkipVerify = v.GetBool("tls-skip-verify")
 	child.ThinkingLevel = v.GetString("thinking-level")
 	if v.IsSet("max-tokens") {
@@ -2252,6 +2333,26 @@ func inheritProviderConfig(child *Options, v *viper.Viper) {
 	}
 }
 
+// toolsIncludeMCP reports whether the provided tool set already contains any
+// of the parent's loaded MCP tools (matched by prefixed name). Used to decide
+// whether a spawned subagent needs to re-load MCP servers or can rely on the
+// inherited tools. Returns false when there are no MCP tool names to match.
+func toolsIncludeMCP(tools []Tool, mcpNames []string) bool {
+	if len(mcpNames) == 0 || len(tools) == 0 {
+		return false
+	}
+	mcpSet := make(map[string]struct{}, len(mcpNames))
+	for _, n := range mcpNames {
+		mcpSet[n] = struct{}{}
+	}
+	for _, t := range tools {
+		if _, ok := mcpSet[t.Info().Name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Subagent spawns an in-process child Kit instance to perform a task. The
 // child gets its own session, event bus, and agent loop but shares the
 // parent's config (API keys, provider settings) and defaults to the parent's
@@ -2263,8 +2364,41 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	if cfg.Prompt == "" {
 		return nil, fmt.Errorf("subagent prompt is required")
 	}
+	if cfg.SessionID != "" && cfg.NoSession {
+		return nil, fmt.Errorf("subagent SessionID and NoSession are mutually exclusive")
+	}
 
 	start := time.Now()
+
+	// Resolve a resumable session up front: map the session UUID to its
+	// JSONL file so the child opens the existing session instead of creating
+	// a fresh one. Failing fast here gives the calling agent an actionable
+	// error (e.g. a mistyped ID) before any expensive child init.
+	var resumePath string
+	if cfg.SessionID != "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("cannot resume subagent session: %w", err)
+		}
+		resumePath, err = session.FindSessionPathByID(cwd, cfg.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("cannot resume subagent session: %w", err)
+		}
+	}
+
+	// Resolve a named agent definition: its model, system prompt, tool
+	// allowlist, temperature, and timeout act as defaults that explicitly
+	// set cfg fields override. agentRestricted records whether an allowlist
+	// was applied — the child must then not re-load MCP servers, which
+	// would add tools beyond the allowlist.
+	agentRestricted := false
+	if cfg.Agent != "" {
+		var err error
+		agentRestricted, err = m.resolveAgentDefinition(&cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Default timeout.
 	timeout := cfg.Timeout
@@ -2320,6 +2454,31 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 		tools = SubagentTools()
 	}
 
+	// Decide whether the child should re-load MCP servers. When the caller
+	// passes an explicit tool set that ALREADY contains the parent's loaded
+	// MCP tools (the internal agent-loop spawner does this via
+	// GetToolsForSubagent), re-loading MCP would spin up a second set of MCP
+	// server connections in the child. The inherited MCP AgentTools are
+	// closures bound to the PARENT's live tool manager, so the child can call
+	// them directly through the parent's existing connections — no re-load
+	// needed. Detect that case and suppress the child's MCP loading.
+	//
+	// Note: we must pass a non-nil config with no MCPServers rather than nil.
+	// A nil MCPConfig makes New() fall back to loading .kit.yml from disk,
+	// which would re-spawn exactly the servers we are trying to avoid. An
+	// explicit empty config takes the "pre-loaded" branch in New() and loads
+	// zero servers.
+	childMCPConfig := m.mcpConfig
+	if agentRestricted || (cfg.Tools != nil && toolsIncludeMCP(tools, m.GetMCPToolNames())) {
+		if m.mcpConfig != nil {
+			cp := *m.mcpConfig
+			cp.MCPServers = nil
+			childMCPConfig = &cp
+		} else {
+			childMCPConfig = &config.Config{}
+		}
+	}
+
 	// Create child Kit instance. Pass the parent's loaded MCP config to
 	// avoid re-loading and re-validating config for the child.
 	// Streaming is enabled explicitly — without it, non-streaming can hit
@@ -2332,9 +2491,10 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 		SystemPrompt: systemPrompt,
 		Tools:        tools,
 		NoSession:    cfg.NoSession,
+		SessionPath:  resumePath,
 		Quiet:        true,
 		Streaming:    &streamOn,
-		MCPConfig:    m.mcpConfig,
+		MCPConfig:    childMCPConfig,
 	}
 
 	// Inherit the parent's effective provider/runtime configuration. Since #40
@@ -2343,6 +2503,11 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// programmatic Options or runtime setters (e.g. SetThinkingLevel) would
 	// otherwise be lost.
 	inheritProviderConfig(childOpts, m.v)
+	// A per-subagent temperature (explicit or from a named agent definition)
+	// overrides whatever the parent's config store provided.
+	if cfg.Temperature != nil {
+		childOpts.Temperature = cfg.Temperature
+	}
 	// Propagate the parent's MCP task configuration so a child subagent
 	// invoking long-running MCP tools observes the same per-server modes,
 	// timeouts, and progress callback as the parent. Without this, child
@@ -2355,6 +2520,27 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 		return &SubagentResult{Elapsed: time.Since(start)}, fmt.Errorf("failed to create subagent: %w", err)
 	}
 	defer func() { _ = child.Close() }()
+
+	// Link the child session to the parent so delegated work can be traced
+	// from either direction: the parent receives the child's session ID in
+	// the result (and as subagent_session_id tool metadata), and the child's
+	// header records the parent session. Only newly created sessions are
+	// stamped — resumed sessions keep their original parent link.
+	if cfg.SessionID == "" {
+		parentID := cfg.ParentSessionID
+		if parentID == "" && m.GetSessionPath() != "" {
+			// Only auto-link when the parent session is persisted — a link
+			// to an ephemeral in-memory parent session would never resolve.
+			parentID = m.GetSessionID()
+		}
+		if parentID != "" {
+			if ts := child.GetTreeSession(); ts != nil {
+				if err := ts.SetParentLink(m.GetSessionPath(), parentID, cfg.Prompt); err != nil {
+					log.Printf("Warning: failed to link subagent session to parent: %v", err)
+				}
+			}
+		}
+	}
 
 	// Forward events to parent if requested.
 	if cfg.OnEvent != nil {
@@ -2425,24 +2611,26 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 	// subagent core tool can create child Kit instances without
 	// importing pkg/kit (which would create an import cycle).
 	ctx = core.WithSubagentSpawner(ctx, func(
-		spawnCtx context.Context, toolCallID, prompt, model, systemPrompt string, timeout time.Duration,
+		spawnCtx context.Context, req core.SubagentSpawnRequest,
 	) (*core.SubagentSpawnResult, error) {
 		// Build OnEvent: dispatch to per-tool-call listeners if any are
 		// registered via SubscribeSubagent(). Listeners are cleaned up
 		// after the subagent completes.
 		var onEvent func(Event)
-		if listeners := m.getSubagentListenerSet(toolCallID); listeners != nil {
+		if listeners := m.getSubagentListenerSet(req.ToolCallID); listeners != nil {
 			onEvent = listeners.emit
 		}
 		result, err := m.Subagent(spawnCtx, SubagentConfig{
-			Prompt:       prompt,
-			Model:        model,
-			SystemPrompt: systemPrompt,
-			Timeout:      timeout,
+			Prompt:       req.Prompt,
+			Agent:        req.Agent,
+			Model:        req.Model,
+			SystemPrompt: req.SystemPrompt,
+			Timeout:      req.Timeout,
+			SessionID:    req.SessionID,
 			OnEvent:      onEvent,
 			Tools:        m.GetToolsForSubagent(),
 		})
-		m.cleanupSubagentListeners(toolCallID)
+		m.cleanupSubagentListeners(req.ToolCallID)
 		if result == nil {
 			return &core.SubagentSpawnResult{Error: err}, err
 		}
@@ -2582,8 +2770,17 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 				Prompt:     prompt,
 				ResponseCh: responseCh,
 			})
-			resp := <-responseCh
-			return resp.Password, resp.Cancelled
+			// emit is synchronous: every listener has already run (and, per the
+			// PasswordPromptEvent contract, replied) by the time it returns. If
+			// no reply is buffered there is no responder — headless embedders,
+			// or no subscriber at all — and blocking would wedge the bash tool
+			// (and the whole agent turn) forever. Treat that as cancelled.
+			select {
+			case resp := <-responseCh:
+				return resp.Password, resp.Cancelled
+			default:
+				return "", true
+			}
 		},
 		// Tool call argument streaming
 		OnToolCallStart: func(toolCallID, toolName string) {
@@ -2657,18 +2854,38 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			if !m.prepareStep.hasHooks() {
 				return nil
 			}
-			return func(stepNumber int, messages []fantasy.Message) []fantasy.Message {
+			return func(stepNumber int, messages []fantasy.Message) *agent.PrepareStepUpdate {
 				hookResult := m.prepareStep.run(PrepareStepHook{
 					StepNumber: stepNumber,
 					Messages:   messages,
 				})
-				if hookResult != nil && hookResult.Messages != nil {
-					return hookResult.Messages
+				if hookResult == nil || (hookResult.Messages == nil && hookResult.ToolChoice == nil) {
+					return nil
 				}
-				return nil
+				return &agent.PrepareStepUpdate{
+					Messages:   hookResult.Messages,
+					ToolChoice: hookResult.ToolChoice,
+				}
 			}
 		}(),
 	})
+}
+
+// persistGenerationRemainder persists messages produced by generation that
+// were not already persisted incrementally by the onStepMessages callback.
+// sentCount is the number of input messages sent to the LLM (the prefix of
+// result.ConversationMessages to skip). Safe to call with a nil result.
+func (m *Kit) persistGenerationRemainder(result *agent.GenerateWithLoopResult, sentCount int) {
+	if result == nil || len(result.ConversationMessages) <= sentCount {
+		return
+	}
+	newMessages := result.ConversationMessages[sentCount:]
+	if result.PersistedMessageCount >= len(newMessages) {
+		return
+	}
+	for _, msg := range newMessages[result.PersistedMessageCount:] {
+		_, _ = m.session.AppendMessage(msg)
+	}
 }
 
 // runTurn is the shared lifecycle for every prompt turn:
@@ -2681,6 +2898,15 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 //  7. Persist any remaining messages not covered by incremental persistence.
 //  8. Emit turn/message end events.
 //  9. Run AfterTurn hooks.
+//
+// During generation, each completed step's messages are persisted immediately
+// via the onStepMessages callback. Tool calls are always persisted as
+// call/response pairs (assistant + tool messages together). Reasoning and
+// text-only assistant messages are persisted as soon as their step completes.
+// This ensures long-running turns don't lose progress on crash or cancellation.
+//
+// promptLabel is the human-readable label emitted in TurnStartEvent.Prompt.
+// prompt is the raw user text passed to BeforeTurn hooks.
 func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, preMessages []fantasy.Message) (*TurnResult, error) {
 	// Expand /skill:name commands.
 	if expanded := m.expandSkillCommand(prompt); expanded != prompt {
@@ -2753,21 +2979,45 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 	m.events.emit(MessageStartEvent{})
 
 	result, err := m.generate(ctx, messages)
+
+	// Reactive compaction (issue #85): when the provider rejected the
+	// request because the context window was exceeded, compact the
+	// conversation and replay the turn once instead of failing. This is the
+	// safety net for token-estimate drift and huge mid-turn tool results
+	// that the proactive ShouldCompact() check cannot catch. A single-retry
+	// guard (no loop) prevents compact/overflow cycles.
+	if isContextOverflow(err) {
+		// Persist completed-step messages from the failed attempt first so
+		// compaction and the rebuilt context include them — the replay then
+		// resumes from where the turn overflowed rather than restarting.
+		m.persistGenerationRemainder(result, sentCount)
+		result = nil
+
+		if retryMessages, retryErr := m.prepareOverflowRetry(ctx); retryErr != nil {
+			// Recovery impossible — wrap the original provider error with
+			// the recovery failure. ClassifyProviderError below still maps
+			// the chain to ErrContextOverflow, so the errors.Is contract
+			// holds even when the provider error was raw text.
+			err = fmt.Errorf("conversation too large to compact — context-overflow recovery failed (%v): %w", retryErr, err)
+		} else {
+			// Discard stream deltas captured during the failed attempt so
+			// TurnResult.Stream reflects only the replay.
+			collector.drain()
+			sentCount = len(retryMessages)
+			result, err = m.generate(ctx, retryMessages)
+			if isContextOverflow(err) {
+				err = fmt.Errorf("conversation too large to compact — still exceeds the model context window after compaction: %w", err)
+			}
+		}
+	}
+
 	if err != nil {
 		// Persist any messages from completed steps that were NOT already
 		// persisted incrementally by the onStepMessages callback. The agent
 		// layer only includes fully-paired tool_use + tool_result messages
 		// in completedStepMessages, so there are no orphaned entries that
 		// would break subsequent API requests.
-		if result != nil {
-			newMessages := result.ConversationMessages[sentCount:]
-			alreadyPersisted := result.PersistedMessageCount
-			if alreadyPersisted < len(newMessages) {
-				for _, msg := range newMessages[alreadyPersisted:] {
-					_, _ = m.session.AppendMessage(msg)
-				}
-			}
-		}
+		m.persistGenerationRemainder(result, sentCount)
 		m.events.emit(TurnEndEvent{Error: err})
 		// Run AfterTurn hooks even on error.
 		m.afterTurn.run(AfterTurnHook{Error: err})
@@ -2780,15 +3030,7 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 	// by the onStepMessages callback during generation. This handles the
 	// non-streaming path (where onStepMessages is not called) and any edge
 	// cases where the final response messages weren't covered by step callbacks.
-	if len(result.ConversationMessages) > sentCount {
-		newMessages := result.ConversationMessages[sentCount:]
-		alreadyPersisted := result.PersistedMessageCount
-		if alreadyPersisted < len(newMessages) {
-			for _, msg := range newMessages[alreadyPersisted:] {
-				_, _ = m.session.AppendMessage(msg)
-			}
-		}
-	}
+	m.persistGenerationRemainder(result, sentCount)
 
 	// Store the API-reported token count so GetContextStats() matches the
 	// built-in status bar. The context window is filled by all token

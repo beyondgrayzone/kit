@@ -45,6 +45,7 @@ host, err := kit.New(ctx, &kit.Options{
     // Provider configuration
     ProviderAPIKey: "sk-...",                      // "" = use config / provider env var
     ProviderURL:    "https://proxy.internal/v1",  // "" = provider default endpoint
+    ProviderWire:   "anthropic",                  // "" = infer wire from model database
     TLSSkipVerify:  false,                         // only effective when true
 
     // Session
@@ -74,6 +75,7 @@ host, err := kit.New(ctx, &kit.Options{
     // Feature toggles
     NoExtensions:   true,               // disable Yaegi extension loading
     NoContextFiles: true,               // disable automatic AGENTS.md loading
+    NoAgents:       true,               // disable named agent discovery (.agents/agents/, .kit/agents/, ~/.config/kit/agents/, and built-ins)
 
     // Session (advanced)
     SessionManager: myCustomSession,    // custom SessionManager implementation
@@ -144,6 +146,7 @@ when embedding Kit as a library.
 |-------|------|---------|-------------|
 | `ProviderAPIKey` | `string` | — | API key used to authenticate with the provider. `""` falls back to config / provider-specific env var (e.g. `ANTHROPIC_API_KEY`). When set, it takes precedence over config and env values on this instance's store. |
 | `ProviderURL` | `string` | — | Override the provider endpoint (e.g. LiteLLM, vLLM, Azure OpenAI, internal proxy). `""` = provider default. |
+| `ProviderWire` | `string` | — | Override the wire protocol for auto-routed providers: `openai` (Responses API), `openai-compat` (chat completions), `anthropic`, or `google`. `""` = infer from the model database. Takes precedence over per-provider `wire` declarations in the [`providers` config section](/configuration#provider-overrides). Combine with `ProviderURL` to target providers not in the database. |
 | `TLSSkipVerify` | `bool` | `false` | Disable TLS certificate verification on the provider HTTP client. Only effective when `true`; to force-disable, use config file or env var instead. For self-signed dev certs only. |
 
 ### Session
@@ -165,6 +168,7 @@ when embedding Kit as a library.
 | `DisableCoreTools` | `bool` | `false` | Use no core tools (0 tools, for chat-only) |
 | `NoExtensions` | `bool` | `false` | Disable Yaegi extension loading |
 | `NoContextFiles` | `bool` | `false` | Disable automatic AGENTS.md loading |
+| `NoAgents` | `bool` | `false` | Disable named agent discovery (built-ins and `.agents/agents/` / `.kit/agents/` / `~/.config/kit/agents/` files); see [Subagents](/advanced/subagents#named-agents) |
 
 ### Skills & configuration
 
@@ -222,8 +226,8 @@ context files at runtime (e.g. per user or per session), use the
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `AutoCompact` | `bool` | `false` | Auto-compact when near context limit |
-| `CompactionOptions` | `*CompactionOptions` | — | Configuration for auto-compaction |
+| `AutoCompact` | `bool` | `false` | Compact proactively before turns that near the context limit. Independent of this setting, Kit always compacts **reactively** and replays the turn once when a provider call fails with a context-overflow error. |
+| `CompactionOptions` | `*CompactionOptions` | — | Configuration for compaction; zero-value budget fields adapt to the model's limits. See [CompactionOptions](#compactionoptions) below. |
 | `MCPAuthHandler` | `MCPAuthHandler` | — | OAuth handler for remote MCP servers. `nil` disables OAuth (servers returning 401 fail with the authorization-required error). See [MCP OAuth](#mcp-oauth-authorization) below. |
 | `MCPTokenStoreFactory` | `func` | — | Custom OAuth token storage for MCP servers (default: JSON file in `$XDG_CONFIG_HOME/.kit/mcp_tokens.json`). |
 | `InProcessMCPServers` | `map[string]*MCPServer` | — | In-process mcp-go servers (no subprocess) |
@@ -233,6 +237,42 @@ context files at runtime (e.g. per user or per session), use the
 | `MCPTaskPollInterval` | `time.Duration` | `1s` | Fallback interval between `tasks/get` requests when the server does not suggest one. |
 | `MCPTaskMaxPollInterval` | `time.Duration` | `5s` | Cap on the polling interval (a server-supplied `pollInterval` can otherwise grow without bound). |
 | `MCPTaskProgress` | `MCPTaskProgressHandler` | — | Optional callback invoked once when a task is accepted and on every observed status transition. The final invocation always carries a terminal status. |
+
+### CompactionOptions
+
+`CompactionOptions` controls how conversations are summarized. The token
+budgets are adaptive: leave a field at zero and it scales to the model's
+limits, or set an explicit value to override.
+
+| Field | Type | Zero-value behaviour | Description |
+|-------|------|----------------------|-------------|
+| `ContextWindow` | `int` | auto-populated from the model registry | Model's context window size in tokens |
+| `MaxOutputTokens` | `int` | auto-populated from the model registry | Model's max output tokens; scales the adaptive `ReserveTokens` |
+| `ReserveTokens` | `int` | `min(16384, MaxOutputTokens)` | Tokens reserved for the LLM response |
+| `KeepRecentTokens` | `int` | a quarter of the usable context (`ContextWindow − ReserveTokens`), floored at 2000 | Recent tokens preserved verbatim (not summarized) |
+| `SummaryPrompt` | `string` | built-in structured checkpoint prompt | Custom summarization prompt |
+
+When a session compacts more than once, the previous summary is fed back into
+the summarization prompt and updated incrementally (anchored summaries), so
+detail is preserved across compaction generations.
+
+#### Reactive compaction on context overflow
+
+Token estimates inevitably drift from real tokenizer counts, and a single
+huge mid-turn tool result can overflow the context even when the turn started
+well under the limit. When the provider rejects a request with a
+context-overflow error, Kit automatically:
+
+1. Compacts the conversation (persisting any completed steps first, so the
+   replay resumes rather than restarts).
+2. Replays the turn once with the rebuilt context, replacing media
+   attachments with text placeholders (media cannot be shrunk by
+   summarization).
+3. If the replay still overflows, fails the turn with `kit.ErrContextOverflow`
+   ("conversation too large to compact").
+
+This safety net is always on — it does not require `AutoCompact`, which only
+controls the *proactive* check before each turn.
 
 ## MCP OAuth Authorization
 

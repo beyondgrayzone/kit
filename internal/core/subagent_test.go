@@ -2,8 +2,11 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"charm.land/fantasy"
 )
 
 func TestValuesContext_StripsDeadlineAndCancellation(t *testing.T) {
@@ -84,7 +87,7 @@ func TestSpawnContext_SurvivesDeadlineExceededParent(t *testing.T) {
 func TestSpawnContext_PreservesSpawnerValue(t *testing.T) {
 	// Verify the subagent spawner callback survives context detachment.
 	called := false
-	spawner := SubagentSpawnFunc(func(ctx context.Context, toolCallID, prompt, model, systemPrompt string, timeout time.Duration) (*SubagentSpawnResult, error) {
+	spawner := SubagentSpawnFunc(func(ctx context.Context, req SubagentSpawnRequest) (*SubagentSpawnResult, error) {
 		called = true
 		return &SubagentSpawnResult{Response: "ok"}, nil
 	})
@@ -102,7 +105,7 @@ func TestSpawnContext_PreservesSpawnerValue(t *testing.T) {
 		t.Fatal("spawner should be recoverable from detached context")
 	}
 
-	result, err := recovered(spawnCtx, "tc1", "test task", "", "", time.Minute)
+	result, err := recovered(spawnCtx, SubagentSpawnRequest{ToolCallID: "tc1", Prompt: "test task", Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("spawner call failed: %v", err)
 	}
@@ -111,5 +114,44 @@ func TestSpawnContext_PreservesSpawnerValue(t *testing.T) {
 	}
 	if result.Response != "ok" {
 		t.Errorf("expected 'ok', got %q", result.Response)
+	}
+}
+
+func TestExecuteSubagent_ForwardsSessionID(t *testing.T) {
+	// Issue #87: the optional session_id argument must reach the spawner so
+	// the parent Kit can resume the existing subagent session.
+	var captured SubagentSpawnRequest
+	spawner := SubagentSpawnFunc(func(ctx context.Context, req SubagentSpawnRequest) (*SubagentSpawnResult, error) {
+		captured = req
+		return &SubagentSpawnResult{Response: "ok", SessionID: req.SessionID}, nil
+	})
+
+	ctx := WithSubagentSpawner(context.Background(), spawner)
+	resp, err := executeSubagent(ctx, fantasy.ToolCall{
+		ID:    "tc1",
+		Input: `{"task":"follow-up question","session_id":"sess-123"}`,
+	})
+	if err != nil {
+		t.Fatalf("executeSubagent: %v", err)
+	}
+	if resp.IsError {
+		t.Fatalf("unexpected error response: %s", resp.Content)
+	}
+	if captured.SessionID != "sess-123" {
+		t.Errorf("spawner SessionID = %q, want %q", captured.SessionID, "sess-123")
+	}
+	if captured.Prompt != "follow-up question" {
+		t.Errorf("spawner Prompt = %q, want %q", captured.Prompt, "follow-up question")
+	}
+}
+
+func TestSubagentToolDescription_MentionsResume(t *testing.T) {
+	tool := NewSubagentTool()
+	info := tool.Info()
+	if !strings.Contains(info.Description, "session_id") {
+		t.Error("tool description should document the session_id resume workflow")
+	}
+	if _, ok := info.Parameters["session_id"]; !ok {
+		t.Error("tool parameters should include session_id")
 	}
 }

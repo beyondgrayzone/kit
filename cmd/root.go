@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/app"
 	"github.com/mark3labs/kit/internal/config"
@@ -32,6 +33,7 @@ var (
 	modelFlag        string
 	providerURL      string
 	providerAPIKey   string
+	providerWire     string
 	debugMode        bool
 	positionalPrompt string        // set by processPositionalArgs from CLI positional args
 	positionalFiles  []ui.FilePart // binary @file parts from processPositionalArgs
@@ -80,6 +82,9 @@ var (
 	skillsPaths   []string
 	skillsDir     string
 	skillsDisable []string
+
+	// Named agents control
+	noAgentsFlag bool
 
 	// TLS configuration
 	tlsSkipVerify bool
@@ -299,6 +304,8 @@ func init() {
 	rootCmd.PersistentFlags().
 		BoolVar(&noSkillsFlag, "no-skills", false, "disable skill loading (auto-discovery and explicit)")
 	rootCmd.PersistentFlags().
+		BoolVar(&noAgentsFlag, "no-agents", false, "disable named agent discovery (built-ins and .agents/agents, .kit/agents, ~/.config/kit/agents)")
+	rootCmd.PersistentFlags().
 		StringSliceVar(&skillsPaths, "skill", nil, "load skill file or directory (repeatable)")
 	rootCmd.PersistentFlags().
 		StringVar(&skillsDir, "skills-dir", "", "scan this directory directly for skills (overrides auto-discovery)")
@@ -308,6 +315,7 @@ func init() {
 	flags := rootCmd.PersistentFlags()
 	flags.StringVar(&providerURL, "provider-url", "", "base URL for the provider API (applies to OpenAI, Anthropic, Ollama, and Google)")
 	flags.StringVar(&providerAPIKey, "provider-api-key", "", "API key for the provider (applies to OpenAI, Anthropic, and Google)")
+	flags.StringVar(&providerWire, "provider-wire", "", "wire protocol for auto-routed providers: openai, openai-compat, anthropic, google (overrides the model database)")
 	flags.BoolVar(&tlsSkipVerify, "tls-skip-verify", false, "skip TLS certificate verification (WARNING: insecure, use only for self-signed certificates)")
 
 	// Prompt template flags
@@ -339,6 +347,7 @@ func init() {
 
 	_ = viper.BindPFlag("provider-url", rootCmd.PersistentFlags().Lookup("provider-url"))
 	_ = viper.BindPFlag("provider-api-key", rootCmd.PersistentFlags().Lookup("provider-api-key"))
+	_ = viper.BindPFlag("provider-wire", rootCmd.PersistentFlags().Lookup("provider-wire"))
 	_ = viper.BindPFlag("max-tokens", rootCmd.PersistentFlags().Lookup("max-tokens"))
 	_ = viper.BindPFlag("temperature", rootCmd.PersistentFlags().Lookup("temperature"))
 	_ = viper.BindPFlag("top-p", rootCmd.PersistentFlags().Lookup("top-p"))
@@ -358,6 +367,7 @@ func init() {
 	_ = viper.BindPFlag("prompt-template", rootCmd.PersistentFlags().Lookup("prompt-template"))
 	_ = viper.BindPFlag("no-prompt-templates", rootCmd.PersistentFlags().Lookup("no-prompt-templates"))
 	_ = viper.BindPFlag("no-skills", rootCmd.PersistentFlags().Lookup("no-skills"))
+	_ = viper.BindPFlag("no-agents", rootCmd.PersistentFlags().Lookup("no-agents"))
 	_ = viper.BindPFlag("skill", rootCmd.PersistentFlags().Lookup("skill"))
 	_ = viper.BindPFlag("skills-dir", rootCmd.PersistentFlags().Lookup("skills-dir"))
 	_ = viper.BindPFlag("skill-disable", rootCmd.PersistentFlags().Lookup("skill-disable"))
@@ -772,6 +782,15 @@ func applyProviderURLRouting() {
 		return
 	}
 
+	// When --provider-wire is set alongside --provider-url the user is being
+	// explicit about the wire protocol; the custom/ rewrite below would force
+	// the OpenAI-compatible wire, so skip it and let the model's provider
+	// prefix route through the auto-router (which honors --provider-wire and
+	// synthesizes unknown providers when both flags are present).
+	if viper.GetString("provider-wire") != "" {
+		return
+	}
+
 	// When --provider-url is set but no explicit --model was provided,
 	// default to "custom/custom" so the user doesn't need to remember a
 	// provider/model pair for custom OpenAI-compatible endpoints.
@@ -846,10 +865,20 @@ func runNormalMode(ctx context.Context) error {
 
 	// Build Kit options from CLI flags and create the SDK instance.
 	// kit.New() handles: config → skills → agent → session → extension bridge.
-	authHandler, authErr := kit.NewCLIMCPAuthHandler()
+	// Note: NewCLIMCPAuthHandler binds a TCP listener on localhost. In sandbox
+	// VMs where `localhost` is not in /etc/hosts this can fail. We treat that
+	// as non-fatal (OAuth simply isn't available for remote MCP servers) and
+	// must funnel the failure through a true nil interface — assigning a typed
+	// nil *CLIMCPAuthHandler into Options.MCPAuthHandler (an interface) would
+	// produce a non-nil interface wrapping a nil pointer, which panics on the
+	// first method dispatch downstream.
+	var authHandler kit.MCPAuthHandler
+	cliAuthHandler, authErr := kit.NewCLIMCPAuthHandler()
 	if authErr != nil {
-		// Non-fatal: OAuth just won't be available for remote MCP servers.
 		fmt.Fprintf(os.Stderr, "Warning: Failed to create OAuth handler: %v\n", authErr)
+		cliAuthHandler = nil
+	} else {
+		authHandler = cliAuthHandler
 	}
 
 	coreToolList, err := kit.CoreToolFilterHelper(viper.GetViper())
@@ -872,6 +901,7 @@ func runNormalMode(ctx context.Context) error {
 		DisableCoreTools: viper.GetBool("no-core-tools"),
 		CoreToolList:     coreToolList,
 		NoSkills:         noSkillsFlag,
+		NoAgents:         noAgentsFlag,
 		Skills:           skillsPaths,
 		SkillsDir:        skillsDir,
 		SkillsDisable:    skillsDisable,
@@ -972,8 +1002,8 @@ func runNormalMode(ctx context.Context) error {
 	defer appInstance.Close()
 
 	// Wire OAuth handler to route messages through the TUI once it's running.
-	if authHandler != nil {
-		authHandler.NotifyFunc = func(serverName, message string) {
+	if cliAuthHandler != nil {
+		cliAuthHandler.NotifyFunc = func(serverName, message string) {
 			appInstance.PrintFromExtension("info", message)
 		}
 	}
@@ -1657,6 +1687,13 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 	logFile, logErr := tea.LogToFile(filepath.Join(logDir, "kit.log"), "kit")
 	if logErr == nil {
 		defer func() { _ = logFile.Close() }()
+		// tea.LogToFile only redirects the stdlib log package. The
+		// charmbracelet/log default logger (used by internal packages such
+		// as skills for collision diagnostics) still writes to stderr,
+		// which corrupts the alt-screen when a hot-reload fires while the
+		// TUI is running. Point it at the same file so no structured log
+		// output reaches the terminal.
+		charmlog.SetOutput(logFile)
 	}
 
 	// Determine terminal size; fall back gracefully.

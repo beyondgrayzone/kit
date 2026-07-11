@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	log "github.com/charmbracelet/log"
 
 	"github.com/mark3labs/kit/internal/config"
 	"github.com/mark3labs/kit/internal/core"
@@ -55,6 +56,11 @@ type AgentConfig struct {
 	// ExtraTools are additional tools to include alongside core and MCP tools.
 	// Used by extensions to register custom tools.
 	ExtraTools []fantasy.AgentTool
+
+	// NamedAgents lists discovered named agent definitions to advertise in
+	// the subagent tool description (see core.WithNamedAgents). Only
+	// consumed when core tools are built from CoreToolList.
+	NamedAgents []core.NamedAgentSpec
 
 	// OnMCPServerLoaded, if non-nil, is called when each MCP server finishes
 	// loading (successfully or with error). The callback receives the server
@@ -163,10 +169,21 @@ type ErrorHandler func(err error)
 // RetryHandler is called when the LLM request is retried.
 type RetryHandler func(attempt int, err error)
 
-// PrepareStepHandler is called between steps to allow message modification.
-// It receives the step number and current messages, and returns replacement
-// messages (or nil to keep unchanged).
-type PrepareStepHandler func(stepNumber int, messages []fantasy.Message) []fantasy.Message
+// PrepareStepUpdate carries per-step overrides returned by a
+// PrepareStepHandler. Nil fields leave the corresponding aspect of the step
+// unchanged.
+type PrepareStepUpdate struct {
+	// Messages, when non-nil, replaces the context window for this step.
+	Messages []fantasy.Message
+	// ToolChoice, when non-nil, overrides the tool-choice mode for this step.
+	ToolChoice *fantasy.ToolChoice
+}
+
+// PrepareStepHandler is called between steps to allow message modification
+// and per-step tool-choice control. It receives the step number and current
+// messages, and returns a PrepareStepUpdate (or nil to keep everything
+// unchanged).
+type PrepareStepHandler func(stepNumber int, messages []fantasy.Message) *PrepareStepUpdate
 
 // GenerateCallbacks consolidates all callback functions for
 // GenerateWithCallbacks into a single struct, replacing what was previously
@@ -304,7 +321,11 @@ func NewAgent(ctx context.Context, agentConfig *AgentConfig) (*Agent, error) {
 		coreTools = agentConfig.CoreTools
 	} else {
 		// Default: load all core tools
-		coreTools = core.ListedTools(agentConfig.CoreToolList)
+		var toolOpts []core.ToolOption
+		if len(agentConfig.NamedAgents) > 0 {
+			toolOpts = append(toolOpts, core.WithNamedAgents(agentConfig.NamedAgents...))
+		}
+		coreTools = core.ListedTools(agentConfig.CoreToolList, toolOpts...)
 	}
 
 	// Build the initial tool list: core tools + extension tools (no MCP yet).
@@ -472,7 +493,30 @@ func (a *Agent) composeAllTools() []fantasy.AgentTool {
 	if a.toolWrapper != nil {
 		allTools = a.toolWrapper(allTools)
 	}
-	return allTools
+	// Dedupe by tool name. The same tool can arrive from multiple sources —
+	// most notably when a subagent inherits the parent's active tools (which
+	// already include prefixed MCP tools) AND also inherits the parent's
+	// MCPConfig, causing the child to re-load the same MCP servers. Without
+	// this guard the LLM request carries duplicate tool names and providers
+	// like Anthropic reject the turn ("every tool name must be unique").
+	return dedupeToolsByName(allTools)
+}
+
+// dedupeToolsByName returns tools with duplicate names removed, preserving the
+// first occurrence of each name (core/inherited tools take precedence over
+// later, freshly-loaded duplicates). Order is otherwise preserved.
+func dedupeToolsByName(tools []fantasy.AgentTool) []fantasy.AgentTool {
+	seen := make(map[string]struct{}, len(tools))
+	out := tools[:0:0]
+	for _, t := range tools {
+		name := t.Info().Name
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 // buildAgentOptions constructs the fantasy.AgentOption slice from config,
@@ -900,8 +944,13 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 
 			// Phase 2: Run OnPrepareStep hook (if registered).
 			if hasPrepareStepHook {
-				if replacement := cb.OnPrepareStep(opts.StepNumber, result.Messages); replacement != nil {
-					result.Messages = replacement
+				if update := cb.OnPrepareStep(opts.StepNumber, result.Messages); update != nil {
+					if update.Messages != nil {
+						result.Messages = update.Messages
+					}
+					if update.ToolChoice != nil {
+						result.ToolChoice = update.ToolChoice
+					}
 				}
 			}
 
@@ -1116,7 +1165,7 @@ func (a *Agent) GetTools() []fantasy.AgentTool {
 	if len(a.extraTools) > 0 {
 		allTools = append(allTools, a.extraTools...)
 	}
-	return allTools
+	return dedupeToolsByName(allTools)
 }
 
 // GetCoreToolCount returns the number of core tools.
@@ -1130,6 +1179,24 @@ func (a *Agent) GetMCPToolCount() int {
 		return 0
 	}
 	return len(a.toolManager.GetTools())
+}
+
+// GetMCPToolNames returns the prefixed names (serverName__toolName) of all
+// tools currently loaded from external MCP servers. Returns nil when no MCP
+// tool manager is configured or no tools have loaded yet.
+func (a *Agent) GetMCPToolNames() []string {
+	if a.toolManager == nil {
+		return nil
+	}
+	mcpTools := a.toolManager.GetTools()
+	if len(mcpTools) == 0 {
+		return nil
+	}
+	names := make([]string, len(mcpTools))
+	for i, t := range mcpTools {
+		names[i] = t.Name
+	}
+	return names
 }
 
 // GetExtensionToolCount returns the number of tools registered by extensions.
@@ -1378,11 +1445,16 @@ func (a *Agent) GetMaxTokens() int {
 
 // Close closes the agent and cleans up resources.
 // If MCP tools are still loading in the background, Close waits for them
-// to finish before closing connections to avoid resource leaks.
+// to finish before closing connections to avoid resource leaks. The wait
+// is bounded so a hung MCP transport can never block shutdown forever.
 func (a *Agent) Close() error {
 	// Wait for background MCP loading to finish before closing connections.
 	if a.mcpReady != nil {
-		<-a.mcpReady
+		select {
+		case <-a.mcpReady:
+		case <-time.After(30 * time.Second):
+			log.Warn("Timed out waiting for background MCP loading during shutdown; closing anyway")
+		}
 	}
 	var toolErr error
 	if a.toolManager != nil {

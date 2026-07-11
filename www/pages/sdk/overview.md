@@ -78,6 +78,7 @@ Available options:
 | `WithExtraTools(...Tool)` | `Options.ExtraTools` (adds alongside defaults) |
 | `WithProviderAPIKey(string)` | `Options.ProviderAPIKey` |
 | `WithProviderURL(string)` | `Options.ProviderURL` |
+| `WithProviderWire(string)` | `Options.ProviderWire` (wire protocol for auto-routed providers: `openai`, `openai-compat`, `anthropic`, `google`) |
 | `WithConfigFile(string)` | `Options.ConfigFile` |
 | `WithDebug()` | `Options.Debug = true` |
 | `WithDebugLogger(DebugLogger)` | `Options.DebugLogger` (route engine + MCP debug output into a custom logger; overrides `WithDebug` when set) |
@@ -550,6 +551,18 @@ if host.ShouldCompact() {
 }
 ```
 
+Token estimates count every message part (tool-call arguments, tool results,
+reasoning, file attachments), and after the first turn the real API-reported
+token count is preferred over the heuristic. Compaction budgets adapt to the
+model's context and output limits when left at their zero values; pass a
+`*kit.CompactionOptions` as the second argument to `Compact` to override
+them — see [SDK options → CompactionOptions](/sdk/options#compactionoptions).
+
+Estimates can still undercount. When a provider call fails with a
+context-overflow error, the turn loop automatically compacts and replays the
+turn once before surfacing `kit.ErrContextOverflow` — see
+[Reactive compaction](/sdk/options#reactive-compaction-on-context-overflow).
+
 ## Provider error classification
 
 Provider failures are wrapped with exported sentinels so you can branch on the
@@ -561,7 +574,10 @@ also classify any provider error yourself with `kit.ClassifyProviderError`:
 _, err := host.PromptResult(ctx, prompt)
 switch {
 case errors.Is(err, kit.ErrContextOverflow):
-    host.Compact(ctx, nil, "") // compact and retry
+    // Kit already compacted and replayed the turn once before surfacing
+    // this — reaching here means the conversation cannot fit even after
+    // compaction (e.g. start a new session or trim input).
+    handleUnrecoverableOverflow()
 case errors.Is(err, kit.ErrRateLimit):
     backoffAndRetry()
 case errors.Is(err, kit.ErrAuth):
@@ -575,7 +591,7 @@ case errors.Is(err, kit.ErrInvalidRequest):
 
 | Sentinel | Meaning |
 |----------|---------|
-| `kit.ErrContextOverflow` | Request exceeded the model's context window |
+| `kit.ErrContextOverflow` | Request exceeded the model's context window — surfaced only after Kit's automatic compact-and-replay recovery also failed |
 | `kit.ErrRateLimit` | Provider throttled the request |
 | `kit.ErrAuth` | Credential / authorization failure |
 | `kit.ErrProviderUnavailable` | Transient upstream failure (5xx, network, timeout) |
@@ -611,5 +627,25 @@ result, err := host.Subagent(ctx, kit.SubagentConfig{
     Timeout:   2 * time.Minute,
 })
 ```
+
+Set `Agent` to a named agent definition (discovered from `.agents/agents/*.md`,
+`.kit/agents/*.md`, `~/.config/kit/agents/*.md`, or the built-ins `general` /
+`explore`) to apply its preset system prompt, model, tool allowlist, and
+timeout:
+
+```go
+result, err := host.Subagent(ctx, kit.SubagentConfig{
+    Prompt: "Map out the session persistence flow",
+    Agent:  "explore", // read-only preset
+})
+```
+
+Session-backed runs are linked to the parent: new child sessions record the
+parent's session ID in their header, and `result.SessionID` can be passed back
+as `SubagentConfig.SessionID` to resume the child session for follow-up
+prompts that reuse its accumulated context.
+
+See [Subagents](/advanced/subagents#named-agents) for definition file format
+and discovery precedence.
 
 See [Options](/sdk/options), [Callbacks](/sdk/callbacks), and [Sessions](/sdk/sessions) for more details.

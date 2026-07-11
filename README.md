@@ -19,6 +19,7 @@ A powerful, extensible AI coding agent CLI with multi-provider support, built-in
 
 - **Multi-Provider LLM Support**: Anthropic, OpenAI, Google Gemini, Ollama, Azure OpenAI, AWS Bedrock, OpenRouter, and more
 - **Built-in Core Tools**: bash (with interactive sudo password prompt), read, write, edit, grep, find, ls, subagent - no MCP overhead
+- **Named Agents**: Reusable subagent presets defined in markdown with per-agent tool allowlists, advertised to the LLM for delegation
 - **Smart @ Attachments**: Binary files auto-detected via MIME type, MCP resources via `@mcp:server:uri`
 - **MCP Integration**: Connect external MCP servers for expanded capabilities
 - **Extension System**: Write custom tools, commands, widgets, and UI modifications in Go
@@ -140,6 +141,9 @@ skill:                    # explicit skill files/dirs (disables auto-discovery)
 skills-dir: ""            # scan this directory directly for skills (overrides auto-discovery)
 skill-disable:            # hide skills from the model catalog by name (still usable via /skill:)
   - some-skill
+
+# Named agents
+no-agents: false          # set to true to disable named agent discovery (built-ins and definition files)
 ```
 
 All of the above keys can also be set programmatically via the SDK
@@ -191,6 +195,7 @@ mcpServers:
 --model, -m              Model to use (provider/model format)
 --provider-api-key       API key for the provider
 --provider-url           Base URL for provider API
+--provider-wire          Wire protocol for auto-routed providers (openai, openai-compat, anthropic, google)
 --tls-skip-verify        Skip TLS certificate verification
 
 # Session management
@@ -206,7 +211,7 @@ mcpServers:
 --max-steps              Maximum agent steps (0 for unlimited)
 --stream                 Enable streaming output (default: true)
 --compact                Enable compact output mode
---auto-compact           Auto-compact conversation near context limit
+--auto-compact           Auto-compact conversation near context limit (reactive compact-and-retry on provider context-overflow errors is always on)
 
 # Extensions and tools
 --extension, -e          Load additional extension file(s) (repeatable)
@@ -223,6 +228,7 @@ mcpServers:
 --skills-dir             Scan this directory directly for skills (overrides auto-discovery)
 --skill-disable          Hide a skill from the model catalog by name (repeatable); still usable via /skill:
 --no-skills              Disable skill loading (auto-discovery and explicit)
+--no-agents              Disable named agent discovery (built-ins and definition files)
 
 # Generation parameters
 --max-tokens             Maximum tokens in response (default: 8192, auto-raised up to 32768 for models with larger known output limits)
@@ -494,6 +500,50 @@ Placeholders inside fenced code blocks (```) and inline code spans are ignored.
 
 Disable templates with `--no-prompt-templates` or load a specific template with `--prompt-template <name>`.
 
+### Named Agents
+
+Define reusable subagent presets as markdown files. Named agents are advertised to the LLM in the `subagent` tool description, so the main agent can delegate tasks to the right specialist by name — with a preset system prompt, model, tool allowlist, temperature, and timeout.
+
+**Discovery locations** (highest to lowest precedence):
+
+1. `<project>/.agents/agents/*.md` — project-local (cross-client convention)
+2. `<project>/.kit/agents/*.md` — project-local (Kit-specific)
+3. `~/.config/kit/agents/*.md` — user-level (`$XDG_CONFIG_HOME` aware)
+4. Built-in agents: `general` (full tool access) and `explore` (read-only: `read`, `grep`, `find`, `ls`)
+
+The filename (minus `.md`) is the agent name. Higher-precedence definitions override lower ones, so a project can replace — or disable — a built-in or user-level agent.
+
+**Example** (`.agents/agents/code-reviewer.md`):
+
+```markdown
+---
+description: Reviews code for quality and best practices   # required
+model: anthropic/claude-sonnet-4                           # optional model override
+tools: [read, grep, find, ls]                              # optional tool allowlist
+temperature: 0.1                                           # optional
+timeout: 300                                               # optional, seconds
+hidden: false                                              # optional: resolvable but not advertised
+disabled: false                                            # optional: remove this agent (and anything it shadows)
+---
+You are in code review mode. Focus on correctness, security, and
+maintainability. Report findings with file paths and line references.
+```
+
+The LLM invokes it through the `subagent` tool's `agent` parameter; explicit `model` / `system_prompt` / `timeout_seconds` arguments override the agent's presets. An agent without a `tools:` list gets the default subagent tool set (everything except `subagent`, preventing recursion); with a `tools:` allowlist the subagent is restricted to exactly those tools.
+
+From the Go SDK:
+
+```go
+agents := k.GetAgents() // discovered definitions (built-ins included)
+
+result, err := k.Subagent(ctx, kit.SubagentConfig{
+    Prompt: "Map out the session persistence flow",
+    Agent:  "explore", // preset prompt + read-only tools
+})
+```
+
+Disable discovery entirely with `--no-agents`, the `no-agents` config key (`.kit.yml`), `KIT_NO_AGENTS=true`, or `Options.NoAgents` in the SDK.
+
 ## GitHub Integration
 
 Kit can run as an automated collaborator/reviewer inside GitHub Actions. The
@@ -669,8 +719,10 @@ host, err := kit.New(ctx, &kit.Options{
     // Configuration
     SkipConfig:   true,                   // Skip .kit.yml files (viper defaults + env vars still apply)
 
-    // Compaction
-    AutoCompact:  true,                // Auto-compact near context limit
+    // Compaction — proactive check before turns near the context limit.
+    // Reactive compaction (compact + replay once on provider context-overflow
+    // errors) is always on, independent of this setting.
+    AutoCompact:  true,
 
     Debug:        true,                // Debug logging
 })
@@ -1111,6 +1163,30 @@ kit --model opencode/claude-haiku-4-5 "Hello"     # → Anthropic wire
 kit --model opencode/gpt-5 "Hello"                # → OpenAI wire
 kit --model opencode/gemini-3.5-flash "Hello"     # → Google wire
 ```
+
+### Provider Overrides
+
+Declare or patch providers in your config file's `providers` section — fix a
+wire protocol the database gets wrong, or define an internal gateway the
+database doesn't know about:
+
+```yaml
+# ~/.kit.yml
+providers:
+  minimax:                    # patch a known provider
+    wire: anthropic
+  corp-llm:                   # declare a new one
+    wire: anthropic
+    baseUrl: https://llm.internal.corp/api
+    apiKeyEnv: [CORP_LLM_KEY]
+    headers:
+      X-Team: platform
+```
+
+Accepted `wire` values: `openai` (Responses API), `openai-compat` (chat
+completions), `anthropic`, `google`. Unset fields inherit database values.
+For one-off use, `--provider-wire` with `--provider-url` routes any
+`provider/model` through the declared wire without a config entry.
 
 ### Model String Format
 
