@@ -1,3 +1,16 @@
+# Changelog (Till 0.88.0)
+- Merge v0.86.0 custom changes into v0.88.0
+  - Auth refactor with credential manager and device flow for Copilot
+  - Extension system: package relocation internal/extensions → extensions/
+  - New UI features: Ctrl+Arrow word navigation, crush-style text selection, End key support
+  - Compaction improvements: auto-compact, adaptive budgets, retry on overflow
+  - Subagent session linking with parent-child relationships and resume support
+  - SDK parity: WithProviderWire, sealed SDK types, deduplication of auth/UI/extension paths
+  - Various bug fixes: memory leaks, deadlocks, hot-path rendering, subagent nil handle
+  - New subagent type display in StreamComponent spinner
+  - Agent name sanitization and validation with compiled regexp
+  - Bot-review polling loop (/resolve-reviews)
+
 # Changelog (Till 0.86.0)
 - Merge all upstream 0.86.0 changes
 
