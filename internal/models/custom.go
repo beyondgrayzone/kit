@@ -53,8 +53,10 @@ func modelConfigToModelInfo(modelID string, cfg CustomModelConfig) ModelInfo {
 		APIKey:       cfg.APIKey,
 		APIModelName: cfg.APIModelName,
 		Cost: Cost{
-			Input:  cfg.Cost.Input,
-			Output: cfg.Cost.Output,
+			Input:      cfg.Cost.Input,
+			Output:     cfg.Cost.Output,
+			CacheRead:  cfg.Cost.CacheRead,
+			CacheWrite: cfg.Cost.CacheWrite,
 		},
 		Limit: Limit{
 			Context: cfg.Limit.Context,
@@ -318,8 +320,10 @@ type GenerationParamsConfig struct {
 
 // CostConfig defines the pricing for a custom model.
 type CostConfig struct {
-	Input  float64 `json:"input" yaml:"input"`
-	Output float64 `json:"output" yaml:"output"`
+	Input      float64  `json:"input" yaml:"input"`
+	Output     float64  `json:"output" yaml:"output"`
+	CacheRead  *float64 `json:"cacheRead,omitempty" yaml:"cacheRead,omitempty"`
+	CacheWrite *float64 `json:"cacheWrite,omitempty" yaml:"cacheWrite,omitempty"`
 }
 
 // LimitConfig defines context and output limits for a custom model.
