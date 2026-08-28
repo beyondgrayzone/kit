@@ -62,8 +62,17 @@ var (
 	ApplyTheme              = style.ApplyTheme
 	ApplyThemeWithoutSave   = style.ApplyThemeWithoutSave
 	ListThemes              = style.ListThemes
+	CurrentThemeName        = style.CurrentThemeName
+	HexOf                   = style.HexOf
 	RegisterThemeFromConfig = style.RegisterThemeFromConfig
 	KitBanner               = style.KitBanner
 	AdaptiveColor           = style.AdaptiveColor
 	IsDarkBackground        = style.IsDarkBackground
+	SyntaxStyle             = style.SyntaxStyle
+
+	// SetTerminalCapabilities and ResolveTerminalCapabilities let a frontend
+	// control per-terminal styling inputs instead of relying on a process-global
+	// probe. See internal/ui/style.
+	SetTerminalCapabilities     = style.SetTerminalCapabilities
+	ResolveTerminalCapabilities = style.ResolveTerminalCapabilities
 )

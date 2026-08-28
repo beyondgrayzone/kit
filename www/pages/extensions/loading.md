@@ -11,12 +11,53 @@ Kit automatically discovers and loads extensions from these paths, in order:
 
 | Path | Scope |
 |------|-------|
-| `~/.config/kit/extensions/*.go` | Global single files |
-| `~/.config/kit/extensions/*/main.go` | Global subdirectory extensions |
+| `/usr/share/kit/extensions/*.go` | System-wide single files |
+| `/usr/share/kit/extensions/*/main.go` | System-wide subdirectory extensions |
+| `~/.config/kit/extensions/*.go` | User single files |
+| `~/.config/kit/extensions/*/main.go` | User subdirectory extensions |
+| `~/.local/share/kit/git/` | Global git-installed packages |
 | `.kit/extensions/*.go` | Project-local single files |
 | `.kit/extensions/*/main.go` | Project-local subdirectory extensions |
-| `~/.local/share/kit/git/` | Global git-installed packages |
 | `.kit/git/` | Project-local git-installed packages |
+
+Kit loads every extension it finds. The order in the table is the order in
+which extensions load and in which their event handlers run, thus a
+project-local extension runs after a user one, and a user extension runs
+after a system-wide one.
+
+## System-wide extensions
+
+The system-wide directory holds extensions that come with a packaged
+install of Kit (rpm, deb, Homebrew, and so on) and are shared by every
+user of the machine. It defaults to `/usr/share/kit/extensions`.
+
+Set `KIT_SYSTEM_EXTENSIONS_DIR` to use different directories. Give more
+than one directory with the platform list separator (`:` on Unix, `;` on
+Windows):
+
+```bash
+# Unix
+KIT_SYSTEM_EXTENSIONS_DIR=/opt/kit/extensions:/srv/kit/extensions kit
+```
+
+```powershell
+# Windows (PowerShell)
+$env:KIT_SYSTEM_EXTENSIONS_DIR = "C:\ProgramData\kit\extensions;D:\kit\extensions"; kit
+```
+
+Set the variable to an empty value to turn off system-wide discovery:
+
+```bash
+KIT_SYSTEM_EXTENSIONS_DIR= kit
+```
+
+Packagers can change the compiled-in default at build time:
+
+```bash
+go build -ldflags \
+  "-X github.com/mark3labs/kit/internal/extensions.SystemExtensionsDir=/opt/kit/extensions" \
+  ./cmd/kit
+```
 
 ## Explicit loading
 
@@ -148,3 +189,17 @@ snapshotted when the extension loads, and calls to `os.Setenv` mutate only the
 extension's sandboxed copy — they never change Kit's process environment or the
 host. This keeps extensions from leaking state into Kit or other extensions
 while still letting them read the configuration they need.
+
+### Failure isolation
+
+Each extension is loaded into its own interpreter, and a failure in one never
+stops the others. A syntax error, a bad `Init` signature, a panic while the
+source is evaluated, or a panic inside `Init` is reported as a load failure for
+that file only — Kit continues starting up with the remaining extensions.
+
+At runtime the same applies to widget rendering: a panic inside a
+[`Render` callback](/extensions/capabilities#custom-rendering) hides that widget
+and logs the error rather than taking down the TUI.
+
+This is isolation, not sandboxing. Extensions run in-process with `os/exec`
+access, so only load a `.go` file you would be willing to run directly.

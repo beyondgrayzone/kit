@@ -310,9 +310,10 @@ func (p *PopupList) Render() string {
 		Width(popupW)
 	if popupH > 0 {
 		popupStyle = popupStyle.Height(popupH)
-	} else {
-		popupStyle = popupStyle.MarginBottom(1)
 	}
+	// No bottom margin: the popup is composited over the view, so a margin
+	// row would be an unstyled band of spaces below the border that erases
+	// the content behind it. Spacing is the caller's business.
 
 	var b strings.Builder
 
@@ -461,9 +462,9 @@ func (p *PopupList) Render() string {
 	footerHint := p.FooterHint
 	if footerHint == "" {
 		if innerW >= 50 {
-			footerHint = "↑↓ navigate • enter select • esc cancel • type to filter"
+			footerHint = "↑↓ navigate · ↵ select · esc cancel · type to filter"
 		} else if innerW >= 30 {
-			footerHint = "↑↓ nav • ↵ select • esc"
+			footerHint = "↑↓ nav · ↵ select · esc"
 		} else {
 			footerHint = "↑↓ ↵ esc"
 		}
@@ -473,17 +474,22 @@ func (p *PopupList) Render() string {
 		footerParts = append(footerParts, p.ExtraFooter)
 	}
 
+	// Clamp the footer to a single line. Custom hints are written for a wide
+	// popup, and lipgloss wraps rather than truncates, so an unclamped hint
+	// silently becomes a three-line paragraph at narrow widths — more visual
+	// weight than the list it describes.
 	footer := lipgloss.NewStyle().
 		Background(popupBg).
 		Foreground(theme.VeryMuted).
 		Italic(true).
-		Render(strings.Join(footerParts, "  "))
+		Render(truncateLine(strings.Join(footerParts, "  "), innerW))
 
 	return popupStyle.Render(content + "\n\n" + footer)
 }
 
 // RenderCentered returns the popup placed at the center of a termWidth×termHeight
-// canvas, ready to be composed with overlayContent().
+// canvas. Prefer Render() plus the compositor for modals — this full-screen
+// form is opaque and erases whatever sits behind it.
 func (p *PopupList) RenderCentered(termWidth, termHeight int) string {
 	popupContent := p.Render()
 	return lipgloss.Place(

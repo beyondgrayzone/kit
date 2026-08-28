@@ -11,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/log"
 	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/mark3labs/kit/internal/clipboard"
@@ -19,6 +20,7 @@ import (
 	"github.com/mark3labs/kit/internal/ui/imagepreview"
 	"github.com/mark3labs/kit/internal/ui/selection"
 	"github.com/mark3labs/kit/internal/ui/style"
+	"github.com/mark3labs/kit/internal/ui/termgfx"
 )
 
 // InputComponent is the interactive text input field for the parent AppModel.
@@ -86,26 +88,38 @@ type InputComponent struct {
 	// May be nil in tests; nil-safe.
 	appCtrl AppController
 
-	// hideHint suppresses the "enter submit · ctrl+j..." hint text.
-	hideHint bool
-
-	// agentBusy indicates the agent is currently working. When true, the
-	// hint text shows steering shortcut (Ctrl+X s) instead of submit.
-	agentBusy bool
-
 	// pendingImages holds clipboard images attached to the next submission.
 	// Images are added via Ctrl+V and cleared on submit or Ctrl+U.
 	pendingImages []core.ImageAttachment
 
-	// imageThumbs caches the rendered half-block thumbnail for each entry in
+	// imageThumbs caches the rendered thumbnail for each entry in
 	// pendingImages (1:1 index correspondence). Thumbnails are rendered
 	// asynchronously off the Bubble Tea event loop (decode + resample is too
 	// slow to run inside Update), so an entry starts as the empty string
 	// placeholder and is filled in when the matching thumbnailReadyMsg
-	// arrives. An entry stays empty when the terminal cannot display a
-	// half-block preview, in which case the text pill is shown alone.
-	// See internal/ui/imagepreview.
+	// arrives. An entry stays empty when the terminal can display no preview
+	// at all, in which case the text pill is shown alone.
+	//
+	// The contents are either half-block art or a grid of Unicode placeholders
+	// that display a transmitted image; both are ordinary styled text as far as
+	// the view is concerned. See internal/ui/imagepreview.
 	imageThumbs []string
+
+	// imageIDs holds the terminal image id backing each entry in imageThumbs
+	// (1:1 index correspondence), or 0 when the thumbnail is half-block art and
+	// owns no terminal resource. Ids are kept so the images can be freed when
+	// the pending set is cleared; terminals hold transmitted image data until
+	// told to drop it.
+	imageIDs []uint32
+
+	// imagePlace holds the placement escape sequence for each entry in
+	// imageThumbs (1:1 index correspondence), or "" when the thumbnail draws
+	// itself as text and needs no placement.
+	//
+	// A directly-placed image is painted over the screen rather than being part
+	// of the view, so it must be redrawn at its absolute position after every
+	// frame. See DirectPlacements.
+	imagePlace []string
 
 	// imageGen is a monotonic generation counter incremented whenever the
 	// pending image set is cleared. Async thumbnail results carry the
@@ -140,6 +154,25 @@ type InputComponent struct {
 // maxHistory is the maximum number of prompt entries kept in history.
 const maxHistory = 100
 
+// inputChromeWidth is the number of columns the composer frame consumes: one
+// column of horizontal padding on each side of the filled bar. The textarea is
+// sized to the remainder so text neither wraps early nor overflows.
+const inputChromeWidth = 2
+
+// inputMaxRows caps how tall the composer grows before the textarea begins
+// scrolling its own content.
+const inputMaxRows = 8
+
+// inputMaxContentRows bounds how much text the composer will hold. It exists
+// only to keep a runaway paste from exhausting memory; it is far beyond any
+// prompt a person would type, so in practice input is unlimited.
+const inputMaxContentRows = 10000
+
+// defaultPlaceholder doubles as the submit hint. Folding the hint into the
+// placeholder means the composer needs no separate help line, and the hint
+// disappears exactly when it stops being useful — as soon as the user types.
+const defaultPlaceholder = "Ask kit anything…   ↵ send"
+
 // clipboardImageMsg is the result of an async clipboard image read.
 type clipboardImageMsg struct {
 	image *core.ImageAttachment
@@ -154,6 +187,19 @@ type thumbnailReadyMsg struct {
 	gen   int
 	index int
 	thumb string
+
+	// transmit carries image data that must reach the terminal outside the
+	// view text, and is empty for half-block thumbnails. See
+	// imagepreview.Thumbnail.
+	transmit string
+
+	// imageID identifies the transmitted image so it can be freed later, and is
+	// zero for half-block thumbnails.
+	imageID uint32
+
+	// place is the escape sequence that draws the image at the cursor, for
+	// thumbnails that are painted over the screen instead of drawn as text.
+	place string
 }
 
 // NewInputComponent creates a new InputComponent with the given width and
@@ -161,12 +207,28 @@ type thumbnailReadyMsg struct {
 // /clear and /clear-queue are no-ops.
 func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 	ta := textarea.New()
-	ta.Placeholder = "Type your message..."
+	ta.Placeholder = defaultPlaceholder
 	ta.ShowLineNumbers = false
 	ta.Prompt = ""
 	ta.CharLimit = 0
-	ta.SetWidth(width - 8) // Account for container padding, border and internal padding
-	ta.SetHeight(4)        // 4 lines for comfortable multi-line input
+	// Clamp to at least one column: on a pathologically narrow terminal
+	// width-inputChromeWidth would go non-positive and SetWidth would receive
+	// a negative width.
+	ta.SetWidth(max(width-inputChromeWidth, 1))
+
+	// The composer starts as a single row and grows with the text, so an empty
+	// prompt costs one line instead of four. Beyond inputMaxRows the textarea
+	// scrolls internally rather than eating the transcript.
+	//
+	// MaxContentHeight must be set explicitly: with only MaxHeight the
+	// textarea treats it as a content limit and silently refuses newlines past
+	// that many logical lines, which would cap a prompt at inputMaxRows.
+	// Setting it separately keeps MaxHeight governing the viewport alone.
+	ta.DynamicHeight = true
+	ta.MinHeight = 1
+	ta.MaxHeight = inputMaxRows
+	ta.MaxContentHeight = inputMaxContentRows
+	ta.SetHeight(1)
 	ta.Focus()
 
 	// Override InsertNewline so only ctrl+j and shift+enter insert newlines.
@@ -186,14 +248,13 @@ func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 		key.WithHelp("end", "end of line"),
 	)
 
-	// Style the textarea using theme colors.
+	// Style the textarea using theme colors. Every span the textarea emits
+	// carries the composer background explicitly: a Background() set only on
+	// the outer container tears at each inner ANSI reset, which renders as
+	// patchy off-color blocks across the bar.
 	theme := style.GetTheme()
 	styles := ta.Styles()
-	styles.Focused.Base = lipgloss.NewStyle()
-	styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(theme.VeryMuted)
-	styles.Focused.Text = lipgloss.NewStyle().Foreground(theme.Text)
-	styles.Focused.Prompt = lipgloss.NewStyle()
-	styles.Focused.CursorLine = lipgloss.NewStyle()
+	applyComposerStyles(&styles, theme)
 	ta.SetStyles(styles)
 
 	ic := &InputComponent{
@@ -202,13 +263,12 @@ func NewInputComponent(width int, appCtrl AppController) *InputComponent {
 		width:       width,
 		popupHeight: 7,
 		appCtrl:     appCtrl,
-		hideHint:    true,
 	}
 	ic.popup = NewPopupList("", nil, width, 0)
 	ic.popup.ShowSearch = false
 	ic.popup.HideCount = true
 	ic.popup.MaxVisible = ic.popupHeight
-	ic.popup.FooterHint = "↑↓ navigate • tab complete • ↵ select • esc dismiss"
+	ic.popup.FooterHint = "↑↓ navigate · tab complete · ↵ select · esc dismiss"
 	return ic
 }
 
@@ -236,11 +296,11 @@ func (s *InputComponent) HandleMouseDown(x, y int) bool {
 	// Convert to input-relative coordinates.
 	relY := y - s.yOffset
 
-	// Adjust for style margins/padding to get coordinates relative to text content.
-	// inputBoxStyle has MarginTop(1) and no PaddingTop, so text content starts 1 row below.
-	// Also account for left border (1 char) and PaddingLeft(2) = 3 columns offset.
-	const marginTop = 1
-	const leftOffset = 3 // BorderLeft(1) + PaddingLeft(2)
+	// Adjust for style padding to get coordinates relative to text content.
+	// inputBarStyle has no margin and Padding(0, 1), so text starts at the
+	// top row and 1 column in from the left.
+	const marginTop = 0
+	const leftOffset = 1 // PaddingLeft(1)
 
 	relYAdjusted := relY - marginTop
 	if relYAdjusted < 0 || relYAdjusted >= s.textarea.Height() {
@@ -296,9 +356,9 @@ func (s *InputComponent) HandleMouseDrag(x, y int) bool {
 	// Convert to input-relative coordinates.
 	relY := y - s.yOffset
 
-	// Adjust for style margins/padding to get coordinates relative to text content.
-	const marginTop = 1
-	const leftOffset = 3 // BorderLeft(1) + PaddingLeft(2)
+	// Adjust for style padding to get coordinates relative to text content.
+	const marginTop = 0
+	const leftOffset = 1 // PaddingLeft(1)
 
 	relYAdjusted := relY - marginTop
 	if relYAdjusted < 0 || relYAdjusted >= s.textarea.Height() {
@@ -417,7 +477,7 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		s.width = msg.Width
-		s.textarea.SetWidth(msg.Width - 8)
+		s.textarea.SetWidth(max(msg.Width-inputChromeWidth, 1))
 		return s, nil
 
 	case clipboardImageMsg:
@@ -432,6 +492,8 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Reserve a placeholder; the async render fills it in via
 			// thumbnailReadyMsg so Update never blocks on decode/resample.
 			s.imageThumbs = append(s.imageThumbs, "")
+			s.imageIDs = append(s.imageIDs, 0)
+			s.imagePlace = append(s.imagePlace, "")
 			cols := s.thumbCols()
 			if cols < 1 {
 				return s, nil
@@ -441,8 +503,36 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	case thumbnailReadyMsg:
-		if msg.gen == s.imageGen && msg.index >= 0 && msg.index < len(s.imageThumbs) {
-			s.imageThumbs[msg.index] = msg.thumb
+		if msg.gen != s.imageGen || msg.index < 0 || msg.index >= len(s.imageThumbs) {
+			// The slot is gone (cleared, or re-attached under a new
+			// generation). Free the image rather than leaking it in the
+			// terminal, which has already been told to hold the data.
+			if seq := imagepreview.DeleteImage(msg.imageID); seq != "" {
+				return s, tea.Raw(seq)
+			}
+			return s, nil
+		}
+		s.imageThumbs[msg.index] = msg.thumb
+		if msg.index < len(s.imageIDs) {
+			s.imageIDs[msg.index] = msg.imageID
+		}
+		if msg.index < len(s.imagePlace) {
+			s.imagePlace[msg.index] = msg.place
+		}
+		if msg.transmit != "" {
+			// The image data must be written straight to the terminal; it
+			// cannot travel inside the view text. For placeholder thumbnails
+			// the cells are already in the view and the terminal fills them in
+			// as soon as the data lands.
+			cmds := []tea.Cmd{tea.Raw(msg.transmit)}
+			if msg.place != "" {
+				// A directly-placed image is drawn by AppModel, which can only
+				// work out where it goes once this frame has been laid out.
+				// Nothing else would arrive to trigger that write, so ask for
+				// one more Update after the coming View.
+				cmds = append(cmds, gfxNudgeCmd())
+			}
+			return s, tea.Batch(cmds...)
 		}
 		return s, nil
 
@@ -514,10 +604,10 @@ func (s *InputComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+u":
 				// Clear all pending image attachments.
 				if len(s.pendingImages) > 0 {
+					cleanup := s.releaseImages()
 					s.pendingImages = nil
-					s.imageThumbs = nil
 					s.imageGen++
-					return s, nil
+					return s, cleanup
 				}
 			}
 		}
@@ -760,12 +850,39 @@ func (s *InputComponent) handleSubmit(value string) tea.Cmd {
 	// prompts) hand off to the parent via submitMsg. Attach any pending
 	// images and clear them.
 	images := s.pendingImages
+	cleanup := s.releaseImages()
 	s.pendingImages = nil
-	s.imageThumbs = nil
 	s.imageGen++
-	return func() tea.Msg {
+	submit := func() tea.Msg {
 		return core.SubmitMsg{Text: trimmed, Images: images}
 	}
+	if cleanup == nil {
+		return submit
+	}
+	// Free the preview images before handing off. tea.Sequence keeps the order
+	// so the terminal drops them while their placeholder cells are still on
+	// screen, rather than after the composer has already been redrawn.
+	return tea.Sequence(cleanup, submit)
+}
+
+// releaseImages returns a command that frees every transmitted preview image
+// and resets the thumbnail caches, or nil when nothing was transmitted.
+//
+// A terminal keeps transmitted image data until it is told to drop it, so a
+// session that attaches and clears many images would otherwise leave all of
+// them resident.
+func (s *InputComponent) releaseImages() tea.Cmd {
+	var seq strings.Builder
+	for _, id := range s.imageIDs {
+		seq.WriteString(imagepreview.DeleteImage(id))
+	}
+	s.imageThumbs = nil
+	s.imageIDs = nil
+	s.imagePlace = nil
+	if seq.Len() == 0 {
+		return nil
+	}
+	return tea.Raw(seq.String())
 }
 
 // pushHistory adds a prompt to the history ring buffer. Empty strings and
@@ -817,39 +934,140 @@ func (s *InputComponent) thumbCols() int {
 	return cols
 }
 
-// renderThumbnailCmd returns a tea.Cmd that renders a half-block ANSI preview
-// off the Bubble Tea event loop. The decode + resample work runs in the Cmd
-// goroutine, and the result is delivered as a thumbnailReadyMsg tagged with
-// the generation and slot index it was enqueued for. An empty thumbnail
-// (terminal unsupported or render error) leaves the text pill in place.
+// renderThumbnailCmd returns a tea.Cmd that renders an image preview off the
+// Bubble Tea event loop. The decode + resample work runs in the Cmd goroutine,
+// and the result is delivered as a thumbnailReadyMsg tagged with the
+// generation and slot index it was enqueued for. An empty thumbnail (terminal
+// unsupported or render error) leaves the text pill in place.
+//
+// A terminal that answered the graphics probe gets a real image; anything else
+// gets half-block art. The Kitty path falls back to half-block on error rather
+// than showing nothing, so a malformed image degrades instead of vanishing.
 func renderThumbnailCmd(img core.ImageAttachment, cols, rows int, bg color.Color, gen, index int) tea.Cmd {
 	return func() tea.Msg {
-		thumb, err := imagepreview.Render(img.Data, img.MediaType, cols, rows, bg)
+		caps := termgfx.Current()
+		var (
+			kt  imagepreview.Thumbnail
+			err error
+		)
+		switch termgfx.PreviewMode() {
+		case termgfx.ModePlaceholder:
+			kt, err = imagepreview.RenderKitty(img.Data, cols, rows, caps.CellWidth, caps.CellHeight)
+		case termgfx.ModeDirect:
+			kt, err = imagepreview.RenderKittyDirect(img.Data, cols, rows, caps.CellWidth, caps.CellHeight)
+		}
+		if kt.Cells != "" && err == nil {
+			return thumbnailReadyMsg{
+				gen:      gen,
+				index:    index,
+				thumb:    kt.Cells,
+				transmit: kt.Transmit,
+				imageID:  kt.ImageID,
+				place:    kt.Place(),
+			}
+		}
 		if err != nil {
+			log.Debug("kitty thumbnail failed, using half blocks", "error", err)
+		}
+		thumb, rerr := imagepreview.Render(img.Data, img.MediaType, cols, rows, bg)
+		if rerr != nil {
 			thumb = ""
 		}
 		return thumbnailReadyMsg{gen: gen, index: index, thumb: thumb}
 	}
 }
 
-// View implements tea.Model. Renders the textarea, autocomplete popup
-// (if visible), and help text.
-func (s *InputComponent) View() tea.View {
-	containerStyle := lipgloss.NewStyle()
+// gfxNudgeMsg asks for one more Update/View cycle. It carries no data and is
+// handled as a no-op: its only purpose is to give AppModel.Update a chance to
+// write a graphics placement that the View before it has just computed.
+type gfxNudgeMsg struct{}
 
+// gfxNudgeCmd delivers a gfxNudgeMsg immediately.
+func gfxNudgeCmd() tea.Cmd {
+	return func() tea.Msg { return gfxNudgeMsg{} }
+}
+
+// DirectPlacement locates one directly-placed preview image within the input
+// component's view.
+type DirectPlacement struct {
+	// RowOffset is the image's first row, counted from the top of the input
+	// component's own view.
+	RowOffset int
+
+	// Col is the image's first column, counted from the left edge.
+	Col int
+
+	// Sequence draws the image at the cursor.
+	Sequence string
+}
+
+// DirectPlacements returns the placement of every preview image that is
+// painted over the screen rather than drawn as view text, positioned relative
+// to the top-left of this component's view.
+//
+// It returns nil in the usual case, where previews are either half-block art
+// or Unicode placeholders and therefore need no separate placement.
+//
+// The offsets must match the layout built by View exactly; the two are kept
+// in step by thumbRowOffsets.
+func (s *InputComponent) DirectPlacements() []DirectPlacement {
+	var out []DirectPlacement
+	for i, off := range s.thumbRowOffsets() {
+		if i < len(s.imagePlace) && s.imagePlace[i] != "" {
+			out = append(out, DirectPlacement{
+				RowOffset: off,
+				Col:       thumbPaddingLeft,
+				Sequence:  s.imagePlace[i],
+			})
+		}
+	}
+	return out
+}
+
+// thumbPaddingLeft is the left padding applied to each thumbnail by View. It
+// is a constant so DirectPlacements and View cannot disagree about where a
+// thumbnail starts.
+const thumbPaddingLeft = 1
+
+// thumbRowOffsets returns, for each pending image, the row its thumbnail
+// starts on relative to the top of this component's view, or -1 when that
+// image has no thumbnail yet.
+//
+// This mirrors the stacking order in View: the composer bar, then the "N
+// image(s) attached" label, then one block per rendered thumbnail.
+func (s *InputComponent) thumbRowOffsets() []int {
+	if len(s.pendingImages) == 0 {
+		return nil
+	}
+	// The composer bar, followed by the attachment label.
+	row := lipgloss.Height(s.textarea.View()) + 1
+
+	offsets := make([]int, len(s.pendingImages))
+	for i := range s.pendingImages {
+		if i >= len(s.imageThumbs) || s.imageThumbs[i] == "" {
+			offsets[i] = -1
+			continue
+		}
+		offsets[i] = row
+		row += lipgloss.Height(s.imageThumbs[i])
+	}
+	return offsets
+}
+
+// View implements tea.Model. Renders the composer bar and any pending image
+// attachments. The autocomplete popup is drawn separately as a centered
+// overlay by AppModel.View().
+func (s *InputComponent) View() tea.View {
 	theme := style.GetTheme()
 
-	inputBoxStyle := lipgloss.NewStyle().
-		Border(lipgloss.ThickBorder()).
-		BorderLeft(true).
-		BorderRight(false).
-		BorderTop(false).
-		BorderBottom(false).
-		BorderForeground(theme.Primary).
-		MarginTop(1).
-		MarginBottom(1).
-		PaddingLeft(2).    // match message block paddingLeft
-		Width(s.width - 1) // full width minus left border
+	// The composer is a filled bar rather than a bordered box. A background
+	// fill reads as chrome, which is what the composer is; a border reads as
+	// content, which is what messages are. Keeping the two distinct means the
+	// input can never be mistaken for something the agent said.
+	inputBarStyle := lipgloss.NewStyle().
+		Background(theme.InputBg).
+		Padding(0, 1).
+		Width(s.width)
 
 	var view strings.Builder
 
@@ -870,7 +1088,7 @@ func (s *InputComponent) View() tea.View {
 		textareaView = strings.Join(lines, "\n")
 	}
 
-	view.WriteString(inputBoxStyle.Render(textareaView))
+	view.WriteString(inputBarStyle.Render(textareaView))
 
 	// Popup is now rendered as a centered overlay in AppModel.View()
 	// instead of inline here to prevent bottom overflow
@@ -880,14 +1098,14 @@ func (s *InputComponent) View() tea.View {
 	// otherwise the text pill alone is shown.
 	if len(s.pendingImages) > 0 {
 		imgStyle := lipgloss.NewStyle().
-			Foreground(theme.Secondary).
-			PaddingLeft(3)
+			Foreground(theme.VeryMuted).
+			PaddingLeft(1)
 
-		label := fmt.Sprintf("[%d image(s) attached] ctrl+u to clear", len(s.pendingImages))
+		label := fmt.Sprintf("%d image(s) attached · ctrl+u to clear", len(s.pendingImages))
 		view.WriteString("\n")
 		view.WriteString(imgStyle.Render(label))
 
-		thumbStyle := lipgloss.NewStyle().PaddingLeft(3)
+		thumbStyle := lipgloss.NewStyle().PaddingLeft(thumbPaddingLeft)
 		for i := range s.pendingImages {
 			if i < len(s.imageThumbs) && s.imageThumbs[i] != "" {
 				view.WriteString("\n")
@@ -896,50 +1114,19 @@ func (s *InputComponent) View() tea.View {
 		}
 	}
 
-	if !s.hideHint {
-		helpStyle := lipgloss.NewStyle().
-			Foreground(theme.VeryMuted).
-			MarginTop(1).
-			PaddingLeft(3)
-
-		// Adapt hint text to available width (accounting for left padding of 3).
-		var hint string
-		availableHintWidth := s.width - 3
-		if s.agentBusy {
-			// When the agent is working, show steering shortcut.
-			if availableHintWidth >= 60 {
-				hint = "enter queue • ctrl+x s steer • esc esc cancel"
-			} else if availableHintWidth >= 40 {
-				hint = "↵ queue • ^X s steer • esc×2 cancel"
-			} else {
-				hint = "^X s steer"
-			}
-		} else if availableHintWidth >= 80 {
-			hint = "enter submit • ctrl+j / shift+enter new line • ctrl+x e editor • ctrl+v paste image"
-		} else if availableHintWidth >= 67 {
-			hint = "enter submit • ctrl+j new line • ctrl+x e editor • ctrl+v image"
-		} else if availableHintWidth >= 40 {
-			hint = "↵ submit • ctrl+j newline • ^X e editor"
-		} else if availableHintWidth >= 20 {
-			hint = "↵ submit • ^X e editor"
-		} else {
-			hint = "↵ submit"
-		}
-		view.WriteString("\n")
-		view.WriteString(helpStyle.Render(hint))
-	}
-
-	return tea.NewView(containerStyle.Render(view.String()))
+	return tea.NewView(view.String())
 }
 
-// RenderPopupCentered renders the autocomplete popup for / or @ as a
-// centered overlay. Returns "" when the popup is not currently shown.
+// RenderPopupBox renders the autocomplete popup for / or @ as a bare box.
+// Returns "" when the popup is not currently shown. The caller composites it
+// over the main view so the transcript stays visible around it.
+//
 // The actual filtering / selection state lives on InputComponent — this
 // method merely converts the filtered FuzzyMatch list into PopupItems
 // and asks the shared PopupList to draw it. As a result the / popup, the
 // @ popup, the model picker, the tree selector and the session selector
 // all share identical chrome.
-func (s *InputComponent) RenderPopupCentered(termWidth, termHeight int) string {
+func (s *InputComponent) RenderPopupBox(termWidth, termHeight int) string {
 	if !s.showPopup || len(s.filtered) == 0 {
 		return ""
 	}
@@ -962,7 +1149,7 @@ func (s *InputComponent) RenderPopupCentered(termWidth, termHeight int) string {
 	s.popup.SetSize(termWidth, termHeight)
 	s.popup.SetItems(items)
 	s.popup.SetCursor(s.selected)
-	return s.popup.RenderCentered(termWidth, termHeight)
+	return s.popup.Render()
 }
 
 // completeArgs checks whether the input line matches a command with a Complete
@@ -1026,14 +1213,19 @@ func readClipboardImageCmd() tea.Cmd {
 	}
 }
 
-// ClearPendingImages removes all pending image attachments and returns them.
-// Used by the parent model when consuming images for submission.
-func (s *InputComponent) ClearPendingImages() []core.ImageAttachment {
+// ClearPendingImages removes all pending image attachments and returns them,
+// along with a command that frees any images transmitted to the terminal.
+//
+// The cleanup command must be run. A terminal holds transmitted image data
+// until told to drop it, and these ids are discarded here, so a caller that
+// ignores the command leaks every preview image for the rest of the session.
+// It is nil when there is nothing to free.
+func (s *InputComponent) ClearPendingImages() ([]core.ImageAttachment, tea.Cmd) {
 	images := s.pendingImages
 	s.pendingImages = nil
-	s.imageThumbs = nil
+	cleanup := s.releaseImages()
 	s.imageGen++
-	return images
+	return images, cleanup
 }
 
 // PendingImageCount returns the number of images currently attached.
@@ -1321,4 +1513,33 @@ func (s *InputComponent) updateEditFilePopup(cmdLen int, pathPrefix string) {
 		s.filtered[i] = FuzzyMatch{Command: &s.fileSynthCmds[i], Score: fs.Score}
 	}
 	s.selected = 0
+}
+
+// applyComposerStyles paints every textarea style state with the composer
+// background.
+//
+// lipgloss emits a reset sequence at the end of each styled span, which clears
+// the background set by an enclosing container. Filling the bar therefore has
+// to happen on the innermost styles rather than on the wrapper, or the result
+// is a bar that flickers back to the terminal background wherever the textarea
+// changed color (placeholder, text, cursor line).
+func applyComposerStyles(styles *textarea.Styles, theme style.Theme) {
+	bg := lipgloss.NewStyle().Background(theme.InputBg)
+
+	for _, state := range []*textarea.StyleState{&styles.Focused, &styles.Blurred} {
+		state.Base = bg
+		state.Text = bg.Foreground(theme.Text)
+		state.Placeholder = bg.Foreground(theme.VeryMuted)
+		state.Prompt = bg
+		state.CursorLine = bg
+		state.EndOfBuffer = bg
+	}
+}
+
+// UpdateTheme repaints the composer with colors from the current theme.
+// Called after /theme switches the active palette.
+func (s *InputComponent) UpdateTheme() {
+	styles := s.textarea.Styles()
+	applyComposerStyles(&styles, style.GetTheme())
+	s.textarea.SetStyles(styles)
 }

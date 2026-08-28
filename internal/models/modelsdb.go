@@ -26,7 +26,7 @@ type modelsDBModel struct {
 	Reasoning   bool                   `json:"reasoning"`
 	ToolCall    bool                   `json:"tool_call"`
 	Temperature bool                   `json:"temperature"`
-	Cost        modelsDBCost           `json:"cost"`
+	Cost        *modelsDBCost          `json:"cost"`
 	Limit       modelsDBLimit          `json:"limit"`
 	Provider    *modelsDBModelProvider `json:"provider,omitempty"` // Model-specific provider override
 }
@@ -98,6 +98,53 @@ func parseWire(name string) (wireProtocol, bool) {
 // wireNames lists the accepted canonical wire names for error messages.
 func wireNames() string {
 	return strings.Join([]string{WireNameOpenAI, WireNameOpenAICompat, WireNameAnthropic, WireNameGoogle}, ", ")
+}
+
+// modelWirePrefix pins a wire protocol for every model whose ID starts with
+// Prefix.
+type modelWirePrefix struct {
+	Prefix string
+	Wire   wireProtocol
+}
+
+// modelWireOverrides pins a wire protocol for specific provider + model-family
+// combinations that the npm heuristic gets wrong. models.dev states one npm
+// package for the whole provider (plus optional per-model overrides), but some
+// aggregators mix wires inside a single catalog and publish no hint for the
+// odd families out.
+//
+// opencode zen is the motivating case: its default npm is
+// @ai-sdk/openai-compatible (chat completions), which is right for the
+// open-weight models, while its OpenAI and xAI families answer only on the
+// Responses API — /chat/completions returns HTTP 500/503 for them. The
+// claude-* and gemini-* families need no entry here because models.dev already
+// carries per-model npm overrides for them.
+//
+// Longest prefix wins, so a more specific family can opt out of a broader rule.
+var modelWireOverrides = map[string][]modelWirePrefix{
+	"opencode": {
+		{Prefix: "gpt-", Wire: wireOpenAI},
+		{Prefix: "grok-", Wire: wireOpenAI},
+	},
+}
+
+// lookupModelWire reports the pinned wire protocol for a provider + model pair,
+// if any. Matching is case-insensitive and uses the longest matching prefix.
+func lookupModelWire(provider, modelName string) (wireProtocol, bool) {
+	entries, ok := modelWireOverrides[strings.ToLower(provider)]
+	if !ok {
+		return wireUnknown, false
+	}
+
+	id := strings.ToLower(modelName)
+	wire, found := wireUnknown, false
+	best := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(id, entry.Prefix) && len(entry.Prefix) > best {
+			wire, found, best = entry.Wire, true, len(entry.Prefix)
+		}
+	}
+	return wire, found
 }
 
 // npmToWireProtocol maps npm package names from models.dev to the wire

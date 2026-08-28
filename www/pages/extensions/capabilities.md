@@ -7,7 +7,7 @@ description: All extension capabilities — lifecycle events, tools, commands, w
 
 ## Lifecycle events
 
-Extensions can hook into 27 lifecycle events:
+Extensions can hook into 30 lifecycle events:
 
 | Event | Description |
 |-------|-------------|
@@ -30,6 +30,9 @@ Extensions can hook into 27 lifecycle events:
 | `OnMessageUpdate` | Streaming text chunk received |
 | `OnMessageEnd` | Assistant message completed |
 | `OnModelChange` | Model switched |
+| `OnThinkingLevelChange` | Extended-thinking effort level changed |
+| `OnTerminalResize` | Terminal resized (also fires once at startup) |
+| `OnTurnStateChange` | UI entered or left the working state |
 | `OnContextPrepare` | Context being assembled for the model |
 | `OnBeforeFork` | Before forking a conversation branch |
 | `OnBeforeSessionSwitch` | Before switching sessions |
@@ -131,21 +134,110 @@ Add persistent status displays above or below the input area:
 
 ```go
 ctx.SetWidget(ext.WidgetConfig{
-    ID:       "token-count",
-    Position: "bottom",
-    Content:  ext.WidgetContent{Text: "Tokens: 1,234"},
+    ID:        "token-count",
+    Placement: ext.WidgetBelow,
+    Content:   ext.WidgetContent{Text: "Tokens: 1,234"},
 })
 
-// Update later
+// Update later — same ID replaces the previous widget
 ctx.SetWidget(ext.WidgetConfig{
-    ID:       "token-count",
-    Position: "bottom",
-    Content:  ext.WidgetContent{Text: "Tokens: 2,456"},
+    ID:        "token-count",
+    Placement: ext.WidgetBelow,
+    Content:   ext.WidgetContent{Text: "Tokens: 2,456"},
 })
 
 // Remove
 ctx.RemoveWidget("token-count")
 ```
+
+`Placement` is `ext.WidgetAbove` or `ext.WidgetBelow`. `Priority` orders
+multiple widgets within the same slot (lower renders first).
+
+### Markdown content
+
+Set `Markdown: true` to render `Text` as styled markdown — headings, bold,
+inline code and lists are formatted and sized to the widget's content column:
+
+```go
+ctx.SetWidget(ext.WidgetConfig{
+    ID:        "notes",
+    Placement: ext.WidgetAbove,
+    Content: ext.WidgetContent{
+        Markdown: true,
+        Text:     "## Build\n\n**passing** — `go test ./...`",
+    },
+})
+```
+
+### Custom rendering
+
+`Text` covers static content. For anything Kit has no vocabulary for — sparklines,
+gauges, box drawing, sprites — supply a `Render` function instead. It receives the
+width in columns available for content (the gutter and padding are already
+subtracted) and Kit uses the returned string **verbatim**:
+
+```go
+ctx.SetWidget(ext.WidgetConfig{
+    ID:        "cpu-gauge",
+    Placement: ext.WidgetAbove,
+    Style:     ext.WidgetStyle{NoBorder: true},
+    Content: ext.WidgetContent{
+        Render: func(width int) string {
+            filled := int(load * float64(width))
+            return "\033[38;5;82m" + strings.Repeat("━", filled) +
+                "\033[0m" + strings.Repeat("─", width-filled)
+        },
+    },
+})
+```
+
+`Render` takes priority over `Text`, and `Markdown` is ignored when it is set —
+a render function is expected to do its own styling. Returning an empty string
+hides the widget. A panic inside `Render` is contained: the widget is hidden and
+the error logged, rather than taking down the TUI.
+
+The example above hardcodes its color. To follow whatever theme the user has
+active instead, read [`ctx.GetTheme()`](#reading-the-active-theme) inside
+`Render` and paint with `ANSI` / `ANSIBold`.
+
+`Render` also works on headers and footers via `HeaderFooterConfig`.
+
+### Animated widgets
+
+Kit's animation clock is demand-driven — it runs while the startup logo or the
+activity spinner needs it and stops otherwise, so an idle session costs nothing.
+A widget that only reads state repaints whenever something *else* causes a
+render, which when idle means roughly twice a second (the input cursor blink).
+That is fine for a counter and visibly choppy for a spinner.
+
+Set `RefreshHz` to hold the clock open and repaint at a chosen rate:
+
+```go
+Content: ext.WidgetContent{
+    RefreshHz: 15,
+    Render:    func(width int) string { return spinnerFrame() + " working" },
+},
+```
+
+| `RefreshHz` | Behaviour | Use for |
+|---|---|---|
+| `0` (default) | Static. Repaints only when something else renders. | Counters, status text |
+| `4`–`8` | Gentle pulse | Slow progress, breathing indicators |
+| `10`–`15` | Smooth | Spinners, meters |
+| `30` | Kit's ceiling | Continuous motion |
+
+This is a real cost: a non-zero value means the app never idles. Ask for the
+lowest rate that looks right. Kit calls `Render` at approximately the requested
+rate rather than on every frame, so a 5Hz widget does not pay 30Hz of
+interpreter crossings.
+
+> **Because `Render` runs on every frame it must be cheap and must not block.**
+> No network calls, no locks held across the call. Compute in an event handler
+> or goroutine, store the result, and format it here.
+
+See [`arbitrary-ui.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/arbitrary-ui.go)
+for a live dashboard and [`bad-apple.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/bad-apple.go)
+for 30fps playback.
 
 ## Headers and footers
 
@@ -161,6 +253,35 @@ ctx.SetFooter(ext.HeaderFooterConfig{
 })
 ```
 
+Headers and footers accept the same `WidgetContent` as widgets, so `Markdown`,
+`Render` and `RefreshHz` all apply.
+
+Plain `Text` is rendered at **full terminal width with no truncation** — a longer
+line wraps and silently consumes a row of scrollback. Measure against
+`ctx.GetTerminalSize()` and truncate before calling `SetHeader`/`SetFooter`, or
+use `Render`, which is handed the exact width to draw into.
+
+## Terminal size
+
+```go
+width, height := ctx.GetTerminalSize()  // 0, 0 outside the interactive TUI
+
+api.OnTerminalResize(func(e ext.TerminalResizeEvent, ctx ext.Context) {
+    // e.Width, e.Height — re-render chrome at the new size
+})
+```
+
+`OnTerminalResize` also fires once at startup, so a handler can lay out
+immediately instead of waiting for the user to resize.
+
+This is a **function, not a field**, so it reports the live size. A long-lived
+goroutine (a ticking clock in a footer, say) that captured a `Context` still
+observes resizes; a struct field would freeze at the value copied when the
+handler was invoked.
+
+Note that multi-byte characters occupy more than one column — count display
+width, not bytes or runes, when fitting text to `width`.
+
 ## Status bar
 
 Custom status bar entries:
@@ -169,6 +290,44 @@ Custom status bar entries:
 ctx.SetStatus("mode", "Planning")
 ctx.RemoveStatus("mode")
 ```
+
+## Thinking level
+
+```go
+level := ctx.GetThinkingLevel()  // "off", "none", "minimal", "low", "medium", "high"
+
+api.OnThinkingLevelChange(func(e ext.ThinkingLevelChangeEvent, ctx ext.Context) {
+    // e.NewLevel, e.PreviousLevel string
+    // e.Source string — "user" (/thinking or shift+tab) or "model_fallback"
+})
+```
+
+Models without reasoning support report `"off"`. To distinguish "reasoning is
+switched off" from "this model cannot reason at all", pair it with
+`ctx.GetModelCapabilities("").Reasoning`.
+
+`Source` is `"model_fallback"` when Kit downgrades the level automatically
+because the newly selected model does not support the previous one.
+
+## Turn state
+
+```go
+api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
+    // e.State, e.Previous string — "working" or "idle"
+})
+```
+
+This is a **superset of `OnAgentStart`/`OnAgentEnd`**: it also covers work that
+never reaches the agent loop (shell commands run with `!`) and fires on every
+path back to idle, including cancellation and error.
+
+| Use | For |
+|-----|-----|
+| `OnTurnStateChange` | UI that tracks whether Kit is busy — a spinner, a turn timer |
+| `OnAgentStart` / `OnAgentEnd` | Agent turns specifically, plus their token usage and cost |
+
+Interactive TUI only — like `OnTerminalResize`, this does not fire in headless,
+ACP, or script mode.
 
 ## Shortcuts
 
@@ -183,6 +342,47 @@ api.RegisterShortcut(ext.ShortcutDef{
 })
 ```
 
+Handlers run in a goroutine, so they may call blocking APIs like
+`ctx.PromptSelect` without stalling the TUI.
+
+Run `/shortcuts` in the TUI to list every registered binding, grouped by the
+extension file that registered it.
+
+### Key names
+
+Keys are normalized at registration, so modifier order and casing do not
+matter — `"Ctrl+Shift+S"`, `"control+shift+s"` and `"shift+ctrl+s"` all resolve
+to the same binding. `control`, `option`/`opt`, `cmd`/`command` and `win` are
+accepted as aliases for `ctrl`, `alt`, `meta` and `super`.
+
+A shifted key can be written either way: `"shift+a"` and `"A"` both match the
+same press, as do `"shift+/"` and `"?"`. Common key-name spellings are folded
+too (`escape` → `esc`, `return` → `enter`, `pgdn`/`pagedown` → `pgdown`).
+
+A bare single character keeps its case, because `"A"` and `"a"` are genuinely
+different presses.
+
+### Reserved and shadowed keys
+
+Kit dispatches extension shortcuts early — before its own scrollback, selector
+and chord bindings — so a shortcut can claim almost any key. Two cases are
+handled specially:
+
+| Key | Behaviour |
+|-----|-----------|
+| `ctrl+c` | **Rejected.** Kit consumes it for cancel/quit before extensions are consulted, so the handler could never fire. The registration is dropped with a logged warning. |
+| `esc`, `ctrl+x`, `pgup`, `pgdown`, `ctrl+home`, `ctrl+end`, `shift+tab`, `enter`, `tab`, `up`, `down` | **Accepted with a warning.** The shortcut wins, shadowing Kit's built-in behaviour. |
+
+An armed `Ctrl+X` leader chord takes precedence over shortcuts, so binding a
+chord suffix such as `"s"` does not break `Ctrl+X s`.
+
+> **Prefer modifier combinations.** A bare character like `"s"` fires on every
+> press of that key outside a modal — including while you are typing a slash
+> command.
+
+Shortcuts do not fire while a modal prompt or overlay is open, or during
+message navigation.
+
 ## Overlays
 
 Modal dialogs with markdown content:
@@ -196,29 +396,65 @@ ctx.ShowOverlay(ext.OverlayConfig{
 
 ## Tool renderers
 
-Customize how specific tool calls are displayed in the TUI:
+Customize how specific tool calls are displayed in the TUI. `RenderHeader`
+replaces the parameter summary on the header line; `RenderBody` replaces the
+result body. Both receive the width they may draw into, and returning an empty
+string falls back to Kit's default rendering:
 
 ```go
 api.RegisterToolRenderer(ext.ToolRenderConfig{
-    ToolName: "bash",
-    Render: func(name, args, result string, isError bool) string {
-        return "$ " + args + "\n" + result
+    ToolName:    "bash",
+    DisplayName: "Shell",
+    RenderHeader: func(toolArgs string, width int) string {
+        return "$ " + toolArgs
+    },
+    RenderBody: func(toolResult string, isError bool, width int) string {
+        return toolResult
     },
 })
 ```
+
+Set `BorderColor` and/or `Background` (hex strings) to give the tool block its
+own stripe and backdrop. Tool blocks are otherwise unattributed, so the stripe
+appears only when asked for — it marks a tool as special rather than restyling
+every call:
+
+```go
+api.RegisterToolRenderer(ext.ToolRenderConfig{
+    ToolName:    "deploy",
+    BorderColor: "#c678dd",
+    Background:  "#1b1b2b",
+    RenderBody: func(result string, isError bool, width int) string {
+        return result
+    },
+})
+```
+
+Set `BodyMarkdown: true` to pass `RenderBody`'s output through the markdown
+renderer.
 
 ## Message renderers
 
-Custom rendering for assistant messages:
+Named renderers invoked explicitly from extension code via
+`ctx.RenderMessage(name, content)`:
 
 ```go
 api.RegisterMessageRenderer(ext.MessageRendererConfig{
-    Name: "custom",
-    Render: func(content string) string {
-        return ">> " + content
+    Name: "build-status",
+    Render: func(content string, width int) string {
+        return "▸ " + content
     },
 })
+
+ctx.RenderMessage("build-status", "all tests passed")
 ```
+
+> **Note:** the returned string is *not* emitted verbatim. In interactive mode
+> Kit re-wraps it to the content width and nests it inside a system message
+> block (gutter glyph plus indent), so box drawing that assumes full terminal
+> width is wrapped a second time. Size output to roughly `width-4` and prefer
+> inline styling over full-width frames. For output Kit uses as-is, use a
+> [widget with a `Render` callback](#custom-rendering).
 
 ## Editor interceptors
 
@@ -227,36 +463,74 @@ Handle key events and wrap the editor's rendering:
 ```go
 ctx.SetEditor(ext.EditorConfig{
     HandleKey: func(key, text string) ext.EditorKeyAction {
-        if key == "escape" {
-            return ext.EditorKeyAction{Handled: true}
+        if key == "esc" {
+            return ext.EditorKeyAction{Type: ext.EditorKeyConsumed}
         }
-        return ext.EditorKeyAction{Handled: false}
+        return ext.EditorKeyAction{Type: ext.EditorKeyPassthrough}
     },
 })
 ```
 
+`Type` is one of:
+
+| Type | Effect |
+|------|--------|
+| `ext.EditorKeyPassthrough` | Let the built-in editor handle the key normally. Any unrecognized `Type` behaves this way too, so a zero-value action passes through. |
+| `ext.EditorKeyConsumed` | The extension handled it; the editor never sees the key. |
+| `ext.EditorKeyRemap` | Replace the key with `RemappedKey` before the editor sees it. |
+| `ext.EditorKeySubmit` | Submit immediately, using `SubmitText` (or the current text when empty). |
+
+> **`HandleKey` runs synchronously on the TUI event loop.** Unlike a shortcut
+> handler, a blocking call here freezes the whole interface. Keep it fast and
+> hand slow work to a goroutine.
+
+The interceptor is the last hook before the editor, so it never sees keys an
+earlier stage already consumed: `ctrl+c`, any registered extension shortcut,
+`esc` while a turn is running, `ctrl+x` and its chord suffix, and the
+scrollback bindings such as `pgup`.
+
 ## Interactive prompts
 
-Select, confirm, input, and multi-select dialogs:
+Select, multi-select, confirm, and text input dialogs. Each blocks the calling
+goroutine until the user answers, and each returns a result struct whose
+`Cancelled` field is true if the user pressed ESC or the prompt was unavailable
+(non-interactive mode):
 
 ```go
 // Single select
-response := ctx.PromptSelect(ext.PromptSelectConfig{
-    Title:   "Choose a model",
+res := ctx.PromptSelect(ext.PromptSelectConfig{
+    Message: "Choose a model",
     Options: []string{"claude-sonnet", "gpt-4o", "llama3"},
 })
+if !res.Cancelled {
+    ctx.PrintInfo("picked " + res.Value)  // also res.Index
+}
+
+// Multi-select — Space toggles, a selects all, n clears, Enter confirms
+pick := ctx.PromptMultiSelect(ext.PromptMultiSelectConfig{
+    Message:         "Which checks should run?",
+    Options:         []string{"vet", "test", "lint"},
+    DefaultSelected: []int{0, 1},  // nil selects everything
+})
+if !pick.Cancelled {
+    ctx.PrintInfo(strings.Join(pick.Values, ", "))  // also pick.Indices
+}
 
 // Confirm
-confirmed := ctx.PromptConfirm(ext.PromptConfirmConfig{
-    Title: "Delete this file?",
+yes := ctx.PromptConfirm(ext.PromptConfirmConfig{
+    Message: "Delete this file?",
 })
 
 // Text input
 name := ctx.PromptInput(ext.PromptInputConfig{
-    Title:       "Enter project name",
+    Message:     "Enter project name",
     Placeholder: "my-project",
 })
 ```
+
+`PromptMultiSelect` returns both `Values` (the selected option text) and
+`Indices` (their zero-based positions), so you can map back to your own data
+without string matching.
 
 ## Options
 
@@ -347,7 +621,7 @@ response := ctx.Complete(ext.CompleteRequest{
 
 ## Themes
 
-Register and switch color themes at runtime:
+Register, switch, and read color themes at runtime:
 
 ```go
 // Register a custom theme
@@ -368,6 +642,57 @@ ctx.SetTheme("neon")
 // List all available themes
 names := ctx.ListThemes()
 ```
+
+### Reading the active theme
+
+`ctx.GetTheme()` reports the colors currently in effect, so a widget can follow
+the user's theme instead of hardcoding a palette. The light/dark variants are
+already resolved for the terminal's appearance and every slot is a `"#rrggbb"`
+string:
+
+```go
+theme := ctx.GetTheme()
+theme.Name     // "catppuccin" — "" when the derived default is in effect
+theme.Dark     // true when the dark variants were resolved
+theme.Accent   // "#89b4fa"
+```
+
+Widget `Render` output is used **verbatim**, so nothing styles it for you. Two
+helpers turn a theme color into an escape sequence:
+
+| Method | Description |
+|---|---|
+| `theme.ANSI(color, text)` | Truecolor foreground, auto-reset |
+| `theme.ANSIBold(color, text)` | Same, with the bold attribute |
+
+```go
+ctx.SetWidget(ext.WidgetConfig{
+    ID:        "build-status",
+    Placement: ext.WidgetAbove,
+    Content: ext.WidgetContent{
+        Render: func(width int) string {
+            th := ctx.GetTheme()          // read per frame, not cached
+            return th.ANSIBold(th.Accent, "Build") + "  " +
+                th.ANSI(th.Success, "passing")
+        },
+    },
+    Style: ext.WidgetStyle{BorderColor: ctx.GetTheme().Accent},
+})
+```
+
+An empty or malformed color returns the text unchanged, so a partially-defined
+theme degrades to plain output rather than leaking escape codes.
+
+`ThemeColors` carries the same field names as [`ThemeColorConfig`](/themes#themecolorconfig-fields),
+but as a single resolved string per slot rather than a light/dark pair — it is
+the read counterpart to the type you register with.
+
+> **Call `GetTheme()` inside `Render`, not once at setup.** `Render` runs on
+> every frame, so reading there means a `/theme` switch repaints in the new
+> colors automatically. `WidgetStyle.BorderColor`, by contrast, is captured when
+> the widget is set: to keep a border in sync, call `SetWidget` again when the
+> theme changes. There is no theme-change event, so poll `GetTheme().Accent`
+> from a goroutine if that matters.
 
 See [Themes](/themes) for the full theme file format, built-in themes, and color reference.
 
@@ -530,6 +855,10 @@ result := ctx.ResolveModelChain([]string{
 // Get capabilities for a specific model
 caps, err := ctx.GetModelCapabilities("anthropic/claude-sonnet-4")
 // caps.Provider, caps.ModelID, caps.ContextLimit, caps.Reasoning, caps.Streaming
+// caps.Pricing (see Model pricing below)
+
+// Pass an empty string for the model currently in use
+caps, err = ctx.GetModelCapabilities("")
 
 // Check if a model is available (provider exists)
 available := ctx.CheckModelAvailable("anthropic/claude-sonnet-4")  // bool
@@ -538,3 +867,35 @@ available := ctx.CheckModelAvailable("anthropic/claude-sonnet-4")  // bool
 provider := ctx.GetCurrentProvider()  // "anthropic"
 modelID := ctx.GetCurrentModelID()    // "claude-sonnet-4"
 ```
+
+### Model pricing
+
+`ModelCapabilities.Pricing` reports registry token costs in **US dollars per
+million tokens**, so a cost is `tokens * rate / 1_000_000`:
+
+```go
+caps, _ := ctx.GetModelCapabilities("")
+p := caps.Pricing
+// p.Input, p.Output           float64 — $ per 1M tokens
+// p.CacheRead, p.CacheWrite   float64 — valid only when the Has* flag is true
+// p.HasCacheRead, p.HasCacheWrite bool
+// p.Known                     bool
+```
+
+Always check `Known` before rendering a cost. It is `false` for local models and
+custom OpenAI-compatible endpoints, where every rate is zero — without the flag
+an unpriced model is indistinguishable from a free one. Likewise check
+`HasCacheRead` rather than assuming a zero `CacheRead` means cache reads are
+free.
+
+Computing prompt-cache savings:
+
+```go
+usage := ctx.GetSessionUsage()
+if p.Known && p.HasCacheRead {
+    saved := float64(usage.TotalCacheReadTokens) * (p.Input - p.CacheRead) / 1000000
+}
+```
+
+The same `Pricing` field is present on each entry from
+`ctx.GetAvailableModels()`.

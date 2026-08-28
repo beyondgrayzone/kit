@@ -837,13 +837,13 @@ func (a *App) RunOnceResultWithFiles(ctx context.Context, prompt string, files [
 // etc.) and is responsible for rendering them.
 //
 // Blocks until the step completes or ctx is cancelled.
-func (a *App) RunOnceWithDisplay(ctx context.Context, prompt string, eventFn func(tea.Msg)) error {
+func (a *App) RunOnceWithDisplay(ctx context.Context, prompt string, eventFn func(Event)) error {
 	return a.RunOnceWithDisplayAndFiles(ctx, prompt, eventFn, nil)
 }
 
 // RunOnceWithDisplayAndFiles executes a single agent step synchronously with
 // optional multimodal file attachments, sending intermediate display events.
-func (a *App) RunOnceWithDisplayAndFiles(ctx context.Context, prompt string, eventFn func(tea.Msg), files []kit.LLMFilePart) error {
+func (a *App) RunOnceWithDisplayAndFiles(ctx context.Context, prompt string, eventFn func(Event), files []kit.LLMFilePart) error {
 	stepCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -995,7 +995,7 @@ func (a *App) runQueueBatch(items []queueItem) {
 	prog := a.program
 	a.mu.Unlock()
 
-	eventFn := func(msg tea.Msg) {
+	eventFn := func(msg Event) {
 		if prog != nil {
 			prog.Send(msg)
 		}
@@ -1029,16 +1029,22 @@ func (a *App) runQueueBatch(items []queueItem) {
 // executeStep runs a single agentic step by delegating to the SDK's
 // PromptResult() (or PromptResultWithFiles for multimodal), which handles
 // session persistence, hooks, extension events, and the generation loop.
-func (a *App) executeStep(ctx context.Context, prompt string, eventFn func(tea.Msg), files []kit.LLMFilePart) (*kit.TurnResult, error) {
+func (a *App) executeStep(ctx context.Context, prompt string, eventFn func(Event), files []kit.LLMFilePart) (*kit.TurnResult, error) {
 	// Test hook: bypass SDK entirely.
 	if a.opts.PromptFunc != nil {
 		return a.opts.PromptFunc(ctx, prompt)
 	}
 
-	sendFn := func(msg tea.Msg) {
+	sendFn := func(msg Event) {
 		if eventFn != nil {
 			eventFn(msg)
 		}
+	}
+
+	// Reset the per-turn usage accumulator. UpdateUsage sums every step in a
+	// turn, so without this the previous turn's tokens carry over.
+	if a.opts.UsageTracker != nil {
+		a.opts.UsageTracker.StartTurn()
 	}
 
 	// Subscribe to SDK events for TUI rendering and per-step usage updates.
@@ -1074,7 +1080,7 @@ func (a *App) executeStep(ctx context.Context, prompt string, eventFn func(tea.M
 // executeBatch runs a batch of queue items as a single agent step by delegating
 // to the SDK's PromptResultWithMessages(), which handles session persistence,
 // hooks, extension events, and the generation loop.
-func (a *App) executeBatch(ctx context.Context, items []queueItem, eventFn func(tea.Msg)) (*kit.TurnResult, error) {
+func (a *App) executeBatch(ctx context.Context, items []queueItem, eventFn func(Event)) (*kit.TurnResult, error) {
 	// Test hook: bypass SDK entirely (single item only for test compatibility).
 	if a.opts.PromptFunc != nil {
 		if len(items) == 1 {
@@ -1084,10 +1090,16 @@ func (a *App) executeBatch(ctx context.Context, items []queueItem, eventFn func(
 		return a.opts.PromptFunc(ctx, items[0].Prompt)
 	}
 
-	sendFn := func(msg tea.Msg) {
+	sendFn := func(msg Event) {
 		if eventFn != nil {
 			eventFn(msg)
 		}
+	}
+
+	// Reset the per-turn usage accumulator. UpdateUsage sums every step in a
+	// turn, so without this the previous turn's tokens carry over.
+	if a.opts.UsageTracker != nil {
+		a.opts.UsageTracker.StartTurn()
 	}
 
 	// Subscribe to SDK events for TUI rendering and per-step usage updates.
@@ -1156,14 +1168,14 @@ func (a *App) executeBatch(ctx context.Context, items []queueItem, eventFn func(
 	return result, nil
 }
 
-// sendEvent sends a tea.Msg to the registered program if one is set.
+// sendEvent sends an app Event to the registered program if one is set.
 // Must NOT be called with a.mu held (to avoid deadlock with the program).
-func (a *App) sendEvent(msg tea.Msg) {
+func (a *App) sendEvent(e Event) {
 	a.mu.Lock()
 	prog := a.program
 	a.mu.Unlock()
 	if prog != nil {
-		prog.Send(msg)
+		prog.Send(e)
 	}
 }
 
@@ -1175,7 +1187,7 @@ func (a *App) sendEvent(msg tea.Msg) {
 // false, such events are answered "cancelled" immediately instead of being
 // dispatched — dispatching into a void would leave the SDK blocked forever.
 // Returns an unsubscribe function that removes all listeners.
-func (a *App) subscribeSDKEvents(sendFn func(tea.Msg), stepUsageSeen *atomic.Bool, canPrompt bool) func() {
+func (a *App) subscribeSDKEvents(sendFn func(Event), stepUsageSeen *atomic.Bool, canPrompt bool) func() {
 	k := a.opts.Kit
 	var unsubs []func()
 
@@ -1269,7 +1281,7 @@ func (a *App) subscribeSDKEvents(sendFn func(tea.Msg), stepUsageSeen *atomic.Boo
 //
 // Separated from subscribeSDKEvents so tests can exercise it directly via a
 // stubbed sendFn without standing up a full Kit.
-func (a *App) handleTurnEnd(ev kit.TurnEndEvent, sendFn func(tea.Msg)) {
+func (a *App) handleTurnEnd(ev kit.TurnEndEvent, sendFn func(Event)) {
 	if sendFn == nil {
 		return
 	}
@@ -1503,6 +1515,19 @@ func (a *App) NotifyContentReload() {
 	}
 }
 
+// NotifyThemeChange sends a ThemeChangedEvent to the TUI so components holding
+// theme-derived styling repaint. Called after the active theme is replaced
+// from outside the TUI, such as by an extension's ctx.SetTheme.
+// In non-interactive mode this is a no-op.
+func (a *App) NotifyThemeChange() {
+	a.mu.Lock()
+	prog := a.program
+	a.mu.Unlock()
+	if prog != nil {
+		prog.Send(ThemeChangedEvent{})
+	}
+}
+
 // NotifyMCPToolsReady sends an MCPToolsReadyEvent to the TUI so it refreshes
 // tool names and MCP tool count from provider callbacks. Called when background
 // MCP tool loading completes. In non-interactive mode this is a no-op.
@@ -1531,12 +1556,23 @@ func (a *App) NotifyMCPServerLoaded(serverName string, toolCount int, err error)
 	}
 }
 
-// SendEvent sends a tea.Msg to the registered program. Safe to call from
-// any goroutine. No-op when no program is registered.
+// SendUIMessage forwards a display-layer message straight to the registered
+// program. Safe to call from any goroutine; a no-op when no program is
+// registered.
+//
+// Unlike the app's own Event fan-out, this is a transport escape hatch for the
+// UI to re-inject its own internal messages (goroutine results that must reach
+// the Bubble Tea Update loop without going through a stalling tea.Cmd). The app
+// treats the payload as opaque and does not interpret it.
 //
 // Satisfies ui.AppController.
-func (a *App) SendEvent(msg tea.Msg) {
-	a.sendEvent(msg)
+func (a *App) SendUIMessage(msg tea.Msg) {
+	a.mu.Lock()
+	prog := a.program
+	a.mu.Unlock()
+	if prog != nil {
+		prog.Send(msg)
+	}
 }
 
 // SendPromptRequest sends a PromptRequestEvent to the TUI so the user can
@@ -1636,7 +1672,7 @@ func (a *App) PrintBlockFromExtension(opts extensions.PrintBlockOpts) {
 //
 // sendFn is called with a UsageUpdatedEvent to trigger a TUI re-render so
 // the updated values are visible immediately.
-func (a *App) recordStepUsage(ev kit.StepUsageEvent, stepUsageSeen *atomic.Bool, sendFn func(tea.Msg)) {
+func (a *App) recordStepUsage(ev kit.StepUsageEvent, stepUsageSeen *atomic.Bool, sendFn func(Event)) {
 	hasUsage := ev.InputTokens > 0 || ev.OutputTokens > 0 || ev.CacheReadTokens > 0 || ev.CacheWriteTokens > 0
 	if a.opts.Debug {
 		log.Printf("[DEBUG] recordStepUsage: hasUsage=%v input=%d output=%d cacheRead=%d cacheWrite=%d",

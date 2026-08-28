@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"charm.land/fantasy"
-
 	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/agent"
 	"github.com/mark3labs/kit/internal/config"
@@ -26,7 +25,6 @@ import (
 	"github.com/mark3labs/kit/internal/skills"
 	"github.com/mark3labs/kit/internal/skilltool"
 	"github.com/mark3labs/kit/internal/tools"
-
 	"github.com/spf13/viper"
 )
 
@@ -77,9 +75,11 @@ type Kit struct {
 	// When false, per-model system prompts from modelSettings/customModels
 	// can replace the default prompt on model switch.
 	hasCustomSystemPrompt bool
+
 	// systemPromptSource holds the raw configured value (file path or text)
 	// when hasCustomSystemPrompt is true; empty when the built-in default is in use.
 	systemPromptSource string
+
 	// basePrompt holds the resolved base system prompt text (post file-load,
 	// pre runtime-context composition) captured during New. Used by
 	// RefreshSystemPrompt to recompose after skills/context-file mutations.
@@ -232,7 +232,6 @@ func (m *Kit) RemoveTools(names ...string) error {
 	defer m.promptOptsMu.Unlock()
 
 	cur := m.runtimeExtraTools
-
 	drop := make(map[string]struct{}, len(names))
 	for _, n := range names {
 		drop[n] = struct{}{}
@@ -516,6 +515,7 @@ func (m *Kit) ListMCPPrompts() []MCPPrompt {
 	if len(internal) == 0 {
 		return nil
 	}
+
 	result := make([]MCPPrompt, len(internal))
 	for i, p := range internal {
 		args := make([]MCPPromptArgument, len(p.Arguments))
@@ -547,6 +547,7 @@ func (m *Kit) GetMCPPrompt(ctx context.Context, serverName, promptName string, a
 	if err != nil {
 		return nil, err
 	}
+
 	msgs := make([]MCPPromptMessage, len(internal.Messages))
 	for i, msg := range internal.Messages {
 		var fileParts []LLMFilePart
@@ -563,6 +564,7 @@ func (m *Kit) GetMCPPrompt(ctx context.Context, serverName, promptName string, a
 			FileParts: fileParts,
 		}
 	}
+
 	return &MCPPromptResult{
 		Description: internal.Description,
 		Messages:    msgs,
@@ -609,6 +611,7 @@ func (m *Kit) ListMCPResources() []MCPResource {
 	if len(internal) == 0 {
 		return nil
 	}
+
 	result := make([]MCPResource, len(internal))
 	for i, r := range internal {
 		result[i] = MCPResource{
@@ -679,7 +682,6 @@ func (m *Kit) GetStructuredMessages() []StructuredMessage {
 	if m.session == nil {
 		return nil
 	}
-
 	branch := m.session.GetCurrentBranch()
 	var results []StructuredMessage
 	for _, entry := range branch {
@@ -708,7 +710,6 @@ func iterBranchMessages[T any](tm *session.TreeManager, fn func(*session.Message
 	if tm == nil {
 		return nil
 	}
-
 	branch := tm.GetBranch("")
 	var results []T
 	for _, entry := range branch {
@@ -821,7 +822,6 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 	if err := m.agent.SetModel(ctx, cfg); err != nil {
 		return err
 	}
-
 	m.modelString = modelString
 
 	// Update extension context's Model field.
@@ -872,7 +872,7 @@ func (m *Kit) composeSystemPrompt(basePrompt string) string {
 
 	// Inject AGENTS.md content as project context.
 	for _, cf := range contextFiles {
-		pb.WithSection("", fmt.Sprintf("Instructions from: %s\n\n%s", cf.Path, cf.Content))
+		pb.WithSection("", fmt.Sprintf("Instructions from: %s\n%s", cf.Path, cf.Content))
 	}
 
 	// Inject skills metadata.
@@ -889,10 +889,23 @@ func (m *Kit) composeSystemPrompt(basePrompt string) string {
 	return pb.Build()
 }
 
+// GetCurrentModel returns the fully qualified "provider/model" string for the
+// model currently in use, as resolved from configuration. Unlike the model
+// name carried on the extension Context — which is a bare display ID — this is
+// always registry-addressable, so it can be passed straight to
+// GetModelCapabilities.
+func (m *Kit) GetCurrentModel() string {
+	if m == nil || m.v == nil {
+		return ""
+	}
+	return m.v.GetString("model")
+}
+
 // GetAvailableModels returns a list of known models from the registry. Each
-// entry includes provider, model ID, context limit, and whether the model
-// supports reasoning. This is an advisory list — models not in the registry
-// can still be used by specifying their provider/model string.
+// entry includes provider, model ID, context/output limits, whether the model
+// supports reasoning, and its token pricing. This is an advisory list — models
+// not in the registry can still be used by specifying their provider/model
+// string.
 func (m *Kit) GetAvailableModels() []extensions.ModelInfoEntry {
 	registry := models.GetGlobalRegistry()
 	var result []extensions.ModelInfoEntry
@@ -909,6 +922,7 @@ func (m *Kit) GetAvailableModels() []extensions.ModelInfoEntry {
 				ContextLimit: info.Limit.Context,
 				OutputLimit:  info.Limit.Output,
 				Reasoning:    info.Reasoning,
+				Pricing:      modelPricingFrom(&info),
 			})
 		}
 	}
@@ -1009,7 +1023,6 @@ func (m *Kit) ExecuteCompletion(ctx context.Context, req extensions.CompleteRequ
 	if providerOps != nil {
 		agentOpts = append(agentOpts, fantasy.WithProviderOptions(providerOps))
 	}
-
 	completionAgent := fantasy.NewAgent(llmModel, agentOpts...)
 
 	// Convert extension SessionMessage history to LLM message slice.
@@ -1180,6 +1193,16 @@ type Options struct {
 	// If both DisableCoreTools is true and Tools is empty, the agent
 	// will have no tools (useful for simple chat completions).
 	DisableCoreTools bool
+
+	// BashTimeout sets the default per-call timeout (in seconds) for the bash
+	// tool, applied when the model does not specify one. Zero falls back to
+	// the "bash-timeout" config value, then the built-in default (120s).
+	BashTimeout int
+
+	// BashMaxTimeout caps the maximum timeout (in seconds) a bash tool call
+	// may request via its timeout argument. Zero falls back to the
+	// "bash-max-timeout" config value, then the built-in default (600s).
+	BashMaxTimeout int
 
 	// Session configuration
 	SessionDir  string // Base directory for session discovery (default: cwd)
@@ -1363,12 +1386,16 @@ type CLIOptions struct {
 	// MCPConfig is a pre-loaded MCP config. When set, LoadAndValidateConfig
 	// is skipped during Kit creation.
 	MCPConfig *config.Config
+
 	// ShowSpinner shows a loading spinner for Ollama models.
 	ShowSpinner bool
+
 	// SpinnerFunc provides the spinner implementation (nil = no spinner).
 	SpinnerFunc SpinnerFunc
+
 	// UseBufferedLogger buffers debug messages for later display.
 	UseBufferedLogger bool
+
 	// ProgressReaderFunc wraps an io.Reader with a progress display for
 	// long-running operations such as Ollama model pulls. The returned
 	// io.ReadCloser must be closed when done. When nil, progress is not
@@ -1398,11 +1425,9 @@ func InitTreeSession(opts *Options) (*TreeManager, error) {
 	if opts.NoSession {
 		return session.InMemoryTreeSession(sessionDir), nil
 	}
-
 	if opts.Continue {
 		return session.ContinueRecent(sessionDir)
 	}
-
 	if opts.SessionPath != "" {
 		return session.OpenTreeSession(opts.SessionPath)
 	}
@@ -1458,6 +1483,8 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		toolList              []string
 		maxSteps              int
 		streaming             bool
+		bashTimeout           int
+		bashMaxTimeout        int
 		hasCustomSystemPrompt bool
 		systemPromptSource    string
 		capturedBasePrompt    string
@@ -1496,6 +1523,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		if opts.MaxSteps > 0 {
 			v.Set("max-steps", opts.MaxSteps)
 		}
+
 		// Only override streaming when the caller explicitly set it. Otherwise
 		// leave the precedence chain (env → config → default true) untouched so a
 		// zero-valued Options does not silently force stream=false.
@@ -1572,10 +1600,12 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		if skillsDir == "" {
 			skillsDir = v.GetString("skills-dir")
 		}
+
 		if !noSkills {
 			mergedOpts := *opts
 			mergedOpts.Skills = skillPaths
 			mergedOpts.SkillsDir = skillsDir
+
 			var err error
 			loadedSkills, err = loadSkills(&mergedOpts)
 			if err != nil {
@@ -1664,7 +1694,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 
 			// Inject AGENTS.md content as project context.
 			for _, cf := range contextFiles {
-				pb.WithSection("", fmt.Sprintf("Instructions from: %s\n\n%s", cf.Path, cf.Content))
+				pb.WithSection("", fmt.Sprintf("Instructions from: %s\n%s", cf.Path, cf.Content))
 			}
 
 			// Inject skills metadata (name + description + location).
@@ -1699,9 +1729,11 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		if providerConfig.MaxTokens == 0 && opts.MaxTokens == 0 {
 			providerConfig.MaxTokens = sdkDefaultMaxTokens
 		}
+
 		modelString = v.GetString("model")
 		debug = v.GetBool("debug")
 		noExtensions = opts.NoExtensions || v.GetBool("no-extensions")
+
 		toolList = opts.CoreToolList
 		if toolList == nil {
 			var err error
@@ -1711,13 +1743,24 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			}
 		}
 		toolList = handleCoreToolList(toolList, opts.DisableCoreTools || v.GetBool("no-core-tools"))
+
 		maxSteps = v.GetInt("max-steps")
 		streaming = v.GetBool("stream")
+
+		bashTimeout = opts.BashTimeout
+		if bashTimeout == 0 {
+			bashTimeout = v.GetInt("bash-timeout")
+		}
+		bashMaxTimeout = opts.BashMaxTimeout
+		if bashMaxTimeout == 0 {
+			bashMaxTimeout = v.GetInt("bash-max-timeout")
+		}
 
 		return nil
 	}(); err != nil {
 		return nil, err
 	}
+
 	// ---- config snapshot complete — heavy I/O below ----
 
 	// Load MCP configuration. Use pre-loaded config if provided directly,
@@ -1796,6 +1839,8 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		CoreToolList:      toolList,
 		ExtraTools:        extraTools,
 		NamedAgents:       namedAgentSpecs(namedAgents),
+		BashTimeout:       bashTimeout,
+		BashMaxTimeout:    bashMaxTimeout,
 		ToolWrapper:       hookToolWrapper(beforeToolCall, afterToolResult),
 		ProviderConfig:    providerConfig,
 		Debug:             debug,
@@ -2000,6 +2045,7 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 		}
 	}
 	m.runtimeMu.RUnlock()
+
 	if skillPath == "" {
 		return prompt
 	}
@@ -2011,23 +2057,23 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 	}
 
 	baseDir := filepath.Dir(loaded.Path)
+
 	var buf strings.Builder
 	fmt.Fprintf(&buf, "<skill name=%q location=%q>\n", loaded.Name, loaded.Path)
-	fmt.Fprintf(&buf, "References are relative to %s.\n\n", baseDir)
+	fmt.Fprintf(&buf, "References are relative to %s.\n", baseDir)
 	buf.WriteString(loaded.Content)
 
 	// Enumerate bundled resources (scripts/, references/, assets/) so the model
 	// knows what it can read without listing the directory itself.
 	if res := skills.FormatResources(loaded.Resources()); res != "" {
-		buf.WriteString("\n\n")
+		buf.WriteString("\n")
 		buf.WriteString(res)
 	}
-
 	buf.WriteString("\n</skill>")
 
 	args = strings.TrimSpace(args)
 	if args != "" {
-		buf.WriteString("\n\n")
+		buf.WriteString("\n")
 		buf.WriteString(args)
 	}
 
@@ -2060,11 +2106,13 @@ func loadSkills(opts *Options) ([]*skills.Skill, error) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
+
 	user := skills.LoadUserSkills()
 	project := skills.LoadProjectSkills(cwd)
 	if len(project) > 0 && !projectSkillsTrusted(opts, cwd, len(project)) {
 		project = nil
 	}
+
 	return skills.Combine(user, project), nil
 }
 
@@ -2079,7 +2127,6 @@ func loadExplicitSkills(paths []string) ([]*skills.Skill, error) {
 		if err != nil {
 			return nil, fmt.Errorf("skill path %s: %w", p, err)
 		}
-
 		if info.IsDir() {
 			dirSkills, err := skills.LoadSkillsFromDir(p)
 			if err != nil {
@@ -2103,7 +2150,6 @@ func loadExplicitSkills(paths []string) ([]*skills.Skill, error) {
 			}
 		}
 	}
-
 	return all, nil
 }
 
@@ -2278,12 +2324,16 @@ type SubagentConfig struct {
 type SubagentResult struct {
 	// Response is the subagent's final text response.
 	Response string
+
 	// SessionID is the subagent's session identifier (for replay).
 	SessionID string
+
 	// StopReason is the LLM's finish reason for the subagent's final turn.
 	StopReason string
+
 	// Usage contains token usage from the subagent's run.
 	Usage *LLMUsage
+
 	// Elapsed is the total execution time.
 	Elapsed time.Duration
 }
@@ -2308,6 +2358,7 @@ func inheritProviderConfig(child *Options, v *viper.Viper) {
 	child.ProviderWire = v.GetString("provider-wire")
 	child.TLSSkipVerify = v.GetBool("tls-skip-verify")
 	child.ThinkingLevel = v.GetString("thinking-level")
+
 	if v.IsSet("max-tokens") {
 		child.MaxTokens = v.GetInt("max-tokens")
 	}
@@ -2503,11 +2554,13 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// programmatic Options or runtime setters (e.g. SetThinkingLevel) would
 	// otherwise be lost.
 	inheritProviderConfig(childOpts, m.v)
+
 	// A per-subagent temperature (explicit or from a named agent definition)
 	// overrides whatever the parent's config store provided.
 	if cfg.Temperature != nil {
 		childOpts.Temperature = cfg.Temperature
 	}
+
 	// Propagate the parent's MCP task configuration so a child subagent
 	// invoking long-running MCP tools observes the same per-server modes,
 	// timeouts, and progress callback as the parent. Without this, child
@@ -2515,6 +2568,7 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// polling and no progress feedback even when the parent had configured
 	// custom values.
 	inheritMCPTaskOptions(childOpts, m.opts)
+
 	child, err := New(ctx, childOpts)
 	if err != nil {
 		return &SubagentResult{Elapsed: time.Since(start)}, fmt.Errorf("failed to create subagent: %w", err)
@@ -2550,7 +2604,6 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// Run the prompt.
 	result, err := child.PromptResult(ctx, cfg.Prompt)
 	elapsed := time.Since(start)
-
 	if err != nil {
 		return &SubagentResult{Elapsed: elapsed}, err
 	}
@@ -2579,6 +2632,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 	// Capture the per-turn stream collector (set by runTurn) so streamed
 	// deltas are recorded into TurnResult.Stream in emit order.
 	collector := streamCollectorFromContext(ctx)
+
 	// Create a per-turn steer channel and attach it to the context so the
 	// agent's PrepareStep can inject steering messages between steps.
 	steerCh := make(chan agent.SteerMessage, 16)
@@ -2602,6 +2656,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			}
 		}
 	}()
+
 	ctx = agent.ContextWithSteerCh(ctx, steerCh)
 	ctx = agent.ContextWithSteerConsumed(ctx, func(count int) {
 		m.events.emit(SteerConsumedEvent{Count: count})
@@ -2620,6 +2675,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 		if listeners := m.getSubagentListenerSet(req.ToolCallID); listeners != nil {
 			onEvent = listeners.emit
 		}
+
 		result, err := m.Subagent(spawnCtx, SubagentConfig{
 			Prompt:       req.Prompt,
 			Agent:        req.Agent,
@@ -2631,9 +2687,11 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 			Tools:        m.GetToolsForSubagent(),
 		})
 		m.cleanupSubagentListeners(req.ToolCallID)
+
 		if result == nil {
 			return &core.SubagentSpawnResult{Error: err}, err
 		}
+
 		sr := &core.SubagentSpawnResult{
 			Response:  result.Response,
 			Error:     err,
@@ -2803,7 +2861,6 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 				ToolCallID: toolCallID,
 			})
 		},
-
 		// New callbacks for previously unwired agent lifecycle events.
 		OnStepStart: func(stepNumber int) {
 			m.events.emit(StepStartEvent{StepNumber: stepNumber})
@@ -3018,6 +3075,7 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 		// in completedStepMessages, so there are no orphaned entries that
 		// would break subsequent API requests.
 		m.persistGenerationRemainder(result, sentCount)
+
 		m.events.emit(TurnEndEvent{Error: err})
 		// Run AfterTurn hooks even on error.
 		m.afterTurn.run(AfterTurnHook{Error: err})
@@ -3045,7 +3103,6 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 	}
 
 	stopReason := result.StopReason
-
 	m.events.emit(MessageEndEvent{Content: responseText})
 	m.events.emit(TurnEndEvent{Response: responseText, StopReason: stopReason})
 
@@ -3059,8 +3116,10 @@ func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, pr
 		SessionID:  m.GetSessionID(),
 		Messages:   result.ConversationMessages,
 	}
+
 	totalUsage := result.TotalUsage
 	turnResult.TotalUsage = &totalUsage
+
 	if result.FinalResponse != nil {
 		finalUsage := result.FinalResponse.Usage
 		turnResult.FinalUsage = &finalUsage
@@ -3122,7 +3181,6 @@ func (m *Kit) FollowUp(ctx context.Context, text string) (string, error) {
 	if len(m.session.GetMessages()) == 0 {
 		return "", fmt.Errorf("cannot follow up: no previous messages")
 	}
-
 	if text == "" {
 		text = "Continue."
 	}
@@ -3162,6 +3220,7 @@ func (m *Kit) InjectSteerWithFiles(message string, files []LLMFilePart) {
 	if ch == nil {
 		return
 	}
+
 	select {
 	case ch <- agent.SteerMessage{Text: message, Files: files}:
 	default:
@@ -3247,11 +3306,13 @@ type PromptOptions struct {
 func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(), error) {
 	needsModelRebuild := opts.Model != "" || opts.ThinkingLevel != "" ||
 		opts.ProviderURL != "" || opts.ProviderAPIKey != ""
+
 	if !needsModelRebuild && len(opts.ExtraTools) == 0 {
 		return func() {}, nil
 	}
 
 	m.promptOptsMu.Lock()
+
 	var restores []func()
 	restore := func() {
 		for i := len(restores) - 1; i >= 0; i-- {
@@ -3293,6 +3354,7 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 		if targetModel == "" {
 			targetModel = prevModel
 		}
+
 		if err := m.SetModel(ctx, targetModel); err != nil {
 			// Revert config keys we may have set, then unwind prior restores.
 			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
@@ -3301,6 +3363,7 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 			restore()
 			return nil, err
 		}
+
 		restores = append(restores, func() {
 			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
 			restoreViperString(m.v, "provider-url", prevURL, prevURLSet)
@@ -3519,13 +3582,16 @@ func (m *Kit) CloseContext(ctx context.Context) error {
 	if m.extRunner != nil && m.extRunner.HasHandlers(extensions.SessionShutdown) {
 		_, _ = m.extRunner.Emit(extensions.SessionShutdownEvent{})
 	}
+
 	if m.session != nil {
 		_ = m.session.Close()
 	}
+
 	// Release the OAuth callback port if we own the handler.
 	if closer, ok := m.authHandler.(interface{ Close() error }); ok {
 		_ = closer.Close()
 	}
+
 	err := m.agent.Close()
 	if ctxErr := ctx.Err(); ctxErr != nil && err == nil {
 		return ctxErr

@@ -62,24 +62,6 @@ func knightRiderFrames() []string {
 	return frames
 }
 
-// streamSpinnerTickMsg is the internal tick message that drives the KITT-style
-// spinner animation inside StreamComponent. The generation field ties each tick
-// to the spinner session that created it so that stale ticks from a previous
-// start/stop cycle are silently discarded instead of creating a second
-// concurrent tick loop (which doubles the animation speed).
-type streamSpinnerTickMsg struct {
-	generation uint64
-}
-
-// streamSpinnerTickCmd returns a tea.Cmd that fires streamSpinnerTickMsg at the
-// KITT animation frame rate (14 fps). The generation parameter is embedded in
-// the message so the receiver can verify it matches the current spinner session.
-func streamSpinnerTickCmd(generation uint64) tea.Cmd {
-	return tea.Tick(time.Second/14, func(_ time.Time) tea.Msg {
-		return streamSpinnerTickMsg{generation: generation}
-	})
-}
-
 // streamFlushTickMsg fires when it's time to commit pending chunks to the
 // main content builders and trigger a re-render. This coalesces rapid
 // streaming chunks into fewer expensive markdown re-renders.
@@ -129,28 +111,24 @@ const (
 //   - Parent calls Reset() between agent steps to clear state.
 //   - Content is displayed via StreamingMessageItem in the ScrollList.
 //   - StreamComponent never calls tea.Quit.
+//   - The spinner schedules nothing: it advances when the parent's shared
+//     frame clock hands it a beat, and keeps that clock alive by reporting
+//     IsSpinning.
 //
 // Events handled:
-//   - app.SpinnerEvent{Show:true}  → start spinner tick loop
+//   - app.SpinnerEvent{Show:true}  → raise the spinner
 //   - app.StreamChunkEvent         → append text
 //   - app.ToolExecutionEvent       → show execution label on spinner
+//   - frameTickMsg                 → advance the spinner animation
 type StreamComponent struct {
 	// phase tracks whether the component is idle or active.
 	phase streamPhase
 
-	// spinning is true while the KITT animation tick loop is running.
-	// It is orthogonal to whether streaming text is present: the spinner
-	// remains visible alongside streaming text until Reset().
+	// spinning is true while the KITT animation is running. It is orthogonal
+	// to whether streaming text is present: the spinner remains visible
+	// alongside streaming text until Reset(). AppModel reads it, through
+	// IsSpinning, to decide whether the shared frame clock should keep running.
 	spinning bool
-
-	// spinnerGeneration is incremented each time a new spinner tick loop
-	// is started. Tick messages carry the generation they were created for;
-	// if a tick's generation doesn't match the current one, it is a stale
-	// tick from a previous start/stop cycle and is silently discarded.
-	// This prevents multiple concurrent tick loops from accumulating when
-	// the spinner is rapidly stopped and restarted (e.g. SpinnerEvent
-	// hide → ToolExecutionEvent start before the old tick fires).
-	spinnerGeneration uint64
 
 	// spinnerFrames are the pre-rendered KITT animation frames.
 	spinnerFrames []string
@@ -158,8 +136,8 @@ type StreamComponent struct {
 	// spinnerFrame is the current frame index.
 	spinnerFrame int
 
-	// activeTools maps ToolCallID -> display label for currently running tools.
-	activeTools map[string]string
+	// activeTools maps ToolCallID -> descriptor for currently running tools.
+	activeTools map[string]activeTool
 
 	// activeToolOrder preserves deterministic display order for active tools.
 	activeToolOrder []string
@@ -250,7 +228,6 @@ func (s *StreamComponent) SetHeight(h int) {
 func (s *StreamComponent) Reset() {
 	s.phase = streamPhaseIdle
 	s.spinning = false
-	s.spinnerGeneration++ // invalidate any in-flight tick commands
 	s.spinnerFrame = 0
 	s.activeTools = nil
 	s.activeToolOrder = nil
@@ -333,34 +310,26 @@ func (s *StreamComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.renderer.SetWidth(s.width)
 		}
 
-	case streamSpinnerTickMsg:
-		// Only continue the tick loop if this tick belongs to the current
-		// spinner session. Stale ticks from a previous start/stop cycle
-		// are silently dropped, preventing duplicate concurrent tick loops
-		// that would double (or worse) the animation speed.
-		if s.spinning && msg.generation == s.spinnerGeneration {
+	case frameTickMsg:
+		// One beat of the shared animation clock, subdivided to the spinner's
+		// own rate. Nothing is scheduled here: AppModel owns the loop and keeps
+		// it alive for as long as IsSpinning reports there is something to
+		// animate.
+		if s.spinning && msg.due(frameEverySpinner) {
 			s.spinnerFrame++
-			return s, streamSpinnerTickCmd(s.spinnerGeneration)
 		}
-		// Spinning stopped or generation mismatch; let the tick loop die.
-
 	// ── App-layer events ──────────────────────────────────────────────────
 
 	case app.SpinnerEvent:
 		if msg.Show && !s.spinning {
 			s.phase = streamPhaseActive
 			s.spinning = true
-			s.spinnerGeneration++ // new session; invalidate any stale ticks
 			s.spinnerFrame = 0
 			if s.timestamp.IsZero() {
 				s.timestamp = time.Now()
 			}
-			return s, streamSpinnerTickCmd(s.spinnerGeneration)
 		} else if !msg.Show && s.spinning {
 			s.spinning = false
-			// Bump generation so any in-flight tick from this session is
-			// discarded if spinning is restarted before it fires.
-			s.spinnerGeneration++
 		}
 
 	case streamFlushTickMsg:
@@ -424,7 +393,7 @@ func (s *StreamComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.IsStarting {
 			if s.activeTools == nil {
-				s.activeTools = make(map[string]string)
+				s.activeTools = make(map[string]activeTool)
 			}
 			if _, exists := s.activeTools[toolID]; !exists {
 				s.activeToolOrder = append(s.activeToolOrder, toolID)
@@ -433,13 +402,15 @@ func (s *StreamComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.ToolName == "subagent" {
 				agentName = extractAgentNameFromArgs(msg.ToolArgs)
 			}
-			s.activeTools[toolID] = formatToolExecutionMessage(msg.ToolName, agentName)
+			s.activeTools[toolID] = activeTool{
+				name:      msg.ToolName,
+				args:      msg.ToolArgs,
+				agentName: agentName,
+			}
 			s.spinnerFrame = 0
 			if !s.spinning {
 				s.phase = streamPhaseActive
 				s.spinning = true
-				s.spinnerGeneration++ // new session; invalidate stale ticks
-				return s, streamSpinnerTickCmd(s.spinnerGeneration)
 			}
 		} else {
 			if s.activeTools != nil {
@@ -528,30 +499,39 @@ func (s *StreamComponent) HasReasoning() bool {
 	return s.reasoningContent.Len() > 0 || s.pendingReasoning.Len() > 0
 }
 
-// SpinnerView returns the rendered spinner line for the parent to embed in the
-// status bar. Returns "" when the spinner is not active.
-func (s *StreamComponent) SpinnerView() string {
+// ActivityDot returns just the animated indicator glyph, without any label.
+// Returns "" when the spinner is not running.
+func (s *StreamComponent) ActivityDot() string {
 	if !s.spinning {
 		return ""
 	}
-	frame := s.spinnerFrames[s.spinnerFrame%len(s.spinnerFrames)]
-	tools := s.activeToolDisplays()
-	if len(tools) == 0 {
-		return "  " + frame
-	}
-	theme := GetTheme()
-	msgStyle := lipgloss.NewStyle().
-		Foreground(theme.Text).
-		Italic(true)
+	return s.spinnerFrames[s.spinnerFrame%len(s.spinnerFrames)]
+}
 
-	// Format active tools list
-	var toolsMsg string
-	if len(tools) == 1 {
-		toolsMsg = tools[0]
-	} else {
-		toolsMsg = "Running: " + strings.Join(tools, ", ")
+// ActivityPhrase returns a present-tense description of what the agent is
+// currently doing, for the activity row. Concurrent tool calls collapse to a
+// count so the row stays a single line; a turn with no tool in flight reports
+// that the model is thinking.
+func (s *StreamComponent) ActivityPhrase() string {
+	tools := s.activeToolList()
+	switch len(tools) {
+	case 0:
+		return "Thinking"
+	case 1:
+		t := tools[0]
+		if t.name == "subagent" && t.agentName != "" {
+			return "Delegating to " + t.agentName
+		}
+		return activityVerb(t.name, t.args)
+	default:
+		return fmt.Sprintf("Running %d tools", len(tools))
 	}
-	return "  " + frame + " " + msgStyle.Render(toolsMsg)
+}
+
+// IsSpinning reports whether the stream is currently animating, i.e. whether
+// there is live activity worth showing.
+func (s *StreamComponent) IsSpinning() bool {
+	return s.spinning
 }
 
 // renderStreamingText renders the accumulated streaming text as a live assistant
@@ -568,14 +548,24 @@ func (s *StreamComponent) renderStreamingText(text string) string {
 	return msg.Content
 }
 
-func (s *StreamComponent) activeToolDisplays() []string {
+// activeTool describes a tool call that is currently in flight. The raw
+// arguments are retained so the activity row can render a specific,
+// present-tense phrase ("Reading internal/ui/model.go") rather than a bare
+// tool name.
+type activeTool struct {
+	name      string
+	args      string
+	agentName string
+}
+
+func (s *StreamComponent) activeToolList() []activeTool {
 	if len(s.activeTools) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(s.activeToolOrder))
+	out := make([]activeTool, 0, len(s.activeToolOrder))
 	for _, id := range s.activeToolOrder {
-		if display, ok := s.activeTools[id]; ok {
-			out = append(out, display)
+		if t, ok := s.activeTools[id]; ok {
+			out = append(out, t)
 		}
 	}
 	return out
@@ -632,15 +622,6 @@ func extractAgentNameFromArgs(toolArgs string) string {
 		return sanitizeAgentName(agent)
 	}
 	return ""
-}
-
-// formatToolExecutionMessage creates a descriptive spinner message for tool execution.
-// For subagents, includes the agent type in parentheses (e.g., "subagent (explore)").
-func formatToolExecutionMessage(toolName, agentName string) string {
-	if toolName == "subagent" && agentName != "" {
-		return fmt.Sprintf("subagent (%s)", agentName)
-	}
-	return toolName
 }
 
 // UpdateTheme refreshes the component's typography instance and spinner

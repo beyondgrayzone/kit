@@ -59,12 +59,14 @@ Passed to event handlers, the `Context` object provides runtime access to Kit's 
 - **Output** — `ctx.Print(...)`, `ctx.PrintInfo(...)`, `ctx.PrintError(...)`
 - **UI components** — `ctx.SetWidget(...)`, `ctx.SetHeader(...)`, `ctx.SetFooter(...)`, `ctx.SetStatus(...)`
 - **Editor** — `ctx.SetEditor(...)`, `ctx.ResetEditor()`
-- **Prompts** — `ctx.PromptSelect(...)`, `ctx.PromptConfirm(...)`, `ctx.PromptInput(...)`
+- **Prompts** — `ctx.PromptSelect(...)`, `ctx.PromptMultiSelect(...)`, `ctx.PromptConfirm(...)`, `ctx.PromptInput(...)`
 - **Overlays** — `ctx.ShowOverlay(...)`
 - **Messages** — `ctx.SendMessage(...)`, `ctx.GetMessages()`
-- **Model** — `ctx.SetModel(...)`, `ctx.GetAvailableModels()`
+- **Model** — `ctx.SetModel(...)`, `ctx.GetAvailableModels()`, `ctx.GetThinkingLevel()`
 - **Tools** — `ctx.GetAllTools()`, `ctx.SetActiveTools(...)`
 - **Context stats** — `ctx.GetContextStats()`
+- **Terminal** — `ctx.GetTerminalSize()`
+- **Usage** — `ctx.GetSessionUsage()` (tokens, cost, OAuth status)
 - **Session data** — `ctx.AppendEntry(...)`, `ctx.GetEntries(...)` (append-only, in conversation tree)
 - **Session state** — `ctx.SetState(...)`, `ctx.GetState(...)`, `ctx.DeleteState(...)`, `ctx.ListState()` (last-write-wins, sidecar file)
 - **Subagents** — `ctx.SpawnSubagent(...)`

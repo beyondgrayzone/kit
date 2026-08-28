@@ -2,6 +2,34 @@ package app
 
 import kit "github.com/mark3labs/kit/pkg/kit"
 
+// Event is the sealed union of all events the app layer emits toward a
+// display (the Bubble Tea TUI, the non-interactive CLI handler, or any future
+// transport). Every event type defined in this file implements Event via an
+// unexported marker method. Because that marker is unexported, only types
+// declared in this package can satisfy Event — the union is closed to external
+// implementations.
+//
+// Note that Go does not check type-switch exhaustiveness for this pattern:
+// adding a new Event variant will not produce a compile error at downstream
+// switches, so those switches should keep a default case (or the package a
+// sum-type linter) to stay safe.
+//
+// Keeping the fan-out typed as Event (rather than Bubble Tea's untyped tea.Msg)
+// means the app package no longer needs to speak the TUI's message vocabulary to
+// describe its own events. The concrete transport (prog.Send, a CLI callback)
+// adapts Event at the boundary; the event-producing code stays TUI-agnostic.
+//
+// Note that some events still carry a response channel (PasswordPromptEvent,
+// PromptRequestEvent, OverlayRequestEvent, NewSessionRequestEvent). Those are
+// not yet serialisable across a process boundary; converting them to a
+// request-id correlation scheme is deferred until an actual out-of-process
+// transport exists.
+type Event interface {
+	// isAppEvent is an unexported marker that seals the Event union to types
+	// declared in this package.
+	isAppEvent()
+}
+
 // StreamChunkEvent is sent by the app layer when a streaming text delta arrives
 // from the LLM. Each chunk contains an incremental portion of the response.
 type StreamChunkEvent struct {
@@ -221,6 +249,12 @@ type UsageUpdatedEvent struct{}
 // from its WidgetProvider on the next render cycle.
 type WidgetUpdateEvent struct{}
 
+// ThemeChangedEvent is sent when the active color theme is replaced from
+// outside the TUI's own /theme command — an extension calling ctx.SetTheme,
+// for instance. Components that memoize theme-derived styling repaint
+// themselves when they see it.
+type ThemeChangedEvent struct{}
+
 // ContentReloadEvent is sent when prompt templates or skills are reloaded
 // from disk (e.g. by a file watcher detecting changes). The TUI refreshes
 // its autocomplete entries and internal state from the provider callbacks.
@@ -291,6 +325,11 @@ type PromptResponse struct {
 	Value string
 	// Index is the zero-based index of the selected option (select only).
 	Index int
+	// Values holds the text of every selected option (multiselect only).
+	Values []string
+	// Indices holds the zero-based index of every selected option
+	// (multiselect only).
+	Indices []int
 	// Confirmed is the boolean answer for confirm prompts.
 	Confirmed bool
 	// Cancelled is true if the user dismissed the prompt (ESC) or the
@@ -299,19 +338,22 @@ type PromptResponse struct {
 }
 
 // PromptRequestEvent is sent when an extension requests an interactive
-// prompt from the user (select, confirm, or text input). The TUI enters a
-// modal prompt state, renders the prompt, and sends a single PromptResponse
-// through ResponseCh when the user completes or cancels.
+// prompt from the user (select, multiselect, confirm, or text input). The TUI
+// enters a modal prompt state, renders the prompt, and sends a single
+// PromptResponse through ResponseCh when the user completes or cancels.
 //
 // The extension goroutine blocks on the read side of ResponseCh until the
 // TUI sends a response. The channel must have buffer size >= 1.
 type PromptRequestEvent struct {
-	// PromptType is "select", "confirm", or "input".
+	// PromptType is "select", "multiselect", "confirm", or "input".
 	PromptType string
 	// Message is the question displayed to the user.
 	Message string
-	// Options lists the choices for select prompts.
+	// Options lists the choices for select and multiselect prompts.
 	Options []string
+	// DefaultSelected holds the indices pre-selected when a multiselect
+	// prompt opens. A nil slice selects every option.
+	DefaultSelected []int
 	// Default is the pre-filled value: "true"/"false" for confirm prompts,
 	// or the initial text for input prompts.
 	Default string
@@ -367,3 +409,47 @@ type OverlayRequestEvent struct {
 	// ResponseCh receives the user's response. Must have buffer size >= 1.
 	ResponseCh chan<- OverlayResponse
 }
+
+// --------------------------------------------------------------------------
+// Event union markers
+//
+// Each app event type implements the sealed Event interface via this
+// unexported marker. Grouping the markers here keeps the event structs above
+// focused on their fields while making the closed set easy to audit: adding a
+// new event type is a compile error until it is listed here.
+// --------------------------------------------------------------------------
+
+func (StreamChunkEvent) isAppEvent()        {}
+func (ReasoningChunkEvent) isAppEvent()     {}
+func (ReasoningCompleteEvent) isAppEvent()  {}
+func (ToolCallStartedEvent) isAppEvent()    {}
+func (ToolCallInputStartEvent) isAppEvent() {}
+func (ToolCallInputDeltaEvent) isAppEvent() {}
+func (ToolCallInputEndEvent) isAppEvent()   {}
+func (ToolExecutionEvent) isAppEvent()      {}
+func (ToolResultEvent) isAppEvent()         {}
+func (ToolOutputEvent) isAppEvent()         {}
+func (ToolCallContentEvent) isAppEvent()    {}
+func (PasswordPromptEvent) isAppEvent()     {}
+func (ResponseCompleteEvent) isAppEvent()   {}
+func (StepCompleteEvent) isAppEvent()       {}
+func (StepErrorEvent) isAppEvent()          {}
+func (StepCancelledEvent) isAppEvent()      {}
+func (QueueUpdatedEvent) isAppEvent()       {}
+func (SpinnerEvent) isAppEvent()            {}
+func (MessageCreatedEvent) isAppEvent()     {}
+func (CompactCompleteEvent) isAppEvent()    {}
+func (CompactErrorEvent) isAppEvent()       {}
+func (SteerConsumedEvent) isAppEvent()      {}
+func (ModelChangedEvent) isAppEvent()       {}
+func (UsageUpdatedEvent) isAppEvent()       {}
+func (WidgetUpdateEvent) isAppEvent()       {}
+func (ThemeChangedEvent) isAppEvent()       {}
+func (ContentReloadEvent) isAppEvent()      {}
+func (MCPToolsReadyEvent) isAppEvent()      {}
+func (MCPServerLoadedEvent) isAppEvent()    {}
+func (EditorTextSetEvent) isAppEvent()      {}
+func (NewSessionRequestEvent) isAppEvent()  {}
+func (ExtensionPrintEvent) isAppEvent()     {}
+func (PromptRequestEvent) isAppEvent()      {}
+func (OverlayRequestEvent) isAppEvent()     {}

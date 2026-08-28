@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image/color"
+	"strings"
 
 	"charm.land/lipgloss/v2"
 
@@ -63,6 +64,14 @@ func WithBorderColor(c color.Color) renderingOption {
 	}
 }
 
+// WithBackground returns a renderingOption that sets a background color for
+// the entire block, including the padded region.
+func WithBackground(c color.Color) renderingOption {
+	return func(r *blockRenderer) {
+		r.background = &c
+	}
+}
+
 // WithMarginBottom returns a renderingOption that sets the bottom margin
 // for the block. The margin is specified in number of lines and adds
 // vertical space below the block.
@@ -93,17 +102,31 @@ func WithPaddingBottom(padding int) renderingOption {
 // renderContentBlock renders content with configurable styling options
 func renderContentBlock(content string, containerWidth int, options ...renderingOption) string {
 	renderer := &blockRenderer{
-		fullWidth:     true,
-		paddingTop:    1,
-		paddingBottom: 1,
-		paddingLeft:   2,
-		paddingRight:  0,
-		width:         containerWidth,
+		fullWidth: true,
+		// Blocks carry no interior vertical padding. Vertical rhythm in the
+		// transcript comes from the single trailing gap every block appends
+		// (style.BlockGap); padding inside the gutter as well opens a hole
+		// above and below the text and makes the stripe look detached from
+		// what it marks.
+		paddingTop:    0,
+		paddingBottom: 0,
+		// The border glyph occupies column 0, so the padding that follows it
+		// is one less than the shared content offset.
+		paddingLeft:  style.ContentOffset - 1,
+		paddingRight: style.RightMargin,
+		width:        containerWidth,
 	}
 
 	for _, option := range options {
 		option(renderer)
 	}
+
+	// Trailing blank lines inside the block would be drawn with the gutter
+	// glyph beside them, which reads as an unfinished block rather than as
+	// space. Command output usually ends with a newline, so this is the
+	// common case, not the exceptional one. Vertical separation is the
+	// margin's job.
+	content = strings.TrimRight(content, "\n")
 
 	// Resolve border configuration.
 	hasBorder := !renderer.noBorder
@@ -132,7 +155,7 @@ func renderContentBlock(content string, containerWidth int, options ...rendering
 	}
 
 	// Single-pass render: padding, border, and foreground in one style.
-	style := lipgloss.NewStyle().
+	blockStyle := lipgloss.NewStyle().
 		PaddingLeft(renderer.paddingLeft).
 		PaddingRight(renderer.paddingRight).
 		PaddingTop(renderer.paddingTop).
@@ -140,29 +163,32 @@ func renderContentBlock(content string, containerWidth int, options ...rendering
 		Foreground(fgColor)
 
 	if hasBorder {
-		style = style.BorderStyle(lipgloss.ThickBorder())
+		// One gutter glyph is used for every attributed block in the UI, so
+		// the left edge reads as a single vocabulary rather than as several
+		// competing border weights.
+		blockStyle = blockStyle.BorderStyle(style.GutterBorder())
 
 		switch borderAlign {
 		case lipgloss.Right:
-			style = style.
+			blockStyle = blockStyle.
 				BorderRight(true).
 				BorderRightForeground(borderColor)
 		default:
-			style = style.
+			blockStyle = blockStyle.
 				BorderLeft(true).
 				BorderLeftForeground(borderColor)
 		}
 	}
 
 	if renderer.background != nil {
-		style = style.Background(*renderer.background)
+		blockStyle = blockStyle.Background(*renderer.background)
 	}
 
 	if renderer.fullWidth {
-		style = style.Width(renderer.width - borderChars)
+		blockStyle = blockStyle.Width(renderer.width - borderChars)
 	}
 
-	content = style.Render(content)
+	content = blockStyle.Render(content)
 
 	// Add margins
 	if renderer.marginTop > 0 {

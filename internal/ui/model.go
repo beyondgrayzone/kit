@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/log"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/editor"
 	"github.com/spf13/viper"
 
@@ -21,7 +26,6 @@ import (
 	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/models"
 	"github.com/mark3labs/kit/internal/prompts"
-	"github.com/mark3labs/kit/internal/session"
 	"github.com/mark3labs/kit/internal/ui/clipboard"
 	"github.com/mark3labs/kit/internal/ui/commands"
 	uicore "github.com/mark3labs/kit/internal/ui/core"
@@ -29,6 +33,7 @@ import (
 	"github.com/mark3labs/kit/internal/ui/imagepreview"
 	"github.com/mark3labs/kit/internal/ui/prefs"
 	"github.com/mark3labs/kit/internal/ui/style"
+	"github.com/mark3labs/kit/internal/ui/termgfx"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
 
@@ -60,6 +65,12 @@ const (
 
 	// stateSessionSelector means the /resume session picker is active.
 	stateSessionSelector
+
+	// stateMessageNav means scrollback message navigation is active. The
+	// user moves a selection between messages with up/down (or j/k) and
+	// opens the selected message in a scrollable inspector with Enter.
+	// The composer keeps its text but does not receive keys.
+	stateMessageNav
 )
 
 // AppController is the interface the parent TUI model uses to interact with the
@@ -95,17 +106,50 @@ type AppController interface {
 	// error synchronously if compaction cannot be started (e.g. agent is busy).
 	// customInstructions is optional text appended to the summary prompt.
 	CompactConversation(customInstructions string) error
-	// GetTreeSession returns the tree session manager, or nil if tree sessions
-	// are not enabled. Used by slash commands like /tree, /fork, /session.
-	GetTreeSession() *session.TreeManager
-	// SwitchTreeSession replaces the active tree session with a new one,
-	// closing the old session. Used by /new to create a completely fresh session.
-	SwitchTreeSession(ts *session.TreeManager)
-	// SendEvent sends a tea.Msg to the program asynchronously. Safe to call
-	// from any goroutine. Used by extension command goroutines to deliver
-	// results back to the TUI without going through tea.Cmd (which can stall
-	// when the goroutine blocks on interactive prompts).
-	SendEvent(tea.Msg)
+	// SessionSnapshot returns a value snapshot of the active tree session's
+	// metadata (id, name, file path, counts, current leaf). ok is false when
+	// no tree session is active. Callers re-read it whenever they need
+	// current values rather than caching it.
+	SessionSnapshot() (app.SessionSnapshot, bool)
+	// SessionTree returns the session's entry tree projected into value
+	// nodes, or nil when no tree session is active. Used by /tree and /fork.
+	SessionTree() []app.TreeNodeView
+	// SessionHistory returns the conversation messages on the session's
+	// current branch, oldest first. Used to replay the transcript after
+	// resuming or forking a session.
+	SessionHistory() []message.Message
+	// SetSessionName sets the session's display name. Used by /name.
+	SetSessionName(name string) error
+	// NewSession replaces the active session with a brand new one created in
+	// cwd, closing the old one. Used by /new.
+	NewSession(cwd string) error
+	// ForkSession creates a new session in cwd holding the history up to
+	// targetID and switches to it. Used by /fork and tree-node selection.
+	ForkSession(cwd, targetID string) error
+	// ListSessions returns summaries of the sessions recorded for cwd,
+	// newest first. Used by the session picker.
+	ListSessions(cwd string) ([]app.SessionSummary, error)
+	// ListAllSessions returns summaries of every session across all working
+	// directories, newest first. Used by the session picker's "All" scope.
+	ListAllSessions() ([]app.SessionSummary, error)
+	// DeleteSession removes a session file from disk. Used by the session
+	// picker's delete flow.
+	DeleteSession(path string) error
+	// ExportSession copies the active session's file to dstPath, deriving a
+	// name when dstPath is empty, and reports the path written and byte
+	// count. Used by /export.
+	ExportSession(dstPath string) (string, int, error)
+	// WriteShareableSession writes a shareable copy of the active session
+	// (with a system-prompt entry spliced in) to a temporary file and returns
+	// its path. The caller must remove the file. Used by /share.
+	WriteShareableSession(systemPrompt, fallbackModelID string) (string, error)
+	// SendUIMessage re-injects a UI-internal message into the program's Update
+	// loop asynchronously. Safe to call from any goroutine. Used by extension
+	// command goroutines (and other async UI work) to deliver results back to
+	// the TUI without going through tea.Cmd (which can stall when the goroutine
+	// blocks on interactive prompts). The message is opaque to the app layer;
+	// it is not an app Event and is only understood by the UI's own Update.
+	SendUIMessage(tea.Msg)
 	// AddContextMessage adds a user-role message to the conversation history
 	// without triggering an LLM response. Used by the ! shell command prefix
 	// to inject command output into context so the LLM can reference it in
@@ -233,6 +277,17 @@ var styleMarginBottom1 = lipgloss.NewStyle().MarginBottom(1)
 // Editor interceptor types (UI-layer, decoupled from extensions package)
 // ---------------------------------------------------------------------------
 
+// ShortcutInfo describes one extension-registered keyboard shortcut for the
+// /shortcuts listing. Mirrors extensions.ShortcutEntry for package decoupling.
+type ShortcutInfo struct {
+	// Key is the normalized binding, e.g. "ctrl+p".
+	Key string
+	// Description explains what the shortcut does.
+	Description string
+	// Source is the file name of the extension that registered it.
+	Source string
+}
+
 // EditorKeyActionType defines the outcome of an editor key interception.
 // Mirrors extensions.EditorKeyActionType for package decoupling.
 type EditorKeyActionType string
@@ -268,14 +323,33 @@ type EditorInterceptor struct {
 	Render func(width int, defaultContent string) string
 }
 
+// widgetRenderCache holds the last output of an animated widget's Render
+// callback, so the interpreter is re-entered at the widget's requested rate
+// rather than on every frame the shared clock ticks.
+type widgetRenderCache struct {
+	content string
+	width   int
+	beat    int
+}
+
 // WidgetData is the UI-layer representation of an extension widget. It
 // decouples the UI package from the extensions package. The CLI layer
 // converts extension WidgetConfig values to WidgetData for rendering.
 type WidgetData struct {
-	// Text is the content to display.
+	// ID uniquely identifies the widget. Used to key the animation render
+	// cache; empty for header/footer, which get synthetic keys.
+	ID string
+	// Text is the content to display. Ignored when Render is non-nil.
 	Text string
 	// Markdown, when true, renders Text as styled markdown.
 	Markdown bool
+	// Render, if non-nil, produces the widget body per frame from the
+	// content width. Its output is used verbatim.
+	Render func(width int) string
+	// RefreshHz, when > 0, asks the shared animation clock to keep running
+	// so the widget repaints continuously. It also bounds how often Render
+	// is actually invoked. Zero means a static widget.
+	RefreshHz int
 	// BorderColor is a hex color (e.g. "#a6e3a1") for the left border.
 	// Empty uses the theme's default accent color.
 	BorderColor string
@@ -296,9 +370,12 @@ type StatusBarEntryData struct {
 // The zero value shows everything (backward compatible).
 type UIVisibility struct {
 	HideStartupMessage bool // Hide the "Model loaded..." startup block
-	HideStatusBar      bool // Hide the "provider · model  Tokens: ..." line
-	HideSeparator      bool // Hide the "────────" divider between stream and input
-	HideInputHint      bool // Hide the "enter submit · ctrl+j..." hint below input
+	HideStatusBar      bool // Hide the "~/path (branch) ... provider · model" line
+	HideSeparator      bool // Hide the queued/steering count above the composer
+	// HideInputHint is retained for compatibility and has no effect. The
+	// submit hint is no longer a separate line below the composer; it lives
+	// in the placeholder and disappears as soon as the user types.
+	HideInputHint bool
 }
 
 // AppModelOptions holds configuration passed to NewAppModel.
@@ -458,6 +535,11 @@ type AppModelOptions struct {
 	// loop. May be nil if no extensions are loaded.
 	GetGlobalShortcuts func() map[string]func()
 
+	// GetShortcutList, if non-nil, returns the registered extension shortcuts
+	// for the /shortcuts listing, sorted for display. May be nil if no
+	// extensions are loaded.
+	GetShortcutList func() []ShortcutInfo
+
 	// GetExtensionCommands, if non-nil, returns the current extension
 	// commands. Called on WidgetUpdateEvent to refresh the command list
 	// after an extension hot-reload. May be nil if no extensions loaded.
@@ -474,11 +556,22 @@ type AppModelOptions struct {
 	// May be nil if extensions are not loaded.
 	EmitModelChange func(newModel, previousModel, source string)
 
+	// EmitThinkingLevelChange fires the OnThinkingLevelChange extension
+	// event. May be nil when no extensions are loaded.
+	EmitThinkingLevelChange func(newLevel, previousLevel, source string)
+
+	// EmitTerminalResize fires the OnTerminalResize extension event and
+	// refreshes the terminal size on the extension context. May be nil.
+	EmitTerminalResize func(width, height int)
+
+	// EmitTurnStateChange fires the OnTurnStateChange extension event when
+	// the UI enters or leaves the working state. May be nil.
+	EmitTurnStateChange func(state, previous string)
+
 	// EmitRawInput fires the OnRawInput extension event, delivering
 	// the original user input (before @file expansion etc.) to extensions.
 	// May be nil if extensions are not loaded.
 	EmitRawInput func(rawText string, source string)
-
 	// SwitchSession opens a session by JSONL file path, replacing the
 	// active tree session and reloading messages. Called when the user
 	// picks a session from /resume. May be nil if session switching is
@@ -673,6 +766,35 @@ type AppModel struct {
 	contextPaths []string
 	skillItems   []SkillItem
 
+	// splashItem is the scrollback item holding the startup splash, retained
+	// while the logo animation is running so each frame can be painted into
+	// it in place. Cleared once the animation settles.
+	splashItem *TextMessageItem
+
+	// splashTail is the part of the splash below the wordmark (the model line
+	// and the list of what was loaded), kept so animation frames rebuild only
+	// the logo rather than re-deriving the whole block.
+	splashTail []string
+
+	// logoFrame is the startup animation's current frame. The animation does
+	// not own a tick loop; it advances when the shared frame clock hands it a
+	// frame, and reports through wantsFrames that it wants more.
+	logoFrame int
+
+	// frames is the shared animation clock. Every animated component in the
+	// app advances on its beat; see frameclock.go for why there is only one.
+	frames frameClock
+
+	// widgetRenders caches output from animated extension widgets, keyed by
+	// widget ID (headers and footers use synthetic keys).
+	widgetRenders map[string]widgetRenderCache
+
+	// renderEpoch increments once per View() pass. Widget Render callbacks
+	// are cached against it so the measurement pass in distributeHeight and
+	// the paint pass in View always see identical content — a time-varying
+	// widget would otherwise be able to measure N lines and paint N+1.
+	renderEpoch int
+
 	// getSkillItems returns the current skill items. Used to refresh the
 	// skill list after content hot-reload. May be nil.
 	getSkillItems func() []SkillItem
@@ -739,6 +861,9 @@ type AppModel struct {
 	// May be nil if no extensions are loaded.
 	getGlobalShortcuts func() map[string]func()
 
+	// getShortcutList returns extension shortcuts for the /shortcuts listing.
+	getShortcutList func() []ShortcutInfo
+
 	// getExtensionCommands returns the current extension commands. Used
 	// to refresh the command list after an extension hot-reload. May be nil.
 	getExtensionCommands func() []commands.ExtensionCommand
@@ -749,6 +874,20 @@ type AppModel struct {
 
 	// emitModelChange fires the OnModelChange extension event. May be nil.
 	emitModelChange func(newModel, previousModel, source string)
+
+	// emitThinkingLevelChange fires the OnThinkingLevelChange extension
+	// event. May be nil.
+	emitThinkingLevelChange func(newLevel, previousLevel, source string)
+
+	// emitTerminalResize fires the OnTerminalResize extension event. May be nil.
+	emitTerminalResize func(width, height int)
+
+	// emitTurnStateChange fires the OnTurnStateChange extension event. May be nil.
+	emitTurnStateChange func(state, previous string)
+
+	// extEvents serializes extension event dispatch so that rapid events
+	// reach the runner in emission order. See ext_event_dispatcher.go.
+	extEvents *extEventDispatcher
 
 	// modelSelector is the model selection overlay, active in stateModelSelector.
 	modelSelector *ModelSelectorComponent
@@ -789,8 +928,50 @@ type AppModel struct {
 	// so the model can return to it when the overlay completes.
 	preOverlayState appState
 
+	// navReturnState remembers the state message navigation suspended, so
+	// exiting navigation returns to it rather than unconditionally to
+	// stateInput. Agent lifecycle transitions that land while navigation
+	// owns the keyboard are recorded here instead of being applied (see
+	// setAgentState), so a turn that starts or finishes mid-browse is
+	// reflected the moment the user presses Esc.
+	navReturnState appState
+
+	// navNotice is a one-shot acknowledgement shown in the status bar's
+	// navigation slot — currently only the result of a copy.
+	//
+	// Navigation feedback cannot use printSystemMessage: that appends an item
+	// to the very list being navigated, which shifts the frame's position
+	// counter and can move the selection off screen. The notice is cleared by
+	// the next navigation keystroke.
+	navNotice string
+
 	// cwd is the working directory for @file path resolution.
 	cwd string
+
+	// gitBranch is the current git branch name, resolved once when cwd is
+	// set. Empty when the working directory is not a git repository. Shown
+	// in the ambient status bar.
+	gitBranch string
+
+	// turnStartedAt records when the current agent turn began, so the
+	// activity row can show elapsed time. Zero when idle.
+	turnStartedAt time.Time
+
+	// turnToolCount counts tool calls completed during the current turn, for
+	// the turn-completion receipt. Reset when a turn begins.
+	turnToolCount int
+
+	// lastInputHeight is the composer height measured by the last
+	// distributeHeight. The composer grows and shrinks with its content, so
+	// this is compared after every input update to detect a size change that
+	// requires the transcript to be resized. See syncInputHeight.
+	lastInputHeight int
+
+	// lastActivityPresent records whether the activity row was rendered by the
+	// last distributeHeight. The row appears when the agent starts working and
+	// disappears when it stops, and nothing in that transition otherwise marks
+	// the layout dirty, so it is compared every frame. See syncActivityRow.
+	lastActivityPresent bool
 
 	// mcpResourceReader is an optional callback to read MCP resources when
 	// processing @mcp:server:uri tokens at submit time. Set by the parent.
@@ -828,6 +1009,31 @@ type AppModel struct {
 	// View() calls distributeHeight() when this is true and then clears it.
 	layoutDirty bool
 
+	// gfxPlacement is the escape sequence that redraws directly-placed preview
+	// images at their current screen position, or "" when there are none.
+	//
+	// A direct placement is painted over the screen rather than being part of
+	// the view. View computes it, because only View knows the final row of
+	// every element, and Update writes it, because escape sequences cannot
+	// travel inside view text.
+	//
+	// Only terminals that need ModeDirect use this; see internal/ui/termgfx.
+	gfxPlacement string
+
+	// gfxDirty records that the screen has been repainted since the image was
+	// last placed, so it must be drawn again.
+	//
+	// Re-placing only when the computed row changes is not enough. The
+	// renderer scrolls the screen to update it, and a terminal scrolls its
+	// images along with the text, so an image drifts upward while the row it
+	// belongs on stays exactly the same. Redrawing whenever the frame content
+	// changes catches that; gfxContentHash is what detects the change.
+	gfxDirty bool
+
+	// gfxContentHash is a hash of the last rendered frame, used to notice that
+	// the screen was repainted.
+	gfxContentHash uint64
+
 	// pendingGotoBottom requests a GotoBottom() after the next layout
 	// recalculation. Set when loading a session so that scrolling to the
 	// bottom happens with the correct viewport height.
@@ -863,10 +1069,16 @@ type streamComponentIface interface {
 	// GetRenderedContent returns the rendered assistant message from accumulated
 	// streaming text, or empty string if nothing has been accumulated.
 	GetRenderedContent() string
-	// SpinnerView returns the rendered spinner line (animation + optional label).
-	// Returns "" when the spinner is not active. The parent renders this in the
-	// status bar so the spinner never changes the view height.
-	SpinnerView() string
+	// ActivityDot returns the animated indicator glyph on its own, for the
+	// activity row. Returns "" when nothing is in flight.
+	ActivityDot() string
+	// IsSpinning reports whether there is live activity being animated. The
+	// parent reads this to decide whether the shared frame clock should keep
+	// running.
+	IsSpinning() bool
+	// ActivityPhrase returns a present-tense description of the work currently
+	// in flight, e.g. "Running go test ./...".
+	ActivityPhrase() string
 	// SetThinkingVisible sets whether reasoning blocks are shown or collapsed.
 	SetThinkingVisible(visible bool)
 	// HasReasoning returns true if any reasoning content has been accumulated.
@@ -934,9 +1146,14 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	m.emitBeforeFork = opts.EmitBeforeFork
 	m.emitBeforeSessionSwitch = opts.EmitBeforeSessionSwitch
 	m.getGlobalShortcuts = opts.GetGlobalShortcuts
+	m.getShortcutList = opts.GetShortcutList
 	m.getExtensionCommands = opts.GetExtensionCommands
 	m.setModel = opts.SetModel
 	m.emitModelChange = opts.EmitModelChange
+	m.emitThinkingLevelChange = opts.EmitThinkingLevelChange
+	m.emitTerminalResize = opts.EmitTerminalResize
+	m.emitTurnStateChange = opts.EmitTurnStateChange
+	m.extEvents = newExtEventDispatcher()
 	m.thinkingLevel = opts.ThinkingLevel
 
 	// Initialize the theme list function for command completion.
@@ -972,6 +1189,10 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	if ic, ok := m.input.(*InputComponent); ok && opts.Cwd != "" {
 		ic.SetCwd(opts.Cwd)
 	}
+
+	// Resolve the git branch once at startup for the ambient status bar.
+	// A miss is not an error — the branch is simply omitted.
+	m.gitBranch = detectGitBranch(opts.Cwd)
 
 	// Wire up MCP resource provider for @ autocomplete.
 	if ic, ok := m.input.(*InputComponent); ok && opts.GetMCPResources != nil {
@@ -1043,7 +1264,7 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 
 	// If --resume was passed, open the session picker immediately.
 	if opts.ShowSessionPicker {
-		m.sessionSelector = NewSessionSelector(opts.Cwd, width, height)
+		m.sessionSelector = NewSessionSelector(appCtrl, opts.Cwd, width, height)
 		m.state = stateSessionSelector
 	}
 
@@ -1064,6 +1285,10 @@ func (m *AppModel) Init() tea.Cmd {
 
 	// m.input is always set by NewAppModel; its Init starts the textarea cursor blink.
 	// m.stream.Init() always returns nil, so there is nothing to batch.
+	// The logo animation is nil unless the terminal can render it.
+	if anim := m.startLogoAnimation(); anim != nil {
+		return tea.Batch(m.input.Init(), anim)
+	}
 	return m.input.Init()
 }
 
@@ -1086,21 +1311,29 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 		return
 	}
 
-	// Add the ASCII logo at the very top.
-	// logo := style.KitBanner()
-	// logoMsg := NewStyledMessageItem(generateMessageID(), "logo", logo, logo)
-	// m.messages = append(m.messages, logoMsg)
+	// The splash is one block: the wordmark, the active model, and an aligned
+	// list of what was loaded, indented to the shared content column.
+	theme := style.GetTheme()
+	labelStyle := lipgloss.NewStyle().Foreground(theme.VeryMuted)
+	valueStyle := lipgloss.NewStyle().Foreground(theme.Muted)
 
-	// Build key-value pairs for startup info.
-	ty := createTypography(style.GetTheme())
-	var pairs [][2]string
+	// The wordmark leads, and is kept separate from everything below it so
+	// the startup animation can repaint just the logo without rebuilding the
+	// rest of the block on every frame.
+	var tail []string
+	tail = append(tail, "")
 
 	if m.providerName != "" && m.modelName != "" {
-		pairs = append(pairs, [2]string{"Model", fmt.Sprintf("%s (%s)", m.providerName, m.modelName)})
+		tail = append(tail, valueStyle.Render(m.providerName+" · "+m.modelName))
+	} else if m.modelName != "" {
+		tail = append(tail, valueStyle.Render(m.modelName))
 	}
 
+	// Build key-value pairs for startup info.
+	var pairs [][2]string
+
 	if m.loadingMessage != "" {
-		pairs = append(pairs, [2]string{"Status", m.loadingMessage})
+		pairs = append(pairs, [2]string{"status", m.loadingMessage})
 	}
 
 	// Context — loaded AGENTS.md files.
@@ -1109,7 +1342,7 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 		if len(m.contextPaths) > 1 {
 			contextStr += fmt.Sprintf(" +%d more", len(m.contextPaths)-1)
 		}
-		pairs = append(pairs, [2]string{"Context", contextStr})
+		pairs = append(pairs, [2]string{"context", contextStr})
 	}
 
 	// Skills — listed by name.
@@ -1118,11 +1351,11 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 		for i, si := range m.skillItems {
 			names[i] = si.Name
 		}
-		pairs = append(pairs, [2]string{"Skills", strings.Join(names, ", ")})
+		pairs = append(pairs, [2]string{"skills", strings.Join(names, ", ")})
 	}
 
-	// Extensions — listed by filename. Each extension shows its basename
-	// without the .go suffix, matching the [Skills] section's style.
+	// Extensions — listed by filename, with a tool count when they register
+	// tools. Falls back to a bare count if the CLI supplied no item list.
 	if len(m.extensionItems) > 0 {
 		names := make([]string, len(m.extensionItems))
 		for i, ei := range m.extensionItems {
@@ -1132,48 +1365,140 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 		if m.extensionToolCount > 0 {
 			value += fmt.Sprintf(" (%d tools)", m.extensionToolCount)
 		}
-		pairs = append(pairs, [2]string{"Extensions", value})
+		pairs = append(pairs, [2]string{"extensions", value})
 	} else if m.extensionToolCount > 0 {
-		// Fallback: tool count only (extensions registered tools but the CLI
-		// did not provide ExtensionItems for some reason).
-		pairs = append(pairs, [2]string{"Extensions", fmt.Sprintf("%d tools", m.extensionToolCount)})
+		pairs = append(pairs, [2]string{"extensions", fmt.Sprintf("%d tools", m.extensionToolCount)})
 	}
 
 	// MCP tool count (only shown when > 0).
 	if m.mcpToolCount > 0 {
-		pairs = append(pairs, [2]string{"MCP", fmt.Sprintf("%d tools", m.mcpToolCount)})
+		pairs = append(pairs, [2]string{"mcp", fmt.Sprintf("%d tools", m.mcpToolCount)})
 	}
 
 	if len(pairs) > 0 {
-		rendered := ty.KVGroup(pairs)
-		rendered = styleMarginBottom1.Render(rendered)
-
-		// Add as a styled system message to ScrollList
-		msg := NewStyledMessageItem(generateMessageID(), "system", rendered, rendered)
-		m.messages = append(m.messages, msg)
-	}
-
-	// Add extension startup messages if any
-	if len(m.startupExtensionMessages) > 0 {
-		for _, extMsg := range m.startupExtensionMessages {
-			msg := NewStyledMessageItem(generateMessageID(), "system", extMsg, extMsg)
-			m.messages = append(m.messages, msg)
+		// Align values into a column so the list scans vertically.
+		labelWidth := 0
+		for _, p := range pairs {
+			if w := lipgloss.Width(p[0]); w > labelWidth {
+				labelWidth = w
+			}
+		}
+		tail = append(tail, "")
+		for _, p := range pairs {
+			label := labelStyle.Render(p[0] + strings.Repeat(" ", labelWidth-lipgloss.Width(p[0])))
+			tail = append(tail, label+"  "+valueStyle.Render(p[1]))
 		}
 	}
 
-	// Add a visual separator after startup info: blank line + HR + blank line.
-	// Uses a single pre-rendered item so there are no left borders on the spacing.
-	theme := style.GetTheme()
-	separator := strings.Repeat("─", m.width)
-	separatorStyled := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Render(separator)
-	separatorBlock := "\n" + separatorStyled + "\n"
-	separatorMsg := NewStyledMessageItem(generateMessageID(), "separator", separatorBlock, separatorBlock)
-	m.messages = append(m.messages, separatorMsg)
+	m.splashTail = tail
+	// The splash starts at whichever frame the animation will begin from, so
+	// there is no flash of the resting logo before the first tick lands.
+	m.logoFrame = m.initialLogoFrame()
+	splash := m.renderSplash(m.logoFrame)
+	// Themed so the banner follows a theme switch. The closure reads the
+	// current frame, which is also what lets the animation repaint in place.
+	item := NewThemedMessageItem(generateMessageID(), "logo", splash, func() string {
+		return m.renderSplash(m.logoFrame)
+	})
+	m.splashItem = item
+	m.messages = append(m.messages, item)
+
+	// Add extension startup messages if any. These are ordinary system
+	// notices and are rendered as such — appending the raw string would put
+	// unstyled, unwrapped text at column 0.
+	for _, extMsg := range m.startupExtensionMessages {
+		now := time.Now()
+		m.messages = append(m.messages, NewThemedMessageItem(generateMessageID(), "system", extMsg, func() string {
+			return m.renderer.RenderSystemMessage(extMsg, now).Content
+		}))
+	}
+
+	// The splash carries its own trailing gap, which is what separates the
+	// startup banner from the conversation. A blank line is enough to break
+	// the two apart, and it does not add a heavy horizontal element to an
+	// otherwise quiet screen.
 
 	// Refresh ScrollList once with all startup messages
 	m.refreshContent()
+}
+
+// --------------------------------------------------------------------------
+// Startup logo animation
+// --------------------------------------------------------------------------
+
+// logoAnimationSupported reports whether the startup animation should run at
+// all.
+//
+// It is skipped on terminals without the colour depth to render a gradient
+// sweep (where it would strobe between a handful of steps rather than move),
+// and when the wordmark has degraded to a plain "KIT" because the terminal is
+// too narrow for the block art — there is nothing there to animate.
+//
+// The gate lives here, on the animation, rather than on the shared clock. The
+// clock also drives the activity spinner, which is a liveness indicator rather
+// than decoration and has to keep moving on a two-colour terminal.
+func (m *AppModel) logoAnimationSupported() bool {
+	return style.SupportsSmoothAnimation() && style.KitLogoFits(m.width-style.ContentOffset)
+}
+
+// initialLogoFrame returns the frame the splash should first be rendered at:
+// the start of the animation when it will run, or the resting frame when it
+// will not.
+func (m *AppModel) initialLogoFrame() int {
+	if m.logoAnimationSupported() {
+		return 0
+	}
+	return style.KitLogoAnimationFrames
+}
+
+// renderSplash rebuilds the startup block with the wordmark at the given
+// animation frame.
+func (m *AppModel) renderSplash(frame int) string {
+	// The block is indented by ContentOffset, so that is what the logo has to
+	// fit inside.
+	content := make([]string, 0, len(m.splashTail)+style.KitLogoHeight)
+	content = append(content, style.KitLogoLinesAt(m.width-style.ContentOffset, frame)...)
+	content = append(content, m.splashTail...)
+	return style.SplashBlock(content)
+}
+
+// startLogoAnimation arms the startup animation, returning the command that
+// starts the shared clock, or nil when the animation will not run.
+//
+// Arming is just resetting the frame counter: the retained splashItem is what
+// wantsFrames reads to keep the clock alive, and dropping it at the end of the
+// sweep is what lets the clock stop.
+func (m *AppModel) startLogoAnimation() tea.Cmd {
+	if m.splashItem == nil || !m.logoAnimationSupported() {
+		return nil
+	}
+	m.logoFrame = 0
+	return m.wakeFrameClock()
+}
+
+// advanceLogoAnimation paints the next animation frame into the splash item,
+// releasing it once the animation has settled.
+//
+// The splash is repainted in place rather than replaced: the item keeps its
+// ID, and every frame is the same height, so ScrollList's height cache stays
+// valid and the animation costs one re-render of a seven-line item per frame.
+func (m *AppModel) advanceLogoAnimation() {
+	if m.splashItem == nil {
+		return
+	}
+
+	m.logoFrame++
+	m.splashItem.Invalidate()
+	m.refreshContent()
+
+	if m.logoFrame >= style.KitLogoAnimationFrames {
+		// Settled. Dropping the item reference both stops any later frame from
+		// finding something to repaint and tells wantsFrames the animation is
+		// over, which is what lets the clock wind down. splashTail is
+		// deliberately kept, so renderSplash stays valid for any future caller
+		// rather than silently rebuilding the block without its content.
+		m.splashItem = nil
+	}
 }
 
 // tildeHome replaces the user's home directory prefix with ~ for display.
@@ -1188,10 +1513,149 @@ func tildeHome(path string) string {
 	return path
 }
 
-// Update implements tea.Model. It is the heart of the state machine: it routes
-// incoming messages to children and handles state transitions.
+// Update implements tea.Model. It routes incoming messages to children and
+// handles state transitions, then keeps the shared animation clock in step.
+//
+// The clock is woken here rather than at each site that starts an animation.
+// update has many early returns, and an animation can begin down any of them —
+// a spinner starting on a tool event, the logo starting on a resize — so a
+// wake call per site would be a standing invitation to miss one, and a missed
+// one is a permanently frozen animation. Doing it once, after update has run
+// and whatever it did has settled, makes the invariant total: if anything
+// wants frames, the clock is running. start is idempotent, so this costs
+// nothing on the overwhelming majority of messages, when the clock is either
+// already running or not wanted.
 func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := m.update(msg)
+	cmds := []tea.Cmd{cmd}
+	if gfx := m.flushGfxPlacement(); gfx != nil {
+		cmds = append(cmds, gfx)
+	}
+	if wake := m.wakeFrameClock(); wake != nil {
+		cmds = append(cmds, wake)
+	}
+	if len(cmds) == 1 {
+		return model, cmd
+	}
+	return model, tea.Batch(cmds...)
+}
+
+// flushGfxPlacement returns a command that redraws directly-placed preview
+// images, or nil when their position has not changed since the last write.
+//
+// The sequence itself is computed by View, which is the only place that knows
+// the final screen row of every element. It is written from here because
+// escape sequences cannot travel inside view text: the renderer parses the
+// view into cells and would mangle them.
+//
+// The one-frame lag this implies is not visible in practice. Update runs
+// before View for a given message, so the placement written here belongs to
+// the previous frame; a frame that moves the image is therefore followed by a
+// corrective placement on the next event. Anything that changes the layout —
+// a keystroke, a resize, an agent event, the frame clock — produces that
+// event, and the image is re-placed against a screen the renderer has already
+// finished drawing.
+func (m *AppModel) flushGfxPlacement() tea.Cmd {
+	if !m.gfxDirty {
+		return nil
+	}
+	m.gfxDirty = false
+	if m.gfxPlacement == "" {
+		// The images are gone. They are deleted by the input component, which
+		// owns their ids, so there is nothing to draw here.
+		return nil
+	}
+	// Draw the image, then ask for one more cycle. Update runs before View, so
+	// the sequence written here was computed for the previous frame; the extra
+	// cycle lets the frame after this one settle and, if it moved the image
+	// again, mark it dirty once more. It converges as soon as the screen stops
+	// changing, because an unchanged frame leaves gfxDirty false.
+	return tea.Batch(tea.Raw(m.gfxPlacement), gfxNudgeCmd())
+}
+
+// wantsFrames reports whether any animation currently needs the clock.
+//
+// This is a pull, not a subscription registry. The animated components are
+// already owned by AppModel, so asking them is cheaper and harder to get wrong
+// than having each register and — the part that actually breaks — remember to
+// deregister on every exit path.
+func (m *AppModel) wantsFrames() bool {
+	if m.splashItem != nil {
+		return true
+	}
+	if m.stream != nil && m.stream.IsSpinning() {
+		return true
+	}
+	// An extension widget can hold the clock open for its own animation.
+	// This is the only path by which a session with nothing else moving stays
+	// awake, so it is deliberately gated on an explicit RefreshHz opt-in.
+	return m.animatedWidgets()
+}
+
+// wakeFrameClock resumes the clock if something needs frames and it is idle,
+// returning nil in every other case.
+func (m *AppModel) wakeFrameClock() tea.Cmd {
+	if !m.wantsFrames() {
+		return nil
+	}
+	return m.frames.start()
+}
+
+// advanceFrame drives one beat of the shared clock: it hands the frame to
+// every animation that is due one, then either schedules the next beat or
+// stops the clock because nothing is animating any more.
+func (m *AppModel) advanceFrame(t frameTickMsg) tea.Cmd {
+	if !m.frames.accept(t) {
+		return nil
+	}
+
 	var cmds []tea.Cmd
+
+	if m.splashItem != nil && t.due(frameEveryLogo) {
+		m.advanceLogoAnimation()
+	}
+
+	// The spinner lives in StreamComponent, so the frame is handed to it the
+	// same way any other message would be. It advances its own frame and
+	// schedules nothing.
+	if m.stream != nil {
+		updated, cmd := m.stream.Update(t)
+		m.stream, _ = updated.(streamComponentIface)
+		cmds = append(cmds, cmd)
+	}
+
+	if !m.wantsFrames() {
+		m.frames.stop()
+		return tea.Batch(cmds...)
+	}
+	return tea.Batch(append(cmds, m.frames.tick())...)
+}
+
+// update is the state machine proper. Callers go through Update, which wraps
+// this to maintain the frame clock.
+func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	// Stamp the turn clock on entry to / exit from the working state, so the
+	// activity row can report elapsed time without every transition site
+	// having to remember to do it. Deferred so it observes the state as it
+	// stands after this Update has run.
+	//
+	// Keyed on agentWorking() rather than the raw state so that entering and
+	// leaving message navigation — which suspends stateWorking without
+	// stopping the agent — does not report a phantom turn end and restart.
+	workingBefore := m.agentWorking()
+	defer func() {
+		workingAfter := m.agentWorking()
+		if workingAfter && !workingBefore {
+			m.turnStartedAt = time.Now()
+			m.turnToolCount = 0
+			m.notifyTurnState("working", "idle")
+		} else if !workingAfter && workingBefore {
+			m.turnStartedAt = time.Time{}
+			m.notifyTurnState("idle", "working")
+		}
+	}()
 
 	// Coalesced streaming: chunk events are buffered and applied on a ~16ms
 	// flush tick instead of per chunk (a full markdown re-render per chunk is
@@ -1199,13 +1663,19 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// so ordering-sensitive handlers (tool calls, reasoning completion, …)
 	// always see fully applied content. This runs before the modal-state
 	// routing below so buffered content never stalls behind a prompt/overlay.
-	switch msg.(type) {
+	switch msg := msg.(type) {
 	case app.StreamChunkEvent, app.ReasoningChunkEvent:
 		// Buffered by the handlers in the main switch below.
 	case streamAppendFlushMsg:
 		m.streamFlushPending = false
 		m.flushPendingStreamChunks()
 		return m, nil
+	case frameTickMsg:
+		// Handled here, ahead of the modal routing below, because a prompt or
+		// overlay opening mid-animation would otherwise swallow the beat and
+		// strand every animation on screen — the wordmark with a highlight
+		// band frozen across it, the activity dot mid-bounce.
+		return m, m.advanceFrame(msg)
 	default:
 		m.flushPendingStreamChunks()
 	}
@@ -1225,17 +1695,13 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Tree selector events ─────────────────────────────────────────────────
 	case uicore.TreeNodeSelectedMsg:
 		// User selected a node in the tree. Branch to it and return to input.
-		if ts := m.appCtrl.GetTreeSession(); ts != nil {
+		if _, ok := m.appCtrl.SessionSnapshot(); ok {
 			// For user messages: branch to parent (so user can resubmit).
 			// For other entries: branch directly to the selected entry.
 			targetID := msg.ID
 			if msg.IsUser {
 				// Branch to parent of user message, place text in editor.
-				if node := ts.GetEntry(msg.ID); node != nil {
-					if me, ok := node.(*session.MessageEntry); ok {
-						targetID = me.ParentID
-					}
-				}
+				targetID = msg.ParentID
 			}
 
 			// Emit before-fork event in a goroutine so that extension handlers
@@ -1249,7 +1715,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				forkUserText := msg.UserText
 				go func() {
 					cancelled, reason := emit(forkTargetID, forkIsUser, forkUserText)
-					ctrl.SendEvent(beforeForkResultMsg{
+					ctrl.SendUIMessage(beforeForkResultMsg{
 						cancelled: cancelled,
 						reason:    reason,
 						targetID:  forkTargetID,
@@ -1318,6 +1784,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.layoutDirty = true
+		m.notifyResize()
 		// Update renderer width for proper message styling
 		m.renderer.SetWidth(m.width)
 		// Propagate to children.
@@ -1330,6 +1797,23 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			updated, cmd := m.stream.Update(msg)
 			m.stream, _ = updated.(streamComponentIface)
 			cmds = append(cmds, cmd)
+		}
+		// A width change re-wraps every message, so the selected one can end
+		// up outside the viewport. Pull it back into view rather than leaving
+		// the user navigating a selection they cannot see.
+		//
+		// The layout pass has to run first: SetWidth/SetHeight land in
+		// distributeHeight, which View() defers until the next frame. Choosing
+		// an offset before that would measure the selected item at the old
+		// width (and against a stale viewport height), so a message that grew
+		// taller under the new wrapping could still end up clipped.
+		//
+		// layoutDirty is deliberately left set so View() still runs its own
+		// pass and repopulates the chrome cache it invalidates each frame.
+		// The repeat is cheap — SetWidth is a no-op at an unchanged width.
+		if m.state == stateMessageNav && m.scrollList != nil {
+			m.distributeHeight()
+			m.scrollList.EnsureVisible(m.scrollList.SelectedIndex())
 		}
 
 	// ── Mouse wheel scrolling ────────────────────────────────────────────────
@@ -1465,11 +1949,20 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Check extension-registered global keyboard shortcuts. These fire
 		// in all app states except modal prompts/overlays (which return early
-		// above). Matched shortcuts are consumed — the key does not propagate
+		// above) and message navigation, which rebinds plain keys like j/k
+		// and enter for itself — an extension shortcut on one of those would
+		// otherwise consume it first and silently break navigation.
+		//
+		// An armed leader chord (Ctrl+X) also takes precedence: the chord owns
+		// the next key press outright. Without this guard a shortcut bound to
+		// a chord suffix (s/t/m/e) stole the key and returned early, leaving
+		// leaderKeyActive latched on forever.
+		//
+		// Matched shortcuts are consumed — the key does not propagate
 		// to child components.
-		if m.getGlobalShortcuts != nil {
+		if m.getGlobalShortcuts != nil && m.state != stateMessageNav && !m.leaderKeyActive {
 			if shortcuts := m.getGlobalShortcuts(); shortcuts != nil {
-				if handler, ok := shortcuts[msg.String()]; ok {
+				if handler, ok := lookupShortcut(shortcuts, msg); ok {
 					// Run in goroutine so blocking extension calls
 					// (PromptSelect, etc.) don't stall the event loop.
 					go handler()
@@ -1546,6 +2039,55 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
+		// Message navigation consumes every key it understands so the
+		// composer never sees j/k as text while the user is browsing.
+		if m.state == stateMessageNav {
+			// Any navigation key retires the previous acknowledgement, except
+			// the one that produces a fresh copy.
+			if msg.String() != "y" {
+				m.navNotice = ""
+			}
+			switch msg.String() {
+			case "up", "k":
+				m.moveMessageSelection(-1)
+				return m, tea.Batch(cmds...)
+			case "down", "j":
+				m.moveMessageSelection(1)
+				return m, tea.Batch(cmds...)
+			case "home", "g":
+				if idx := m.firstSelectableIndex(); idx >= 0 {
+					m.selectMessage(idx)
+				}
+				return m, tea.Batch(cmds...)
+			case "end", "G":
+				if idx := m.lastSelectableIndex(); idx >= 0 {
+					m.selectMessage(idx)
+				}
+				return m, tea.Batch(cmds...)
+			// Jump between the user's own turns. "Scroll back to what I asked"
+			// is the dominant reason to enter navigation at all, and stepping
+			// there one tool result at a time is a lot of keypresses.
+			case "u":
+				m.jumpToRole("user", -1)
+				return m, tea.Batch(cmds...)
+			case "U":
+				m.jumpToRole("user", 1)
+				return m, tea.Batch(cmds...)
+			case "y":
+				cmds = append(cmds, m.copySelectedMessage())
+				return m, tea.Batch(cmds...)
+			case "enter":
+				m.inspectSelectedMessage()
+				return m, tea.Batch(cmds...)
+			case "esc", "q":
+				m.exitMessageNav()
+				return m, tea.Batch(cmds...)
+			}
+			// Swallow everything else: an unhandled key must not leak into
+			// the composer while navigation owns the keyboard.
+			return m, tea.Batch(cmds...)
+		}
+
 		// ── Leader key chord handling (Ctrl+X prefix) ──────────────
 		// If the leader key was previously pressed, the current key
 		// completes the chord. We consume it regardless of match so
@@ -1567,7 +2109,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if ic, ok := m.input.(*InputComponent); ok {
 							ic.pushHistory(text)
 							ic.textarea.SetValue("")
-							images = ic.ClearPendingImages()
+							var cleanup tea.Cmd
+							images, cleanup = ic.ClearPendingImages()
+							if cleanup != nil {
+								cmds = append(cmds, cleanup)
+							}
 						}
 
 						// Preprocess @file references (text files are XML-inlined,
@@ -1609,8 +2155,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							// Started immediately (agent was idle).
 							m.pendingUserPrints = append(m.pendingUserPrints, displayText)
 							m.flushStreamAndPendingUserMessages()
-							if m.state != stateWorking {
-								m.state = stateWorking
+							if !m.agentWorking() {
+								m.setAgentState(stateWorking)
 							}
 						}
 					}
@@ -1623,6 +2169,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.stream.SetThinkingVisible(m.thinkingVisible)
 					}
 				}
+			case "m":
+				// Ctrl+X m → Move: navigate messages in the scrollback.
+				m.enterMessageNav()
 			case "e":
 				// Ctrl+X e → open $EDITOR to compose/edit the prompt.
 				editorApp := os.Getenv("VISUAL")
@@ -1710,6 +2259,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							updated, cmd := m.input.Update(remapped)
 							m.input, _ = updated.(inputComponentIface)
 							cmds = append(cmds, cmd)
+							m.syncInputHeight()
 							intercepted = true
 						}
 						// If remap target is unrecognized, fall through to normal handling.
@@ -1719,7 +2269,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if text == "" {
 							if ic, ok := m.input.(*InputComponent); ok {
 								text = strings.TrimSpace(ic.textarea.Value())
-								images = ic.ClearPendingImages()
+								var cleanup tea.Cmd
+								images, cleanup = ic.ClearPendingImages()
+								if cleanup != nil {
+									cmds = append(cmds, cleanup)
+								}
 								ic.textarea.SetValue("")
 								ic.textarea.CursorEnd()
 							}
@@ -1738,6 +2292,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updated, cmd := m.input.Update(msg)
 				m.input, _ = updated.(inputComponentIface)
 				cmds = append(cmds, cmd)
+				// The composer is dynamically sized, so a keystroke that wraps
+				// or unwraps a line changes how much room the transcript has.
+				m.syncInputHeight()
 			}
 		}
 
@@ -1890,23 +2447,36 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Insert inline thumbnail previews after the user message.
 			cmds = append(cmds, m.transcriptPreviewCmd(msg.Images, m.lastMessageID()))
 		}
-		if m.state != stateWorking {
-			m.state = stateWorking
+		if !m.agentWorking() {
+			m.setAgentState(stateWorking)
 		}
 
 	// ── Async transcript image preview ───────────────────────────────────────
 	case imagePreviewReadyMsg:
 		if msg.block != "" {
+			// Static: the block is decoded pixel data, not a styled text
+			// block. Repainting it would mean re-decoding the image, and
+			// only its background tint comes from the theme.
 			item := NewStyledMessageItem(generateMessageID(), "user", "", msg.block)
 			m.insertMessageAfter(msg.anchorID, item)
 			m.refreshContent()
 			m.layoutDirty = true
+			if msg.transmit != "" {
+				// The image data cannot travel inside the view text. The
+				// placeholder cells just inserted into the transcript display
+				// it as soon as it lands.
+				//
+				// It is deliberately never deleted: the message stays in the
+				// scrollback for the rest of the session, and freeing the data
+				// would blank the preview the next time it scrolls into view.
+				cmds = append(cmds, tea.Raw(msg.transmit))
+			}
 		}
 
 	// ── Shell command (! / !!) ───────────────────────────────────────────────
 	case uicore.ShellCommandMsg:
 		// Show spinner while the shell command runs.
-		m.state = stateWorking
+		m.setAgentState(stateWorking)
 		if m.stream != nil {
 			updated, cmd := m.stream.Update(app.SpinnerEvent{Show: true})
 			m.stream, _ = updated.(streamComponentIface)
@@ -1922,7 +2492,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stream, _ = updated.(streamComponentIface)
 			cmds = append(cmds, cmd)
 		}
-		m.state = stateInput
+		m.setAgentState(stateInput)
 		cmds = append(cmds, m.handleShellCommandResult(msg))
 
 	// ── App layer events ─────────────────────────────────────────────────────
@@ -1936,7 +2506,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// guarantee chronological ordering.
 		if msg.Show {
 			m.flushStreamAndPendingUserMessages()
-			m.state = stateWorking
+			m.setAgentState(stateWorking)
 			m.layoutDirty = true
 		}
 		if m.stream != nil {
@@ -2137,7 +2707,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//     SpinnerEvent{Show: true} for the next turn is already in flight.
 		//     Defer to pendingUserPrints so the previous assistant response is
 		//     flushed first, preserving chronological order.
-		if m.state == stateWorking {
+		if m.agentWorking() {
 			// Case 1: mid-turn — flush + print immediately.
 			m.flushStreamContent()
 			for _, text := range m.steeringMessages {
@@ -2153,63 +2723,52 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case app.StepCompleteEvent:
-		// Keep stream content visible in the view — don't flush to the ScrollList
-		// yet. Flushing + resetting in the same frame would shrink the view
-		// height, and bubbletea's inline renderer leaves blank lines at the
-		// bottom for the orphaned rows. The content will be flushed to
-		// the ScrollList when the next step starts (SpinnerEvent{Show: true}).
-		// Just stop the spinner and return to input state.
+		// Stop the spinner and return to input state. The response is already
+		// mirrored in the ScrollList as a StreamingMessageItem, so
+		// finalizeStreamTurn() freezes it and drops the stream component's
+		// redundant copy (see its doc comment).
 		if m.stream != nil {
 			updated, cmd := m.stream.Update(app.SpinnerEvent{Show: false})
 			m.stream, _ = updated.(streamComponentIface)
 			cmds = append(cmds, cmd)
 		}
-		// Mark any trailing StreamingMessageItem as complete so its live
-		// timer freezes and it is not left in a dangling streaming state.
-		if len(m.messages) > 0 {
-			if streamMsg, ok := m.messages[len(m.messages)-1].(*StreamingMessageItem); ok {
-				streamMsg.MarkComplete()
-			}
-		}
-		m.state = stateInput
+		m.finalizeStreamTurn()
+		m.printTurnReceipt(turnDone)
+		m.setAgentState(stateInput)
 		m.canceling = false
 
 	case app.StepCancelledEvent:
-		// User cancelled the step (double-ESC). Keep partial stream content
-		// visible (same reasoning as StepCompleteEvent). Just stop the spinner.
+		// User cancelled the step (double-ESC). The partial response stays
+		// visible via the ScrollList copy; the stream component's copy is
+		// dropped so the next turn does not re-print it after the receipt.
 		if m.stream != nil {
 			updated, cmd := m.stream.Update(app.SpinnerEvent{Show: false})
 			m.stream, _ = updated.(streamComponentIface)
 			cmds = append(cmds, cmd)
 		}
-		// Mark any trailing StreamingMessageItem as complete (see StepCompleteEvent).
-		if len(m.messages) > 0 {
-			if streamMsg, ok := m.messages[len(m.messages)-1].(*StreamingMessageItem); ok {
-				streamMsg.MarkComplete()
-			}
-		}
-		m.state = stateInput
+		m.finalizeStreamTurn()
+		m.printTurnReceipt(turnCancelled)
+		m.setAgentState(stateInput)
 		m.canceling = false
 
 	case app.StepErrorEvent:
-		// Keep partial stream content visible (same reasoning as
-		// StepCompleteEvent). Print the error to the ScrollList — it appears
-		// above the view, and the partial response stays visible below.
+		// The partial response stays visible via the ScrollList copy; the
+		// error block is printed after it, in chronological order.
 		if m.stream != nil {
 			updated, cmd := m.stream.Update(app.SpinnerEvent{Show: false})
 			m.stream, _ = updated.(streamComponentIface)
 			cmds = append(cmds, cmd)
 		}
-		// Mark any trailing StreamingMessageItem as complete (see StepCompleteEvent).
-		if len(m.messages) > 0 {
-			if streamMsg, ok := m.messages[len(m.messages)-1].(*StreamingMessageItem); ok {
-				streamMsg.MarkComplete()
-			}
-		}
+		m.finalizeStreamTurn()
 		if msg.Err != nil {
 			m.printErrorResponse(msg)
 		}
-		m.state = stateInput
+		// Close the turn with a failure receipt, consistent with the Done and
+		// Interrupted receipts on the other terminal events. The error block
+		// above says what went wrong; the receipt records the turn's shape
+		// (tool count, elapsed) that the error itself omits.
+		m.printTurnReceipt(turnFailed)
+		m.setAgentState(stateInput)
 		m.canceling = false
 
 	case app.CompactCompleteEvent:
@@ -2217,7 +2776,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.stream != nil {
 			m.stream.Reset()
 		}
-		m.state = stateInput
+		m.setAgentState(stateInput)
 
 		// Mark the last streaming message as complete in ScrollList.
 		if len(m.messages) > 0 {
@@ -2247,7 +2806,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.stream != nil {
 			m.stream.Reset()
 		}
-		m.state = stateInput
+		m.setAgentState(stateInput)
 		m.printSystemMessage(fmt.Sprintf("Compaction failed: %v", msg.Err))
 
 	case app.ModelChangedEvent:
@@ -2261,6 +2820,12 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// changes needed — the UsageTracker was already mutated in-place.
 		// Returning from Update() triggers View() which re-renders the
 		// status bar with the latest token counts, cost, and context %.
+
+	case app.ThemeChangedEvent:
+		// The theme was replaced from outside the /theme command (an
+		// extension's ctx.SetTheme). The global theme is already set; this
+		// repaints the components that cache styling derived from it.
+		m.refreshTheme()
 
 	case app.WidgetUpdateEvent:
 		// Extension widget changed — recalculate height distribution so the
@@ -2391,6 +2956,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.PromptType {
 		case "select":
 			m.prompt = newSelectPrompt(msg.Message, msg.Options, m.width, m.height)
+		case "multiselect":
+			m.prompt = newMultiSelectPrompt(msg.Message, msg.Options, msg.DefaultSelected, m.width, m.height)
 		case "confirm":
 			defaultVal := msg.Default == "true"
 			m.prompt = newConfirmPrompt(msg.Message, defaultVal, m.width, m.height)
@@ -2504,8 +3071,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingUserPrints = append(m.pendingUserPrints, displayText)
 					m.flushStreamAndPendingUserMessages()
 				}
-				if m.state != stateWorking {
-					m.state = stateWorking
+				if !m.agentWorking() {
+					m.setAgentState(stateWorking)
 				}
 			}
 		}
@@ -2615,8 +3182,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // View implements tea.Model. It renders the stacked layout:
-// stream region + separator + [queued messages] + input region + status bar.
-// The status bar is always present (1 line) to avoid layout shifts.
+// stream region + separator + [queued messages] + [activity row] + input
+// region + status bar. The status bar is always present (1 line) to avoid
+// layout shifts; the activity row appears only while the agent is working.
 // When the tree selector is active, it replaces the stream region.
 func (m *AppModel) View() tea.View {
 	// When quitting, disable alt screen for clean terminal restoration.
@@ -2628,29 +3196,10 @@ func (m *AppModel) View() tea.View {
 		return v
 	}
 
-	// Tree selector overlay replaces the normal layout.
-	if m.state == stateTreeSelector && m.treeSelector != nil {
-		return m.treeSelector.View()
-	}
-
-	// Model selector is rendered as a centered overlay later (see below).
-
-	// Session selector overlay replaces the normal layout.
-	if m.state == stateSessionSelector && m.sessionSelector != nil {
-		return m.sessionSelector.View()
-	}
-
-	// Overlay dialog replaces the normal layout.
-	if m.state == stateOverlay && m.overlay != nil {
-		v := tea.NewView(m.overlay.Render())
-		v.AltScreen = true
-		v.MouseMode = tea.MouseModeCellMotion
-		v.ReportFocus = true
-		v.KeyboardEnhancements = tea.KeyboardEnhancements{
-			ReportEventTypes: true,
-		}
-		return v
-	}
+	// Tree selector, session selector and the overlay dialog are composited
+	// over the normal layout further down, alongside the slash popup and the
+	// model selector, so every modal in the app shows the conversation
+	// behind it instead of blanking the screen.
 
 	// Recompute layout heights if any Update() changed state that affects
 	// sizing. Deferring this to View() guarantees exactly one call per frame
@@ -2661,6 +3210,8 @@ func (m *AppModel) View() tea.View {
 	// and only repopulated by the distributeHeight() call below, so a stale
 	// render can never leak into a later frame.
 	m.chrome.valid = false
+	m.renderEpoch++
+	m.syncActivityRow()
 	if m.layoutDirty {
 		m.distributeHeight()
 		m.layoutDirty = false
@@ -2677,14 +3228,6 @@ func (m *AppModel) View() tea.View {
 
 	// Render scrollback content from ScrollList (replaces renderStream() in alt screen mode)
 	scrollbackView := m.renderScrollback()
-
-	// Propagate hint visibility to the input component before rendering.
-	// Hints are hidden by default for a cleaner UI; extensions cannot
-	// override this.
-	if ic, ok := m.input.(*InputComponent); ok {
-		ic.hideHint = true
-		ic.agentBusy = m.state == stateWorking
-	}
 
 	// When a prompt is active, it replaces the input area for consistency
 	// (appears below the separator, in the same position as the input).
@@ -2718,27 +3261,24 @@ func (m *AppModel) View() tea.View {
 		parts = append(parts, scrollbackView)
 	}
 
-	// Add canceling warning between scrollback and separator
-	// (doesn't go inside scrollback viewport to avoid affecting scroll position)
+	// Confirmation prompts for destructive keys live in the activity row while
+	// the agent is working, since that row is already showing the interrupt
+	// affordance and is where the eye is. When idle there is no activity row,
+	// so the prompt gets its own line here instead.
 	theme := style.GetTheme()
-	if m.canceling {
+	if m.ctrlCPressedOnce && !m.agentWorking() {
 		warning := lipgloss.NewStyle().
 			Foreground(theme.Warning).
-			Bold(true).
-			Render("  ⚠ Press ESC again to cancel")
-		parts = append(parts, warning)
-	}
-
-	if m.ctrlCPressedOnce {
-		warning := lipgloss.NewStyle().
-			Foreground(theme.Warning).
-			Bold(true).
-			Render("  ⚠ Press Ctrl+C again to quit")
+			Render(strings.Repeat(" ", style.ContentOffset) + "ctrl+c again to quit")
 		parts = append(parts, warning)
 	}
 
 	if !vis.HideSeparator {
-		parts = append(parts, m.renderSeparator())
+		// The separator only materialises when it has something to say, so
+		// an idle screen carries no rule between transcript and composer.
+		if sep := m.renderSeparator(); sep != "" {
+			parts = append(parts, sep)
+		}
 	}
 
 	// Render "above" widgets between separator and queued messages.
@@ -2758,10 +3298,21 @@ func (m *AppModel) View() tea.View {
 		parts = append(parts, queuedView)
 	}
 
+	// Live activity sits immediately above the composer so the eye finds it
+	// in the same place it is about to type. It costs zero lines when idle.
+	activityView := m.chrome.activity
+	if !m.chrome.valid {
+		activityView = m.renderActivityRow()
+	}
+	if activityView != "" {
+		parts = append(parts, activityView)
+	}
+
 	// Calculate inputYOffset: the Y position where the input area starts.
 	// This is the cumulative height of all parts rendered before the input.
 	m.inputYOffset = lipgloss.Height(strings.Join(parts, "\n"))
 
+	inputPartIndex := len(parts)
 	parts = append(parts, inputView)
 
 	// Set inputHeight for mouse coordinate conversion.
@@ -2788,19 +3339,56 @@ func (m *AppModel) View() tea.View {
 
 	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
-	// Render slash command popup as centered overlay if active
+	// Record where directly-placed images landed. This must happen with the
+	// assembled parts in hand: the absolute screen row of a preview is only
+	// knowable once everything above and below it has been measured.
+	m.gfxPlacement = m.computeGfxPlacement(parts, inputPartIndex)
+
+	// Composite every modal surface over the layout at the cell level, so
+	// the conversation stays visible around each one. Ordering is z-order:
+	// later draws sit on top.
 	finalContent := content
+
+	// Slash / @ autocomplete popup.
 	if ic, ok := m.input.(*InputComponent); ok {
-		if popupContent := ic.RenderPopupCentered(m.width, m.height); popupContent != "" {
-			// Overlay popup content on top of main content
-			finalContent = overlayContent(content, popupContent, m.width, m.height)
+		if box := ic.RenderPopupBox(m.width, m.height); box != "" {
+			finalContent = compositeCentered(finalContent, box, m.width, m.height)
 		}
 	}
 
-	// Render model selector as centered overlay if active
+	// Model selector.
 	if m.state == stateModelSelector && m.modelSelector != nil {
-		popupContent := m.modelSelector.RenderOverlay(m.width, m.height)
-		finalContent = overlayContent(finalContent, popupContent, m.width, m.height)
+		finalContent = compositeCentered(finalContent, m.modelSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Tree selector (/tree).
+	if m.state == stateTreeSelector && m.treeSelector != nil {
+		finalContent = compositeCentered(finalContent, m.treeSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Session selector (/resume).
+	if m.state == stateSessionSelector && m.sessionSelector != nil {
+		finalContent = compositeCentered(finalContent, m.sessionSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Modal dialog — extension overlays and the message inspector. Honours
+	// the caller's vertical anchor.
+	if m.state == stateOverlay && m.overlay != nil {
+		finalContent = compositeAnchored(finalContent, m.overlay.Render(), m.overlay.Anchor(), m.width, m.height)
+	}
+
+	// Notice a repaint. The renderer scrolls the screen to update it, and a
+	// terminal scrolls its images along with the text, so any change to the
+	// frame can move an image that is not part of the frame. Hashing the
+	// content is how a directly-placed image learns it must be drawn again.
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(finalContent))
+	if sum := h.Sum64(); sum != m.gfxContentHash {
+		m.gfxContentHash = sum
+		// Only a frame that still shows an image needs one drawn. The hash is
+		// updated either way, so that a frame rendered while no image was
+		// attached cannot later be mistaken for an unchanged screen.
+		m.gfxDirty = m.gfxPlacement != ""
 	}
 
 	v := tea.NewView(finalContent)
@@ -2816,35 +3404,6 @@ func (m *AppModel) View() tea.View {
 // --------------------------------------------------------------------------
 // Rendering helpers
 // --------------------------------------------------------------------------
-
-// overlayContent overlays popup content on top of base content line-by-line.
-// Both content strings should be full-screen (width x height).
-func overlayContent(base, overlay string, width, height int) string {
-	baseLines := strings.Split(base, "\n")
-	overlayLines := strings.Split(overlay, "\n")
-
-	// Ensure we have exactly height lines
-	for len(baseLines) < height {
-		baseLines = append(baseLines, strings.Repeat(" ", width))
-	}
-	for len(overlayLines) < height {
-		overlayLines = append(overlayLines, strings.Repeat(" ", width))
-	}
-
-	// Merge lines - overlay takes precedence where non-empty
-	result := make([]string, height)
-	for i := range height {
-		if i < len(overlayLines) && strings.TrimSpace(overlayLines[i]) != "" {
-			result[i] = overlayLines[i]
-		} else if i < len(baseLines) {
-			result[i] = baseLines[i]
-		} else {
-			result[i] = strings.Repeat(" ", width)
-		}
-	}
-
-	return strings.Join(result, "\n")
-}
 
 // refreshContent updates the ScrollList with current messages.
 // Called whenever messages change (new message, streaming update, etc.)
@@ -2871,95 +3430,105 @@ func (m *AppModel) renderScrollback() string {
 // priority). Right side: provider · model + usage stats.
 // This bar is always present so its height is constant, eliminating layout
 // shifts from spinner or usage info appearing/disappearing.
+// renderStatusBar renders the ambient footer: a single muted line carrying
+// context that is true regardless of what the agent is doing.
+//
+//	~/Workspace/kit (main)        anthropic · claude-opus-5 · 7.2K · $0.02
+//
+// Live activity deliberately does not appear here — it owns the activity row
+// directly above the composer (see renderActivityRow). Keeping the two apart
+// means a long-running command can never be squeezed out by a token counter.
 func (m *AppModel) renderStatusBar() string {
 	theme := style.GetTheme()
+	muted := lipgloss.NewStyle().Foreground(theme.Muted)
+	veryMuted := lipgloss.NewStyle().Foreground(theme.VeryMuted)
 
-	// Left side: spinner animation (when active).
+	// Left: working directory, plus the git branch when one is known.
+	// While message navigation owns the keyboard its key hints take that
+	// slot instead: the rebound keys are transient and need discovering,
+	// whereas the path is ambient and always recoverable by pressing Esc.
+	//
+	// The mode label stays up while the inspector is open, because Esc there
+	// returns to navigation rather than leaving it. Its key hints do not: the
+	// dialog carries its own, and showing both would advertise two sets of
+	// bindings for one keyboard.
 	var leftSide string
-	if m.stream != nil {
-		leftSide = m.stream.SpinnerView()
+	if m.navActive() {
+		var trailing string
+		switch {
+		case m.state != stateMessageNav:
+			// A modal opened from navigation owns the keyboard and the hints.
+		case m.navNotice != "":
+			// A notice displaces the key hints rather than crowding in beside
+			// them: it is transient and answers something the user just did,
+			// whereas the hints are always one Esc away from being needed.
+			trailing = "  " + lipgloss.NewStyle().Foreground(theme.Success).Render(m.navNotice)
+		default:
+			trailing = veryMuted.Render("  ↑/↓ move · u/U user · y copy · enter open · esc exit")
+		}
+		leftSide = " " + lipgloss.NewStyle().
+			Foreground(theme.Accent).
+			Render("MESSAGE NAV") + trailing
+	} else if m.cwd != "" {
+		left := tildeHome(m.cwd)
+		if m.gitBranch != "" {
+			left += " (" + m.gitBranch + ")"
+		}
+		leftSide = " " + muted.Render(left)
 	}
 
-	// Middle: thinking level (when reasoning model) + extension status bar entries.
+	// Extension status entries and the thinking level sit next to the path.
+	// They are ambient facts, not activity.
 	var middleParts []string
 	if m.isReasoningModel && m.thinkingLevel != "" && m.thinkingLevel != "off" {
-		thinkingLabel := "Thinking: " + m.thinkingLevel
-		middleParts = append(middleParts, lipgloss.NewStyle().
-			Foreground(theme.Secondary).
-			Render(thinkingLabel))
+		middleParts = append(middleParts, veryMuted.Render("thinking: "+m.thinkingLevel))
 	}
 	if m.getStatusBarEntries != nil {
-		entries := m.getStatusBarEntries()
-		for _, e := range entries {
-			middleParts = append(middleParts, lipgloss.NewStyle().
-				Foreground(theme.Muted).
-				Render(e.Text))
+		for _, e := range m.getStatusBarEntries() {
+			middleParts = append(middleParts, veryMuted.Render(e.Text))
 		}
 	}
-	middleSide := strings.Join(middleParts, "  ")
+	middleSide := strings.Join(middleParts, veryMuted.Render(" · "))
 	if middleSide != "" && leftSide != "" {
-		middleSide = "  " + middleSide
+		middleSide = veryMuted.Render(" · ") + middleSide
 	}
 
-	// Right side: help hint + provider · model + usage stats.
-	// Order matters for progressive truncation — least important first.
+	// Right: provider, model, then usage. Ordered least-important-first so
+	// progressive truncation drops cost before it drops the model name.
 	var rightParts []string
-
-	rightParts = append(rightParts, lipgloss.NewStyle().
-		Foreground(theme.VeryMuted).
-		Render("/help for help"))
-
-	var modelLabel string
 	if m.providerName != "" && m.modelName != "" {
-		modelLabel = m.providerName + " · " + m.modelName
+		rightParts = append(rightParts, muted.Render(m.providerName+" · "+m.modelName))
 	} else if m.modelName != "" {
-		modelLabel = m.modelName
+		rightParts = append(rightParts, muted.Render(m.modelName))
 	}
-	if modelLabel != "" {
-		rightParts = append(rightParts, lipgloss.NewStyle().
-			Foreground(theme.Muted).
-			Render(modelLabel))
-	}
-
 	if m.usageTracker != nil {
 		if usage := m.usageTracker.RenderUsageInfo(); usage != "" {
 			rightParts = append(rightParts, usage)
 		}
 	}
+	sep := veryMuted.Render(" · ")
+	rightSide := strings.Join(rightParts, sep)
 
-	rightSide := strings.Join(rightParts, "  |  ")
-
-	// Progressive truncation to keep the status bar on one line.
-	// When content exceeds terminal width, drop sections in order:
-	// middle (extensions/thinking) → help hint → usage → model → all.
-	leftW := lipgloss.Width(leftSide)
-	middleW := lipgloss.Width(middleSide)
-	rightW := lipgloss.Width(rightSide)
-
-	// Need at least 1 space gap between left+middle and right.
-	if leftW+middleW+rightW+1 > m.width {
-		// Drop middle section first (extensions/thinking status).
+	// Progressive truncation, in order: extension/thinking entries, then
+	// usage, then the model label, then the path.
+	fits := func(l, mid, r string) bool {
+		return lipgloss.Width(l)+lipgloss.Width(mid)+lipgloss.Width(r)+1 <= m.width
+	}
+	if !fits(leftSide, middleSide, rightSide) {
 		middleSide = ""
-		middleW = 0
 	}
-	if leftW+rightW+1 > m.width && len(rightParts) > 2 {
-		// Drop help hint first.
-		rightParts = rightParts[1:]
-		rightSide = strings.Join(rightParts, "  |  ")
-		rightW = lipgloss.Width(rightSide)
-	}
-	if leftW+rightW+1 > m.width && len(rightParts) > 1 {
-		// Drop usage (last) next, keep model label.
+	if !fits(leftSide, middleSide, rightSide) && len(rightParts) > 1 {
 		rightParts = rightParts[:len(rightParts)-1]
-		rightSide = strings.Join(rightParts, "  |  ")
-		rightW = lipgloss.Width(rightSide)
+		rightSide = strings.Join(rightParts, sep)
 	}
-	if leftW+rightW+1 > m.width {
+	if !fits(leftSide, middleSide, rightSide) {
+		leftSide = ""
+	}
+	if !fits(leftSide, middleSide, rightSide) {
 		rightSide = ""
-		rightW = 0
 	}
 
-	gap := max(m.width-leftW-middleW-rightW, 1)
+	gap := max(m.width-lipgloss.Width(leftSide)-lipgloss.Width(middleSide)-lipgloss.Width(rightSide), 1)
 	return leftSide + middleSide + strings.Repeat(" ", gap) + rightSide
 }
 
@@ -2987,42 +3556,52 @@ func (m *AppModel) cycleThinkingLevel() {
 		// Run in goroutine to avoid blocking the event loop (provider
 		// recreation may take time).
 		go func() {
-			_ = m.setThinkingLevel(next)
+			// ThinkingLevelChangeEvent.NewLevel promises the level now in
+			// effect, so announce only once the provider has accepted it.
+			if err := m.setThinkingLevel(next); err == nil {
+				m.notifyThinkingLevel(next, current, "user")
+			}
 		}()
+	} else {
+		m.notifyThinkingLevel(next, current, "user")
 	}
 
 	// Persist thinking level for next launch.
 	go func() { _ = prefs.SaveThinkingLevelPreference(next) }()
 }
 
-// renderSeparator renders the separator line with an optional queue/steer count badge.
+// renderSeparator renders the queue/steer announcement shown between the
+// transcript and the composer.
+//
+// There is deliberately no full-width rule here. The transcript and the
+// composer are already separated by the composer's own filled background and
+// by whitespace; drawing a horizontal line as well was the single heaviest
+// element on screen and carried no information. When there is nothing queued
+// or steering, this returns "" and costs no vertical space.
 func (m *AppModel) renderSeparator() string {
-	theme := style.GetTheme()
-	lineStyle := lipgloss.NewStyle().Foreground(theme.Border)
 	queueLen := len(m.queuedMessages)
 	steerLen := len(m.steeringMessages)
-
-	if steerLen > 0 || queueLen > 0 {
-		var parts []string
-		if steerLen > 0 {
-			parts = append(parts, lipgloss.NewStyle().
-				Foreground(theme.Warning).
-				Render(fmt.Sprintf("%d steering", steerLen)))
-		}
-		if queueLen > 0 {
-			parts = append(parts, lipgloss.NewStyle().
-				Foreground(theme.Secondary).
-				Render(fmt.Sprintf("%d queued", queueLen)))
-		}
-		badge := strings.Join(parts, " ")
-
-		// Fill the separator with dashes up to the badge.
-		dashWidth := max(m.width-lipgloss.Width(badge)-1, 0)
-		dashes := lineStyle.Render(repeatRune('─', dashWidth))
-		return dashes + " " + badge
+	if steerLen == 0 && queueLen == 0 {
+		return ""
 	}
 
-	return lineStyle.Render(repeatRune('─', m.width))
+	theme := style.GetTheme()
+	var parts []string
+	if steerLen > 0 {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(theme.Warning).
+			Render(fmt.Sprintf("%d steering", steerLen)))
+	}
+	if queueLen > 0 {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(theme.Secondary).
+			Render(fmt.Sprintf("%d queued", queueLen)))
+	}
+	badge := strings.Join(parts, " ")
+
+	// Right-align the badge so it reads as chrome rather than as content.
+	pad := max(m.width-lipgloss.Width(badge)-1, 1)
+	return strings.Repeat(" ", pad) + badge
 }
 
 // renderInput returns the input region content. If an editor interceptor
@@ -3055,7 +3634,10 @@ func (m *AppModel) renderWidgetSlot(placement string) string {
 	theme := style.GetTheme()
 	var blocks []string
 	for _, w := range widgets {
-		content := w.Text
+		content, ok := m.resolveWidgetContent(w, placement+":"+w.ID, m.width)
+		if !ok {
+			continue
+		}
 
 		var opts []renderingOption
 		opts = append(opts, WithAlign(lipgloss.Left))
@@ -3079,10 +3661,11 @@ func (m *AppModel) renderWidgetSlot(placement string) string {
 	return strings.Join(blocks, "\n")
 }
 
-// renderHeaderFooter renders a custom header or footer from an extension. The
-// getter function returns the current data ([]WidgetData) or nil when inactive.
-// Returns the rendered view and its height. Uses the same rendering pipeline as
-// widgets for visual consistency.
+// renderHeaderFooterSlot renders the custom header or footer widgets
+// supplied by an extension. The getter returns the current slice
+// ([]WidgetData) or empty when inactive. It returns the rendered view
+// and its height. Widgets are laid out side-by-side. Uses the same
+// rendering pipeline as widgets for visual consistency.
 func (m *AppModel) renderHeaderFooterSlot(getter func() []WidgetData) (string, int) {
 	if getter == nil {
 		return "", 0
@@ -3094,22 +3677,33 @@ func (m *AppModel) renderHeaderFooterSlot(getter func() []WidgetData) (string, i
 
 	theme := style.GetTheme()
 	var rendered []string
-	for _, w := range widgets {
+	for i, w := range widgets {
+		content, ok := m.resolveWidgetContent(w, fmt.Sprintf("hf-slot:%d", i), m.width)
+		if !ok {
+			continue
+		}
 		opts := []renderingOption{
 			WithAlign(lipgloss.Left),
 			WithPaddingTop(0), WithPaddingBottom(0),
 			WithAutoWidth(),
 		}
-		borderClr := theme.Accent
-		if w.BorderColor != "" {
-			borderClr = lipgloss.Color(w.BorderColor)
+		if w.NoBorder {
+			opts = append(opts, WithNoBorder())
+		} else {
+			borderClr := theme.Accent
+			if w.BorderColor != "" {
+				borderClr = lipgloss.Color(w.BorderColor)
+			}
+			opts = append(opts, WithBorderColor(borderClr))
 		}
-		opts = append(opts, WithBorderColor(borderClr))
-		rendered = append(rendered, renderContentBlock(w.Text, 0, opts...))
+		rendered = append(rendered, renderContentBlock(content, 0, opts...))
+	}
+	if len(rendered) == 0 {
+		return "", 0
 	}
 
 	// Join side-by-side with gaps.
-	gap := "  " // two spaces between widgets
+	gap := "  "
 	var spaced []string
 	for i, r := range rendered {
 		spaced = append(spaced, r)
@@ -3119,6 +3713,166 @@ func (m *AppModel) renderHeaderFooterSlot(getter func() []WidgetData) (string, i
 	}
 	view := lipgloss.JoinHorizontal(lipgloss.Top, spaced...)
 	return view, lipgloss.Height(view)
+}
+
+// widgetContentWidth returns the number of columns available to widget content
+// once the block's gutter glyph and horizontal padding are subtracted. This is
+// the width handed to a WidgetData.Render callback, so extensions can size
+// their own output to the exact column they will be drawn into.
+func widgetContentWidth(containerWidth int, noBorder bool) int {
+	borderChars := 1
+	if noBorder {
+		borderChars = 0
+	}
+	return containerWidth - borderChars - (style.ContentOffset - 1) - style.RightMargin
+}
+
+// widgetFrameDivisor maps a requested repaint rate to a number of shared-clock
+// frames. The clock runs at a fixed FrameClockFPS, so a widget that wants less
+// than that subdivides it, exactly as the activity spinner does.
+func widgetFrameDivisor(hz int) int {
+	if hz <= 0 || hz >= FrameClockFPS {
+		return 1
+	}
+	return FrameClockFPS / hz
+}
+
+// animatedWidgets reports whether any extension widget, header or footer has
+// asked for continuous repaints. It is what lets an extension keep the shared
+// animation clock alive; see wantsFrames.
+func (m *AppModel) animatedWidgets() bool {
+	if m.getWidgets != nil {
+		for _, placement := range []string{"above", "below"} {
+			for _, w := range m.getWidgets(placement) {
+				if w.Render != nil && w.RefreshHz > 0 {
+					return true
+				}
+			}
+		}
+	}
+	for _, gets := range []func() []WidgetData{m.getHeaders, m.getFooters} {
+		if gets == nil {
+			continue
+		}
+		if ds := gets(); ds != nil && len(ds) > 0 && ds[0].Render != nil && ds[0].RefreshHz > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveWidgetContent produces the body for a widget, header or footer slot.
+//
+// A Render callback wins over Text and its output is used verbatim, which is
+// what lets an extension draw arbitrary UI. Text is styled as markdown only
+// when asked for. The bool result is false when the slot should be skipped
+// entirely (empty content, or a width too small to draw into).
+//
+// key identifies the slot for the animation render cache. Every View() pass
+// invalidates the chrome cache, so without this an animated widget would
+// re-enter the interpreter on every one of the 30 frames a second the clock
+// ticks at. Gating on the widget's own rate keeps that crossing proportional
+// to what it actually asked for.
+func (m *AppModel) resolveWidgetContent(w WidgetData, key string, containerWidth int) (string, bool) {
+	width := widgetContentWidth(containerWidth, w.NoBorder)
+
+	if w.Render != nil {
+		if width < 1 {
+			return "", false
+		}
+
+		if cached, ok := m.cachedWidgetRender(w, key, width); ok {
+			if cached == "" {
+				return "", false
+			}
+			return cached, true
+		}
+
+		// Extension code runs here. A panic in a widget must not take down the
+		// TUI, so it degrades to a hidden widget.
+		content := safeWidgetRender(w.Render, width)
+		m.storeWidgetRender(w, key, width, content)
+		if content == "" {
+			return "", false
+		}
+		return content, true
+	}
+
+	if w.Text == "" {
+		return "", false
+	}
+	if w.Markdown {
+		return widgetMarkdown(w.Text, containerWidth, w.NoBorder), true
+	}
+	return w.Text, true
+}
+
+// widgetBeat returns the cache generation for a widget's Render output.
+//
+// An animated widget advances on its own subdivision of the shared clock, so
+// its Render is entered at the rate it asked for rather than on every frame.
+// A static widget uses the current View() pass, which caches nothing across
+// frames but does guarantee the measure and paint passes agree.
+func (m *AppModel) widgetBeat(w WidgetData) int {
+	if w.RefreshHz > 0 {
+		return m.frames.frame / widgetFrameDivisor(w.RefreshHz)
+	}
+	return m.renderEpoch
+}
+
+// cachedWidgetRender returns a previously rendered body when the widget is not
+// due to advance. See widgetBeat for what "due" means in each mode.
+func (m *AppModel) cachedWidgetRender(w WidgetData, key string, width int) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	entry, ok := m.widgetRenders[key]
+	if !ok || entry.width != width || entry.beat != m.widgetBeat(w) {
+		return "", false
+	}
+	return entry.content, true
+}
+
+// storeWidgetRender records a render for the widget cache.
+func (m *AppModel) storeWidgetRender(w WidgetData, key string, width int, content string) {
+	if key == "" {
+		return
+	}
+	if m.widgetRenders == nil {
+		m.widgetRenders = make(map[string]widgetRenderCache)
+	}
+	m.widgetRenders[key] = widgetRenderCache{
+		content: content,
+		width:   width,
+		beat:    m.widgetBeat(w),
+	}
+}
+
+// safeWidgetRender invokes an extension render callback, converting a panic
+// into empty output rather than crashing the render loop.
+func safeWidgetRender(render func(int) string, width int) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("extension widget render panicked", "error", r)
+			out = ""
+		}
+	}()
+	return render(width)
+}
+
+// widgetMarkdown renders widget/header/footer content as styled markdown,
+// sized to the text column that renderContentBlock will lay it into.
+//
+// The block reserves one column for the gutter glyph (when bordered), plus
+// the shared left content offset and the right margin; rendering markdown at
+// the full container width would wrap a second time inside those paddings.
+func widgetMarkdown(content string, containerWidth int, noBorder bool) string {
+	width := widgetContentWidth(containerWidth, noBorder)
+	if width < 1 {
+		return content
+	}
+
+	return strings.TrimSuffix(style.ToMarkdown(content, width), "\n")
 }
 
 // maxQueuedMessageLines is the maximum number of visible content lines
@@ -3243,15 +3997,30 @@ func truncateMessageForBlock(msg string, maxLines, width int) string {
 type imagePreviewReadyMsg struct {
 	block    string
 	anchorID string
+
+	// transmit carries image data that must reach the terminal outside the
+	// view text, and is empty for half-block previews. See
+	// imagepreview.Thumbnail.
+	transmit string
 }
 
-// transcriptPreviewCmd returns a tea.Cmd that renders half-block thumbnail
-// previews for the given clipboard images off the Bubble Tea event loop
-// (decode + resample must not block Update). The rendered block is delivered
-// via imagePreviewReadyMsg, tagged with anchorID so the consumer can place it
+// transcriptPreviewCmd returns a tea.Cmd that renders thumbnail previews for
+// the given clipboard images off the Bubble Tea event loop (decode + resample
+// must not block Update). The rendered block is delivered via
+// imagePreviewReadyMsg, tagged with anchorID so the consumer can place it
 // directly after the originating user message. Returns nil when there is
 // nothing to render or no room for a preview; an empty result (terminal lacks
 // color support) yields a nil message that Bubble Tea ignores.
+//
+// Unicode placeholders are used when the terminal supports them, because a
+// transcript preview lives in the scrollback: the ScrollList scrolls and clips
+// its items, and placeholder cells are text, so the image scrolls and clips
+// with the message it belongs to.
+//
+// Direct placement deliberately is not used here even where the composer uses
+// it. A directly placed image is painted at a fixed screen position and would
+// neither scroll with the transcript nor vanish when its message scrolls away,
+// so those terminals keep half blocks for transcript previews.
 func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorID string) tea.Cmd {
 	if len(images) == 0 {
 		return nil
@@ -3265,10 +4034,22 @@ func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorI
 	}
 	bg := style.GetTheme().Background
 	imgs := images
+	usePlaceholders := termgfx.PreviewMode() == termgfx.ModePlaceholder
+	caps := termgfx.Current()
 	return func() tea.Msg {
-		pad := lipgloss.NewStyle().PaddingLeft(2)
+		pad := lipgloss.NewStyle().PaddingLeft(style.ContentOffset)
 		var blocks []string
+		var transmit strings.Builder
 		for _, img := range imgs {
+			if usePlaceholders {
+				kt, err := imagepreview.RenderKitty(img.Data, cols, thumbMaxRows, caps.CellWidth, caps.CellHeight)
+				if err == nil && kt.Cells != "" {
+					transmit.WriteString(kt.Transmit)
+					blocks = append(blocks, pad.Render(kt.Cells))
+					continue
+				}
+				log.Debug("kitty transcript preview failed, using half blocks", "error", err)
+			}
 			thumb, err := imagepreview.Render(img.Data, img.MediaType, cols, thumbMaxRows, bg)
 			if err != nil || thumb == "" {
 				continue
@@ -3278,7 +4059,11 @@ func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorI
 		if len(blocks) == 0 {
 			return nil
 		}
-		return imagePreviewReadyMsg{block: strings.Join(blocks, "\n"), anchorID: anchorID}
+		return imagePreviewReadyMsg{
+			block:    strings.Join(blocks, "\n"),
+			anchorID: anchorID,
+			transmit: transmit.String(),
+		}
 	}
 }
 
@@ -3324,11 +4109,13 @@ func (m *AppModel) printUserMessage(text string) {
 		}
 	}
 
-	// Render styled content using MessageRenderer
-	styledMsg := m.renderer.RenderUserMessage(text, time.Now())
+	now := time.Now()
 
-	// Add to in-memory scrollList with styled content
-	msg := NewStyledMessageItem(generateMessageID(), "user", text, styledMsg.Content)
+	// Add to in-memory scrollList. The renderer call is deferred into a
+	// closure so the block repaints itself after a theme change.
+	msg := NewThemedMessageItem(generateMessageID(), "user", text, func() string {
+		return m.renderer.RenderUserMessage(text, now).Content
+	})
 	m.messages = append(m.messages, msg)
 
 	// Refresh ScrollList content and scroll to bottom
@@ -3338,11 +4125,14 @@ func (m *AppModel) printUserMessage(text string) {
 // printAssistantMessage renders an assistant message into the ScrollList.
 func (m *AppModel) printAssistantMessage(text string) {
 	if strings.TrimSpace(text) != "" {
-		// Render styled content using MessageRenderer
-		styledMsg := m.renderer.RenderAssistantMessage(text, time.Now(), m.modelName)
+		now := time.Now()
+		modelName := m.modelName
 
-		// Add to in-memory scrollList with styled content
-		msg := NewStyledMessageItem(generateMessageID(), "assistant", text, styledMsg.Content)
+		// Add to in-memory scrollList. The renderer call is deferred into a
+		// closure so the block repaints itself after a theme change.
+		msg := NewThemedMessageItem(generateMessageID(), "assistant", text, func() string {
+			return m.renderer.RenderAssistantMessage(text, now, modelName).Content
+		})
 		m.messages = append(m.messages, msg)
 
 		// Refresh ScrollList content and scroll to bottom
@@ -3352,25 +4142,123 @@ func (m *AppModel) printAssistantMessage(text string) {
 
 // printToolResult renders a tool result message into the ScrollList.
 func (m *AppModel) printToolResult(evt app.ToolResultEvent) {
-	// Render styled tool message using MessageRenderer
-	styledMsg := m.renderer.RenderToolMessage(evt.ToolName, evt.ToolArgs, evt.Result, evt.IsError)
+	m.turnToolCount++
 
-	// Add to in-memory scrollList with styled content
-	msg := NewStyledMessageItem(generateMessageID(), "tool", styledMsg.Content, styledMsg.Content)
+	// Keep the untruncated result as the item's raw content. The styled
+	// rendering caps output (10 lines for generic results, 20 for diffs and
+	// code) and elides long arguments in the header, so without this the
+	// message inspector could only ever show the same elided text the
+	// scrollback already displays.
+	raw := toolRawContent(evt.ToolName, evt.ToolArgs, evt.Result, evt.IsError)
+
+	// Add to in-memory scrollList. The renderer call is deferred into a
+	// closure so the block repaints itself after a theme change.
+	msg := NewThemedMessageItem(generateMessageID(), "tool", raw, func() string {
+		return m.renderer.RenderToolMessage(evt.ToolName, evt.ToolArgs, evt.Result, evt.IsError).Content
+	}).WithToolCall(ToolCallInfo{
+		// Kept structured as well as flattened: the inspector re-renders the
+		// body uncapped, which needs the parts, not the transcript's summary.
+		Name:    evt.ToolName,
+		Args:    evt.ToolArgs,
+		Result:  evt.Result,
+		IsError: evt.IsError,
+	})
 	m.messages = append(m.messages, msg)
 
 	// Refresh ScrollList content
 	m.refreshContent()
 }
 
+// toolRawContent composes the full, untruncated record of a tool call for
+// the message inspector: the tool name, its arguments, and the complete
+// result body.
+//
+// The scrollback header shows only a truncated one-line summary of the
+// arguments (formatToolParams), so the full argument set — e.g. a long bash
+// command — is only recoverable from here.
+func toolRawContent(toolName, toolArgs, result string, isError bool) string {
+	var b strings.Builder
+
+	b.WriteString(toolName)
+	if isError {
+		b.WriteString(" (error)")
+	}
+	b.WriteString("\n")
+
+	if args := strings.TrimSpace(toolArgs); args != "" && args != "{}" {
+		b.WriteString("\n")
+		b.WriteString(formatToolArgsForInspector(args))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(result)
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// formatToolArgsForInspector renders tool arguments for full display.
+//
+// Single string values (a bash command, a file path) are printed as bare
+// "key: value" lines so the value stays copy-pasteable: JSON encoding would
+// escape every quote and collapse newlines into \n, which is exactly what
+// makes a long shell command unreadable. Structured values fall back to
+// indented JSON.
+func formatToolArgsForInspector(args string) string {
+	var params map[string]any
+	if err := json.Unmarshal([]byte(args), &params); err != nil {
+		// Not an object — show the argument text as-is.
+		return args
+	}
+	if len(params) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(k)
+		switch v := params[k].(type) {
+		case string:
+			if strings.Contains(v, "\n") {
+				// Multi-line values start on their own line so the key
+				// doesn't visually bind to only the first line.
+				b.WriteString(":\n")
+			} else {
+				b.WriteString(": ")
+			}
+			b.WriteString(v)
+		default:
+			b.WriteString(": ")
+			if enc, err := json.MarshalIndent(v, "", "  "); err == nil {
+				b.Write(enc)
+			} else {
+				fmt.Fprintf(&b, "%v", v)
+			}
+		}
+	}
+	return b.String()
+}
+
 // printErrorResponse renders an error message into the ScrollList.
 func (m *AppModel) printErrorResponse(evt app.StepErrorEvent) {
 	if evt.Err != nil {
-		// Render styled error message using MessageRenderer
-		styledMsg := m.renderer.RenderErrorMessage(evt.Err.Error(), time.Now())
+		errText := evt.Err.Error()
+		now := time.Now()
 
-		// Add to in-memory scrollList with styled content
-		msg := NewStyledMessageItem(generateMessageID(), "error", styledMsg.Content, styledMsg.Content)
+		// Add to in-memory scrollList. The renderer call is deferred into a
+		// closure so the block repaints itself after a theme change.
+		msg := NewThemedMessageItem(generateMessageID(), "error", errText, func() string {
+			return m.renderer.RenderErrorMessage(errText, now).Content
+		})
 		m.messages = append(m.messages, msg)
 
 		// Refresh ScrollList content
@@ -3409,6 +4297,8 @@ func (m *AppModel) handleSlashCommand(sc *commands.SlashCommand, args string) te
 		return m.handleCompactCommand(args)
 	case "/reload-ext":
 		return m.handleReloadExtCommand()
+	case "/shortcuts":
+		return m.handleShortcutsCommand()
 	case "/clear":
 		if m.appCtrl != nil {
 			m.appCtrl.ClearMessages()
@@ -3459,11 +4349,13 @@ func (m *AppModel) handleSlashCommand(sc *commands.SlashCommand, args string) te
 
 // printSystemMessage renders a system-level message into the ScrollList.
 func (m *AppModel) printSystemMessage(text string) {
-	// Render styled system message using MessageRenderer
-	styledMsg := m.renderer.RenderSystemMessage(text, time.Now())
+	now := time.Now()
 
-	// Add to in-memory scrollList with styled content
-	msg := NewStyledMessageItem(generateMessageID(), "system", styledMsg.Content, styledMsg.Content)
+	// Add to in-memory scrollList. The renderer call is deferred into a
+	// closure so the block repaints itself after a theme change.
+	msg := NewThemedMessageItem(generateMessageID(), "system", text, func() string {
+		return m.renderer.RenderSystemMessage(text, now).Content
+	})
 	m.messages = append(m.messages, msg)
 
 	// Refresh ScrollList content
@@ -3472,9 +4364,11 @@ func (m *AppModel) printSystemMessage(text string) {
 
 // printCustomMessage renders a message with a custom alert label into the ScrollList.
 func (m *AppModel) printCustomMessage(text, label string) {
-	styledMsg := m.renderer.RenderCustomMessage(text, label, time.Now())
+	now := time.Now()
 
-	msg := NewStyledMessageItem(generateMessageID(), "system", styledMsg.Content, styledMsg.Content)
+	msg := NewThemedMessageItem(generateMessageID(), "system", text, func() string {
+		return m.renderer.RenderCustomMessage(text, label, now).Content
+	})
 	m.messages = append(m.messages, msg)
 
 	m.refreshContent()
@@ -3483,31 +4377,13 @@ func (m *AppModel) printCustomMessage(text, label string) {
 // printExtensionBlock renders a custom styled block from an extension with
 // caller-chosen border color and optional subtitle into the ScrollList.
 func (m *AppModel) printExtensionBlock(evt app.ExtensionPrintEvent) {
-	theme := style.GetTheme()
-
-	// Resolve border color: use the extension's hex value, fall back to theme info.
-	borderClr := theme.Info
-	if evt.BorderColor != "" {
-		borderClr = lipgloss.Color(evt.BorderColor)
-	}
-
-	// Build content: main text + optional subtitle line.
-	content := evt.Text
-	if evt.Subtitle != "" {
-		sub := lipgloss.NewStyle().Foreground(theme.VeryMuted).Render(" " + evt.Subtitle)
-		content = strings.TrimSuffix(content, "\n") + "\n" + sub
-	}
-
-	rendered := renderContentBlock(
-		content,
-		m.width,
-		WithAlign(lipgloss.Left),
-		WithBorderColor(borderClr),
-		WithMarginBottom(1),
-	)
-
-	// Add to in-memory scrollList with rendered content
-	msg := NewStyledMessageItem(generateMessageID(), "extension", rendered, rendered)
+	// Add to in-memory scrollList. The renderer call is deferred into a
+	// closure so the block repaints itself after a theme change. Note that
+	// evt.BorderColor is the extension's own choice and stays fixed; only the
+	// theme-derived parts of the block follow the active palette.
+	msg := NewThemedMessageItem(generateMessageID(), "extension", evt.Text, func() string {
+		return m.renderer.RenderExtensionBlock(evt.Text, evt.BorderColor, evt.Subtitle).Content
+	})
 	m.messages = append(m.messages, msg)
 
 	// Refresh ScrollList content
@@ -3546,14 +4422,14 @@ func (m *AppModel) handleExtensionCommand(text string) tea.Cmd {
 	// commands may block on interactive prompts (ctx.PromptSelect etc.) which
 	// wait for the TUI to respond via a channel. A blocking tea.Cmd can stall
 	// BubbleTea's internal Cmd scheduler, causing intermittent freezes.
-	// The goroutine delivers its result via SendEvent (prog.Send) instead.
+	// The goroutine delivers its result via SendUIMessage (prog.Send) instead.
 	cmdName := ecmd.Name
 	cmdExec := ecmd.Execute
 	cmdArgs := args
 	ctrl := m.appCtrl
 	go func() {
 		output, err := cmdExec(cmdArgs)
-		ctrl.SendEvent(extensionCmdResultMsg{name: cmdName, output: output, err: err})
+		ctrl.SendUIMessage(extensionCmdResultMsg{name: cmdName, output: output, err: err})
 	}()
 	// Return a non-nil Cmd so the caller knows the command was handled
 	// and doesn't fall through to the regular prompt path. The Cmd itself
@@ -3625,7 +4501,7 @@ func (m *AppModel) handleMCPPromptCommand(text string) tea.Cmd {
 	go func() {
 		result, err := expand(serverName, promptName, args)
 		if err != nil {
-			ctrl.SendEvent(mcpPromptResultMsg{err: err})
+			ctrl.SendUIMessage(mcpPromptResultMsg{err: err})
 			return
 		}
 		// Concatenate user-role messages as the prompt text and collect
@@ -3640,7 +4516,7 @@ func (m *AppModel) handleMCPPromptCommand(text string) tea.Cmd {
 				allFileParts = append(allFileParts, msg.FileParts...)
 			}
 		}
-		ctrl.SendEvent(mcpPromptResultMsg{
+		ctrl.SendUIMessage(mcpPromptResultMsg{
 			text:      strings.Join(parts, "\n\n"),
 			fileParts: allFileParts,
 		})
@@ -3953,12 +4829,12 @@ func (m *AppModel) printUsageMessage() {
 	}
 
 	sessionStats := m.usageTracker.GetSessionStats()
-	lastStats := m.usageTracker.GetLastRequestStats()
+	turnStats := m.usageTracker.GetTurnStats()
 
 	content := "## Usage Statistics\n\n"
-	if lastStats != nil {
-		content += fmt.Sprintf("**Last Request:** %d input + %d output tokens = $%.6f\n",
-			lastStats.InputTokens, lastStats.OutputTokens, lastStats.TotalCost)
+	if turnStats != nil {
+		content += fmt.Sprintf("**Last Turn:** %d input + %d output tokens = $%.6f\n",
+			turnStats.InputTokens, turnStats.OutputTokens, turnStats.TotalCost)
 	}
 	content += fmt.Sprintf("**Session Total:** %d input + %d output tokens = $%.6f (%d requests)\n",
 		sessionStats.TotalInputTokens, sessionStats.TotalOutputTokens, sessionStats.TotalCost, sessionStats.RequestCount)
@@ -3997,6 +4873,48 @@ func (m *AppModel) handleReloadExtCommand() tea.Cmd {
 	}
 }
 
+// handleShortcutsCommand lists the keyboard shortcuts registered by
+// extensions, grouped by the file that registered them.
+func (m *AppModel) handleShortcutsCommand() tea.Cmd {
+	if m.getShortcutList == nil {
+		m.printSystemMessage("No extensions loaded, so no shortcuts are registered.")
+		return nil
+	}
+	list := m.getShortcutList()
+	if len(list) == 0 {
+		m.printSystemMessage("No extension shortcuts are registered.")
+		return nil
+	}
+
+	// Width of the key column, so descriptions line up.
+	keyWidth := 0
+	for _, sc := range list {
+		if w := len([]rune(sc.Key)); w > keyWidth {
+			keyWidth = w
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("Extension keyboard shortcuts\n")
+	currentSource := ""
+	for _, sc := range list {
+		if sc.Source != currentSource {
+			currentSource = sc.Source
+			b.WriteString("\n")
+			b.WriteString(currentSource)
+			b.WriteString("\n")
+		}
+		desc := sc.Description
+		if desc == "" {
+			desc = "(no description)"
+		}
+		fmt.Fprintf(&b, "  %-*s  %s\n", keyWidth, sc.Key, desc)
+	}
+
+	m.printSystemMessage(strings.TrimRight(b.String(), "\n"))
+	return nil
+}
+
 func (m *AppModel) handleCompactCommand(customInstructions string) tea.Cmd {
 	if m.appCtrl == nil {
 		m.printSystemMessage("Compaction is not available.")
@@ -4007,7 +4925,7 @@ func (m *AppModel) handleCompactCommand(customInstructions string) tea.Cmd {
 		return nil
 	}
 	// Transition to working state so the spinner shows while compaction runs.
-	m.state = stateWorking
+	m.setAgentState(stateWorking)
 	m.printSystemMessage("Compacting conversation...")
 	var spinnerCmd tea.Cmd
 	if m.stream != nil {
@@ -4042,6 +4960,37 @@ func (m *AppModel) flushStreamContent() {
 	}
 }
 
+// finalizeStreamTurn closes out a turn's streaming output. Called from every
+// terminal step event (complete, cancelled, error).
+//
+// Stream chunks are mirrored into two places while a turn runs: the
+// StreamComponent's accumulator and a StreamingMessageItem in the ScrollList.
+// The ScrollList copy is marked complete so its live timer freezes, and the
+// StreamComponent is reset so its now-redundant copy is dropped.
+//
+// The reset matters most for interrupted turns. Without it the stale content
+// survives until the next SpinnerEvent{Show: true}, where
+// flushStreamAndPendingUserMessages() re-renders it as a fresh
+// StyledMessageItem — its alreadyInList check only inspects the trailing
+// message, which by then is the turn receipt or any system message printed
+// after the interrupt, so the whole response gets appended a second time.
+//
+// All buffered chunks are already applied to the ScrollList by the time a
+// terminal event is handled (see flushPendingStreamChunks in Update), so the
+// reset never loses content.
+func (m *AppModel) finalizeStreamTurn() {
+	if len(m.messages) > 0 {
+		if streamMsg, ok := m.messages[len(m.messages)-1].(*StreamingMessageItem); ok {
+			streamMsg.MarkComplete()
+		}
+	}
+	if m.stream != nil {
+		m.stream.Reset()
+	}
+	m.refreshContent()
+	m.layoutDirty = true
+}
+
 // flushStreamAndPendingUserMessages moves the previous assistant response and
 // any pending queued user messages into the ScrollList. Called from
 // SpinnerEvent{Show: true} where all previous stream chunks are guaranteed to
@@ -4066,11 +5015,14 @@ func (m *AppModel) flushStreamAndPendingUserMessages() {
 			}
 
 			if !alreadyInList {
-				// Render styled content using MessageRenderer
-				styledMsg := m.renderer.RenderAssistantMessage(content, time.Now(), m.modelName)
+				now := time.Now()
+				modelName := m.modelName
 
-				// Add to in-memory scrollList with styled content
-				msg := NewStyledMessageItem(generateMessageID(), "assistant", content, styledMsg.Content)
+				// Add to in-memory scrollList. The renderer call is deferred
+				// into a closure so the block repaints on a theme change.
+				msg := NewThemedMessageItem(generateMessageID(), "assistant", content, func() string {
+					return m.renderer.RenderAssistantMessage(content, now, modelName).Content
+				})
 				m.messages = append(m.messages, msg)
 			}
 		}
@@ -4078,11 +5030,13 @@ func (m *AppModel) flushStreamAndPendingUserMessages() {
 
 	// 2. Render pending user messages from the queue.
 	for _, text := range m.pendingUserPrints {
-		// Render styled content using MessageRenderer
-		styledMsg := m.renderer.RenderUserMessage(text, time.Now())
+		now := time.Now()
 
-		// Add to in-memory scrollList with styled content
-		msg := NewStyledMessageItem(generateMessageID(), "user", text, styledMsg.Content)
+		// Add to in-memory scrollList. The renderer call is deferred into a
+		// closure so the block repaints itself after a theme change.
+		msg := NewThemedMessageItem(generateMessageID(), "user", text, func() string {
+			return m.renderer.RenderUserMessage(text, now).Content
+		})
 		m.messages = append(m.messages, msg)
 	}
 	m.pendingUserPrints = nil
@@ -4102,13 +5056,14 @@ type pendingStreamChunk struct {
 // chromeCache holds the rendered layout chrome measured by distributeHeight()
 // for reuse by View() within the same frame.
 type chromeCache struct {
-	valid  bool
-	header string
-	footer string
-	above  string
-	below  string
-	queued string
-	input  string
+	valid    bool
+	header   string
+	footer   string
+	above    string
+	below    string
+	queued   string
+	activity string
+	input    string
 }
 
 // streamAppendFlushMsg fires when buffered stream chunks should be applied
@@ -4242,10 +5197,11 @@ func (m *AppModel) currentScrollbackBounds() (yOffset, viewportHeight int) {
 // Layout (line counts):
 //
 //	header         = measured dynamically (0 if not set)
-//	stream region  = total - header - separator(1) - widgets - queued(N*5) - input(measured) - widgets - statusBar(1) - footer
-//	separator      = 1 line
+//	stream region  = total - header - separator - widgets - queued - activity - input - widgets - statusBar - footer
+//	separator      = measured dynamically (0 when it renders nothing)
 //	above widgets  = measured dynamically
 //	queued msgs    = measured dynamically via lipgloss.Height()
+//	activity row   = 1 line while working, 0 when idle
 //	input region   = measured dynamically via lipgloss.Height()
 //	below widgets  = measured dynamically
 //	status bar     = 1 line (always present)
@@ -4253,9 +5209,13 @@ func (m *AppModel) currentScrollbackBounds() (yOffset, viewportHeight int) {
 func (m *AppModel) distributeHeight() {
 	vis := m.uiVis()
 
-	separatorLines := 1
-	if vis.HideSeparator {
-		separatorLines = 0
+	// The separator is measured rather than assumed: it collapses to nothing
+	// unless there are queued or steering messages to announce.
+	separatorLines := 0
+	if !vis.HideSeparator {
+		if sep := m.renderSeparator(); sep != "" {
+			separatorLines = lipgloss.Height(sep)
+		}
 	}
 	statusBarLines := 1
 	if vis.HideStatusBar {
@@ -4275,20 +5235,22 @@ func (m *AppModel) distributeHeight() {
 		m.chrome.queued = queuedView
 	}
 
-	// Propagate hint visibility before measuring input height.
-	// Hints are always hidden for a cleaner UI.
-	// agentBusy must match what View() sets, since the rendered input is
-	// cached in m.chrome and reused by View() in the same frame.
-	if ic, ok := m.input.(*InputComponent); ok {
-		ic.hideHint = true
-		ic.agentBusy = m.state == stateWorking
+	// Measure the activity row so the scrollback shrinks by exactly one line
+	// when the agent starts working and grows back when it stops.
+	var activityLines int
+	if activityView := m.renderActivityRow(); activityView != "" {
+		activityLines = lipgloss.Height(activityView)
+		m.chrome.activity = activityView
 	}
+	// Remember whether the row was present so syncActivityRow can detect the
+	// next time the agent starts or stops working.
+	m.lastActivityPresent = activityLines > 0
 
 	// Measure the actual rendered input (or prompt overlay) height so we
 	// don't rely on a fragile constant that drifts when styling changes.
 	// Use renderInput() which includes the editor interceptor's Render
 	// wrapper so the measured height matches what View() actually renders.
-	inputLines := 8 // fallback: marginTop(1)+textarea(4)+border-chrome(2)+marginBottom(1)
+	inputLines := 3 // fallback: composer bar padding(1) + one text row + padding(1)
 	if m.state == statePrompt && m.prompt != nil {
 		if rendered := m.prompt.Render(); rendered != "" {
 			inputLines = lipgloss.Height(rendered)
@@ -4300,6 +5262,9 @@ func (m *AppModel) distributeHeight() {
 			m.chrome.input = rendered
 		}
 	}
+	// Remember what the composer measured so syncInputHeight can detect the
+	// next time it grows or shrinks.
+	m.lastInputHeight = inputLines
 
 	// Measure widget heights.
 	var widgetLines int
@@ -4313,6 +5278,7 @@ func (m *AppModel) distributeHeight() {
 	}
 
 	// Measure header/footer heights.
+	// Measure header/footer heights.
 	var headerFooterLines int
 	headerView, headerH := m.renderHeaderFooterSlot(m.getHeaders)
 	m.lastHeaderHeight = headerH
@@ -4325,21 +5291,18 @@ func (m *AppModel) distributeHeight() {
 		headerFooterLines += footerH
 		m.chrome.footer = footerView
 	}
-
-	// Account for transient warning rows that View() injects between the
-	// scrollback and the separator. These flags are toggled by ESC/Ctrl+C
-	// handlers; without subtracting them here the joined view exceeds
-	// m.height by one line per active warning and the bottom of the screen
-	// gets silently clipped — which in turn invalidates scrollbackYOffset.
+	// Account for the transient confirmation row that View() injects between
+	// the scrollback and the composer. Without subtracting it here the joined
+	// view exceeds m.height and the bottom of the screen gets silently
+	// clipped — which in turn invalidates scrollbackYOffset. While working
+	// the confirmation lives in the activity row, which is measured
+	// separately, so it costs nothing extra here.
 	var warningLines int
-	if m.canceling {
-		warningLines++
-	}
-	if m.ctrlCPressedOnce {
+	if m.ctrlCPressedOnce && !m.agentWorking() {
 		warningLines++
 	}
 
-	streamHeight := max(m.height-separatorLines-widgetLines-headerFooterLines-queuedLines-inputLines-statusBarLines-warningLines, 0)
+	streamHeight := max(m.height-separatorLines-widgetLines-headerFooterLines-queuedLines-activityLines-inputLines-statusBarLines-warningLines, 0)
 
 	// In alt screen mode, give the calculated height to ScrollList instead of stream.
 	// The stream component still exists but is embedded as the last item in scrollList.
@@ -4368,6 +5331,34 @@ func repeatRune(r rune, n int) string {
 		runes[i] = r
 	}
 	return string(runes)
+}
+
+// --------------------------------------------------------------------------
+// Extension shortcut matching
+// --------------------------------------------------------------------------
+
+// lookupShortcut resolves a key press against the extension shortcut map.
+//
+// The terminal layer renders a key press two different ways and extension
+// authors legitimately use either. String() yields the key's *text* where one
+// exists, so Shift+A arrives as "A" and Shift+/ as "?". Keystroke() always
+// yields the modifier form, "shift+a" and "shift+/". Matching only String()
+// meant a perfectly reasonable binding like "shift+a" could never fire.
+//
+// Both forms are tried, text first, so a binding on the literal character
+// still wins over the modifier spelling of the same press.
+func lookupShortcut[T any](shortcuts map[string]T, msg tea.KeyPressMsg) (T, bool) {
+	text := msg.String()
+	if v, ok := shortcuts[text]; ok {
+		return v, true
+	}
+	if stroke := msg.Keystroke(); stroke != text {
+		if v, ok := shortcuts[stroke]; ok {
+			return v, true
+		}
+	}
+	var zero T
+	return zero, false
 }
 
 // --------------------------------------------------------------------------
@@ -4460,6 +5451,10 @@ func (m *AppModel) switchModel(modelString string) {
 
 	previousModel := m.providerName + "/" + m.modelName
 
+	// Staged thinking-level fallback, announced only once the model switch
+	// below succeeds. Empty pendingFallbackTo means nothing to announce.
+	var pendingFallbackFrom, pendingFallbackTo string
+
 	// Check if thinking level needs adjustment for the new model.
 	// Some models (e.g., OpenAI gpt-5.4) don't support "minimal" and require "none".
 	if m.thinkingLevel != "" && m.thinkingLevel != "off" {
@@ -4473,9 +5468,16 @@ func (m *AppModel) switchModel(modelString string) {
 						"Note: Model %s doesn't support '%s' thinking level. Adjusted to '%s'.",
 						modelName, currentLevel, fallback,
 					))
+					// Stage the announcement: the model switch below can
+					// still fail, and a fallback tied to a model that was
+					// never selected must not be reported as in effect.
+					pendingFallbackFrom = m.thinkingLevel
+					pendingFallbackTo = string(fallback)
 					m.thinkingLevel = string(fallback)
 					if m.setThinkingLevel != nil {
-						_ = m.setThinkingLevel(string(fallback))
+						if err := m.setThinkingLevel(string(fallback)); err != nil {
+							pendingFallbackTo = ""
+						}
 					}
 					go func() { _ = prefs.SaveThinkingLevelPreference(string(fallback)) }()
 				}
@@ -4501,8 +5503,51 @@ func (m *AppModel) switchModel(modelString string) {
 
 	if m.emitModelChange != nil {
 		emit := m.emitModelChange
-		go emit(modelString, previousModel, "user")
+		m.extEvents.dispatch(func() { emit(modelString, previousModel, "user") })
 	}
+
+	// The switch succeeded, so a staged fallback is now genuinely in effect.
+	if pendingFallbackTo != "" {
+		m.notifyThinkingLevel(pendingFallbackTo, pendingFallbackFrom, "model_fallback")
+	}
+}
+
+// notifyTurnState fires the OnTurnStateChange extension event. It is driven
+// from the single deferred busy/idle comparison in Update, so every path into
+// and out of the working state is reported — including shell commands and
+// cancellation, which never reach the agent loop.
+//
+// The handler runs in a goroutine: extension code must never execute inline in
+// Update, where a slow handler would stall BubbleTea's event loop.
+func (m *AppModel) notifyTurnState(state, previous string) {
+	if m.emitTurnStateChange == nil {
+		return
+	}
+	emit := m.emitTurnStateChange
+	m.extEvents.dispatch(func() { emit(state, previous) })
+}
+
+// notifyResize fires the OnTerminalResize extension event and refreshes the
+// terminal size on the extension context. Called from every site that handles
+// tea.WindowSizeMsg, including the prompt and overlay sub-loops that bypass
+// the main Update switch.
+func (m *AppModel) notifyResize() {
+	if m.emitTerminalResize == nil {
+		return
+	}
+	emit := m.emitTerminalResize
+	w, h := m.width, m.height
+	m.extEvents.dispatch(func() { emit(w, h) })
+}
+
+// notifyThinkingLevel fires the OnThinkingLevelChange extension event. Skips
+// no-op changes so handlers are not woken for a level that did not move.
+func (m *AppModel) notifyThinkingLevel(newLevel, previousLevel, source string) {
+	if m.emitThinkingLevelChange == nil || newLevel == previousLevel {
+		return
+	}
+	emit := m.emitThinkingLevelChange
+	m.extEvents.dispatch(func() { emit(newLevel, previousLevel, source) })
 }
 
 // --------------------------------------------------------------------------
@@ -4543,10 +5588,32 @@ func (m *AppModel) handleThemeCommand(args string) tea.Cmd {
 		return nil
 	}
 
-	m.renderer.UpdateTheme()
-	m.stream.UpdateTheme()
+	m.refreshTheme()
 	m.printSystemMessage(fmt.Sprintf("Switched to theme: %s", args))
 	return nil
+}
+
+// refreshTheme repaints everything that holds theme-derived styling after the
+// active theme has been replaced.
+//
+// Most of the UI reads the theme at render time and needs nothing. This covers
+// the exceptions: components that build styles once and keep them, and caches
+// keyed on something other than the theme.
+func (m *AppModel) refreshTheme() {
+	m.renderer.UpdateTheme()
+	m.stream.UpdateTheme()
+	// The composer paints its own background, so it has to be repainted too
+	// or the bar keeps the previous theme's fill until restart.
+	if ic, ok := m.input.(*InputComponent); ok {
+		ic.UpdateTheme()
+	}
+	// Scrollback items repaint themselves lazily on the next draw (see
+	// themeStamp), but their cached heights were measured against the old
+	// rendering and a repainted block can occupy a different number of lines.
+	if m.scrollList != nil {
+		m.scrollList.InvalidateHeights()
+	}
+	m.layoutDirty = true
 }
 
 // --------------------------------------------------------------------------
@@ -4586,11 +5653,18 @@ func (m *AppModel) handleThinkingCommand(args string) tea.Cmd {
 	}
 
 	// Apply the change.
+	previousLevel := m.thinkingLevel
 	m.thinkingLevel = string(level)
 	if m.setThinkingLevel != nil {
 		go func() {
-			_ = m.setThinkingLevel(string(level))
+			// Announce only after the provider accepts the new level, so
+			// ThinkingLevelChangeEvent.NewLevel reflects reality.
+			if err := m.setThinkingLevel(string(level)); err == nil {
+				m.notifyThinkingLevel(string(level), previousLevel, "user")
+			}
 		}()
+	} else {
+		m.notifyThinkingLevel(string(level), previousLevel, "user")
 	}
 	// Persist thinking level for next launch.
 	go func() { _ = prefs.SaveThinkingLevelPreference(string(level)) }()
@@ -4604,17 +5678,17 @@ func (m *AppModel) handleThinkingCommand(args string) tea.Cmd {
 
 // handleTreeCommand opens the tree selector overlay.
 func (m *AppModel) handleTreeCommand() tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	snap, ok := m.appCtrl.SessionSnapshot()
+	if !ok {
 		m.printSystemMessage("No tree session active. Start with `--continue` or `--resume` to enable tree sessions.")
 		return nil
 	}
-	if ts.EntryCount() == 0 {
+	if snap.EntryCount == 0 {
 		m.printSystemMessage("No entries in session yet.")
 		return nil
 	}
 
-	m.treeSelector = NewTreeSelector(ts, m.width, m.height)
+	m.treeSelector = NewTreeSelector(m.appCtrl.SessionTree(), snap.LeafID, m.width, m.height)
 	m.state = stateTreeSelector
 	return nil
 }
@@ -4624,18 +5698,18 @@ func (m *AppModel) handleTreeCommand() tea.Cmd {
 // Unlike /tree which shows the full tree, /fork shows only user messages
 // (matching Pi's behavior) and creates a new session file when a message is selected.
 func (m *AppModel) handleForkCommand() tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	snap, ok := m.appCtrl.SessionSnapshot()
+	if !ok {
 		m.printSystemMessage("No tree session active. Start with `--continue` or `--resume` to enable tree sessions.")
 		return nil
 	}
-	if ts.EntryCount() == 0 {
+	if snap.EntryCount == 0 {
 		m.printSystemMessage("No entries to fork from.")
 		return nil
 	}
 
 	// Use the fork-specific selector that shows only user messages.
-	m.treeSelector = NewTreeSelectorForFork(ts, m.width, m.height)
+	m.treeSelector = NewTreeSelectorForFork(m.appCtrl.SessionTree(), snap.LeafID, m.width, m.height)
 	m.state = stateTreeSelector
 	return nil
 }
@@ -4656,7 +5730,7 @@ func (m *AppModel) handleNewCommand(initialPrompt string) tea.Cmd {
 		ctrl := m.appCtrl
 		go func() {
 			cancelled, reason := emit("new", initialPrompt)
-			ctrl.SendEvent(beforeSessionSwitchResultMsg{
+			ctrl.SendUIMessage(beforeSessionSwitchResultMsg{
 				cancelled:     cancelled,
 				reason:        reason,
 				initialPrompt: initialPrompt,
@@ -4674,8 +5748,7 @@ func (m *AppModel) handleNewCommand(initialPrompt string) tea.Cmd {
 // context from the previous conversation. If initialPrompt is non-empty it
 // is submitted as the first user turn (with @file expansion).
 func (m *AppModel) performNewSession(initialPrompt string) tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	if _, ok := m.appCtrl.SessionSnapshot(); !ok {
 		// No tree session — just clear messages.
 		if m.appCtrl != nil {
 			m.appCtrl.ClearMessages()
@@ -4692,16 +5765,14 @@ func (m *AppModel) performNewSession(initialPrompt string) tea.Cmd {
 		return cmd
 	}
 
-	// Create a brand new session file (Pi-style /new behavior)
-	newTs, err := session.CreateTreeSession(m.cwd)
-	if err != nil {
+	// Create a brand new session file (Pi-style /new behavior) and switch to
+	// it, closing the old one.
+	if err := m.appCtrl.NewSession(m.cwd); err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to create new session: %v", err))
 		m.signalNewSessionResult(fmt.Errorf("create new session: %w", err))
 		return nil
 	}
 
-	// Switch to the new session, closing the old one
-	m.appCtrl.SwitchTreeSession(newTs)
 	// Reset usage statistics for the new session
 	if m.usageTracker != nil {
 		m.usageTracker.Reset()
@@ -4779,22 +5850,18 @@ func (m *AppModel) submitInitialPrompt(prompt string) tea.Cmd {
 // Called either directly (when no before-hook exists) or after the async
 // before-fork hook completes.
 func (m *AppModel) performFork(targetID string, isUser bool, userText string) tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	if _, ok := m.appCtrl.SessionSnapshot(); !ok {
 		m.printSystemMessage("No tree session active.")
 		return nil
 	}
 
-	// Create a new session by forking from the target entry.
-	// This creates a new session file with the history up to the target point.
-	newTs, err := ts.ForkToNewSession(m.cwd, targetID)
-	if err != nil {
+	// Create a new session by forking from the target entry. This writes a
+	// new session file with the history up to the target point and switches
+	// to it.
+	if err := m.appCtrl.ForkSession(m.cwd, targetID); err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to fork session: %v", err))
 		return nil
 	}
-
-	// Switch to the new forked session.
-	m.appCtrl.SwitchTreeSession(newTs)
 
 	// Reset usage statistics for the new session.
 	if m.usageTracker != nil {
@@ -4822,17 +5889,16 @@ func (m *AppModel) performFork(targetID string, isUser bool, userText string) te
 //
 //	/name             — shows the current name.
 func (m *AppModel) handleNameCommand(args string) tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	snap, ok := m.appCtrl.SessionSnapshot()
+	if !ok {
 		m.printSystemMessage("No tree session active.")
 		return nil
 	}
 
 	if args == "" {
 		// No argument — show current name.
-		currentName := ts.GetSessionName()
-		if currentName != "" {
-			m.printSystemMessage(fmt.Sprintf("Session name: %q\nTo rename: `/name <new name>`", currentName))
+		if snap.Name != "" {
+			m.printSystemMessage(fmt.Sprintf("Session name: %q\nTo rename: `/name <new name>`", snap.Name))
 		} else {
 			m.printSystemMessage("Session has no name. Set one with: `/name <new name>`")
 		}
@@ -4840,7 +5906,7 @@ func (m *AppModel) handleNameCommand(args string) tea.Cmd {
 	}
 
 	// Set the session name.
-	if _, err := ts.AppendSessionInfo(args); err != nil {
+	if err := m.appCtrl.SetSessionName(args); err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to set session name: %v", err))
 		return nil
 	}
@@ -4957,8 +6023,8 @@ func (m *AppModel) handleRetryCommand() tea.Cmd {
 		m.pendingUserPrints = append(m.pendingUserPrints, displayText)
 		m.flushStreamAndPendingUserMessages()
 	}
-	if m.state != stateWorking {
-		m.state = stateWorking
+	if !m.agentWorking() {
+		m.setAgentState(stateWorking)
 	}
 	return nil
 }
@@ -5073,49 +6139,17 @@ func (m *AppModel) handleEditCommand(args string) tea.Cmd {
 //
 //	/export path.jsonl — copies to the specified path.
 func (m *AppModel) handleExportCommand(args string) tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	dstPath, written, err := m.appCtrl.ExportSession(args)
+	switch {
+	case errors.Is(err, app.ErrNoSession):
 		m.printSystemMessage("No tree session active.")
-		return nil
-	}
-
-	srcPath := ts.GetFilePath()
-	if srcPath == "" {
+	case errors.Is(err, app.ErrSessionNotPersisted):
 		m.printSystemMessage("Session is in-memory (not persisted). Nothing to export.")
-		return nil
+	case err != nil:
+		m.printSystemMessage(fmt.Sprintf("Failed to export session: %v", err))
+	default:
+		m.printSystemMessage(fmt.Sprintf("Session exported to: %s (%d bytes)", dstPath, written))
 	}
-
-	// Determine destination path.
-	dstPath := args
-	if dstPath == "" {
-		// Generate a name based on session name or ID.
-		name := ts.GetSessionName()
-		if name == "" {
-			name = ts.GetSessionID()[:12]
-		}
-		// Sanitize for filename.
-		name = strings.Map(func(r rune) rune {
-			if r == '/' || r == '\\' || r == ':' || r == ' ' {
-				return '_'
-			}
-			return r
-		}, name)
-		dstPath = fmt.Sprintf("session_%s.jsonl", name)
-	}
-
-	// Copy the file.
-	data, err := os.ReadFile(srcPath)
-	if err != nil {
-		m.printSystemMessage(fmt.Sprintf("Failed to read session file: %v", err))
-		return nil
-	}
-
-	if err := os.WriteFile(dstPath, data, 0644); err != nil {
-		m.printSystemMessage(fmt.Sprintf("Failed to write export file: %v", err))
-		return nil
-	}
-
-	m.printSystemMessage(fmt.Sprintf("Session exported to: %s (%d bytes)", dstPath, len(data)))
 	return nil
 }
 
@@ -5123,14 +6157,14 @@ func (m *AppModel) handleExportCommand(args string) tea.Cmd {
 // a shareable viewer URL. Requires the GitHub CLI (gh) to be installed and
 // authenticated.
 func (m *AppModel) handleShareCommand() tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	// Check the session is shareable before probing for gh, so an in-memory
+	// session reports that rather than a missing-CLI error.
+	snap, ok := m.appCtrl.SessionSnapshot()
+	if !ok {
 		m.printSystemMessage("No tree session active.")
 		return nil
 	}
-
-	srcPath := ts.GetFilePath()
-	if srcPath == "" {
+	if snap.FilePath == "" {
 		m.printSystemMessage("Session is in-memory (not persisted). Nothing to share.")
 		return nil
 	}
@@ -5148,42 +6182,12 @@ func (m *AppModel) handleShareCommand() tea.Cmd {
 		return nil
 	}
 
-	// Read the original session file.
-	data, err := os.ReadFile(srcPath)
-	if err != nil {
-		m.printSystemMessage(fmt.Sprintf("Failed to read session file: %v", err))
-		return nil
-	}
-
-	// Capture the current system prompt and model info.
-	systemPrompt := viper.GetString("system-prompt")
-	_, provider, modelID := ts.BuildContext()
-	if modelID == "" {
-		// Fallback to viper if no model change recorded in session
-		modelID = viper.GetString("model")
-	}
-
-	// Create a SystemPromptEntry with both prompt and model info.
-	sysPromptEntry := session.NewSystemPromptEntry(systemPrompt, modelID, provider)
-	sysPromptJSON, err := session.MarshalEntry(sysPromptEntry)
-	if err != nil {
-		m.printSystemMessage(fmt.Sprintf("Failed to marshal system prompt: %v", err))
-		return nil
-	}
-
-	name := ts.GetSessionName()
-	if name == "" {
-		name = "session"
-	}
-	// Sanitize for filename.
-	name = strings.Map(func(r rune) rune {
-		if r == '/' || r == '\\' || r == ':' || r == ' ' {
-			return '_'
-		}
-		return r
-	}, name)
-
-	tmpPath, err := buildShareFile(name, data, sysPromptJSON)
+	// The app layer writes the session plus a system-prompt entry recording
+	// the context the conversation ran under; we own the temp file from here.
+	tmpPath, err := m.appCtrl.WriteShareableSession(
+		viper.GetString("system-prompt"),
+		viper.GetString("model"),
+	)
 	if err != nil {
 		m.printSystemMessage(fmt.Sprintf("Failed to share session: %v", err))
 		return nil
@@ -5211,56 +6215,6 @@ func (m *AppModel) handleShareCommand() tea.Cmd {
 		viewerURL := fmt.Sprintf("https://go-kit.dev/session/#%s", gistID)
 		return shareResultMsg{gistURL: gistURL, viewerURL: viewerURL}
 	}
-}
-
-// buildShareFile assembles a temp JSONL file containing the session data
-// with the system-prompt entry inserted after the header line. On success
-// the caller owns the returned file and must remove it when done; on error
-// any partially-written temp file has already been cleaned up.
-func buildShareFile(name string, data, sysPromptJSON []byte) (tmpPath string, err error) {
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("kit-%s-*.jsonl", name))
-	if err != nil {
-		return "", fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath = tmpFile.Name()
-	defer func() {
-		_ = tmpFile.Close()
-		if err != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	// Write the session data with the system prompt entry inserted after the
-	// header. The header is the first line, so we write:
-	// 1. First line (header) from original data
-	// 2. System prompt entry
-	// 3. Remaining lines from original data
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1] // Remove trailing empty line
-	}
-	if len(lines) == 0 {
-		return tmpPath, nil
-	}
-
-	if _, err = tmpFile.WriteString(lines[0] + "\n"); err != nil {
-		return "", fmt.Errorf("write temp file: %w", err)
-	}
-	if _, err = tmpFile.Write(sysPromptJSON); err != nil {
-		return "", fmt.Errorf("write system prompt: %w", err)
-	}
-	if _, err = tmpFile.WriteString("\n"); err != nil {
-		return "", fmt.Errorf("write temp file: %w", err)
-	}
-	for i := 1; i < len(lines); i++ {
-		if lines[i] == "" {
-			continue // Skip empty lines
-		}
-		if _, err = tmpFile.WriteString(lines[i] + "\n"); err != nil {
-			return "", fmt.Errorf("write temp file: %w", err)
-		}
-	}
-	return tmpPath, nil
 }
 
 // handleImportCommand imports a session from a JSONL file.
@@ -5299,7 +6253,7 @@ func (m *AppModel) handleResumeCommand() tea.Cmd {
 		return nil
 	}
 
-	m.sessionSelector = NewSessionSelector(m.cwd, m.width, m.height)
+	m.sessionSelector = NewSessionSelector(m.appCtrl, m.cwd, m.width, m.height)
 	m.state = stateSessionSelector
 	return nil
 }
@@ -5309,17 +6263,20 @@ func (m *AppModel) handleResumeCommand() tea.Cmd {
 // This gives the user visual context of the conversation when resuming or
 // importing a session. Call this after switchSession succeeds.
 func (m *AppModel) renderSessionHistory() {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	if _, ok := m.appCtrl.SessionSnapshot(); !ok {
+		// No session to render from — leave the transcript untouched rather
+		// than blanking a conversation the session layer knows nothing about
+		// (e.g. an in-memory run).
 		return
 	}
 
-	branch := ts.GetBranch("")
-	if len(branch) == 0 {
-		return
-	}
+	history := m.appCtrl.SessionHistory()
 
 	// Clear existing messages so we start fresh with the resumed session.
+	// This must happen even when the history is empty: /retry and /undo pop
+	// the last user message and can leave the branch with no messages at all,
+	// and forking or resuming can land on an empty session. Returning early
+	// here would leave the previous transcript on screen.
 	m.messages = []MessageItem{}
 
 	// First pass: build a map of tool call ID → {name, args} from assistant
@@ -5329,16 +6286,8 @@ func (m *AppModel) renderSessionHistory() {
 		Args string
 	}
 	toolCallMap := make(map[string]toolCallInfo)
-	for _, entry := range branch {
-		me, ok := entry.(*session.MessageEntry)
-		if !ok {
-			continue
-		}
-		if me.Role != "assistant" {
-			continue
-		}
-		msg, err := me.ToMessage()
-		if err != nil {
+	for _, msg := range history {
+		if msg.Role != message.RoleAssistant {
 			continue
 		}
 		for _, tc := range msg.ToolCalls() {
@@ -5347,22 +6296,15 @@ func (m *AppModel) renderSessionHistory() {
 	}
 
 	// Second pass: create MessageItems for each message in order.
-	for _, entry := range branch {
-		me, ok := entry.(*session.MessageEntry)
-		if !ok {
-			continue
-		}
-		msg, err := me.ToMessage()
-		if err != nil {
-			continue
-		}
-
+	for _, msg := range history {
 		switch msg.Role {
 		case message.RoleUser:
 			text := strings.TrimSpace(msg.Content())
 			if text != "" {
-				styledMsg := m.renderer.RenderUserMessage(text, msg.CreatedAt)
-				item := NewStyledMessageItem(generateMessageID(), "user", text, styledMsg.Content)
+				createdAt := msg.CreatedAt
+				item := NewThemedMessageItem(generateMessageID(), "user", text, func() string {
+					return m.renderer.RenderUserMessage(text, createdAt).Content
+				})
 				m.messages = append(m.messages, item)
 			}
 
@@ -5370,8 +6312,10 @@ func (m *AppModel) renderSessionHistory() {
 			// First render any reasoning/thinking content
 			reasoning := msg.Reasoning()
 			if reasoning.Thinking != "" {
-				styledMsg := m.renderer.RenderReasoningBlock(reasoning.Thinking, msg.CreatedAt)
-				item := NewStyledMessageItem(generateMessageID(), "reasoning", reasoning.Thinking, styledMsg.Content)
+				thinking, createdAt := reasoning.Thinking, msg.CreatedAt
+				item := NewThemedMessageItem(generateMessageID(), "reasoning", thinking, func() string {
+					return m.renderer.RenderReasoningBlock(thinking, createdAt).Content
+				})
 				m.messages = append(m.messages, item)
 			}
 			// Then render the text content
@@ -5381,8 +6325,10 @@ func (m *AppModel) renderSessionHistory() {
 				if msg.Model != "" {
 					modelName = msg.Model
 				}
-				styledMsg := m.renderer.RenderAssistantMessage(text, msg.CreatedAt, modelName)
-				item := NewStyledMessageItem(generateMessageID(), "assistant", text, styledMsg.Content)
+				createdAt := msg.CreatedAt
+				item := NewThemedMessageItem(generateMessageID(), "assistant", text, func() string {
+					return m.renderer.RenderAssistantMessage(text, createdAt, modelName).Content
+				})
 				m.messages = append(m.messages, item)
 			}
 			// Tool calls from assistant messages are rendered when we
@@ -5398,8 +6344,18 @@ func (m *AppModel) renderSessionHistory() {
 					}
 					toolArgs = info.Args
 				}
-				styledMsg := m.renderer.RenderToolMessage(toolName, toolArgs, tr.Content, tr.IsError)
-				item := NewStyledMessageItem(generateMessageID(), "tool", styledMsg.Content, styledMsg.Content)
+				// Retain the full call record so a resumed session's tool
+				// messages stay inspectable, exactly as live ones are.
+				raw := toolRawContent(toolName, toolArgs, tr.Content, tr.IsError)
+				content, isError := tr.Content, tr.IsError
+				item := NewThemedMessageItem(generateMessageID(), "tool", raw, func() string {
+					return m.renderer.RenderToolMessage(toolName, toolArgs, content, isError).Content
+				}).WithToolCall(ToolCallInfo{
+					Name:    toolName,
+					Args:    toolArgs,
+					Result:  content,
+					IsError: isError,
+				})
 				m.messages = append(m.messages, item)
 			}
 		}
@@ -5415,13 +6371,12 @@ func (m *AppModel) renderSessionHistory() {
 
 // handleSessionInfoCommand shows session statistics.
 func (m *AppModel) handleSessionInfoCommand() tea.Cmd {
-	ts := m.appCtrl.GetTreeSession()
-	if ts == nil {
+	snap, ok := m.appCtrl.SessionSnapshot()
+	if !ok {
 		m.printSystemMessage("No tree session active.")
 		return nil
 	}
 
-	header := ts.GetHeader()
 	info := fmt.Sprintf("## Session Info\n\n"+
 		"- **ID:** `%s`\n"+
 		"- **File:** `%s`\n"+
@@ -5430,17 +6385,17 @@ func (m *AppModel) handleSessionInfoCommand() tea.Cmd {
 		"- **Entries:** %d\n"+
 		"- **Messages:** %d\n"+
 		"- **Current Leaf:** `%s`\n",
-		header.ID,
-		ts.GetFilePath(),
-		header.Cwd,
-		header.Timestamp.Format(time.RFC3339),
-		ts.EntryCount(),
-		ts.MessageCount(),
-		ts.GetLeafID(),
+		snap.ID,
+		snap.FilePath,
+		snap.Cwd,
+		snap.Created.Format(time.RFC3339),
+		snap.EntryCount,
+		snap.MessageCount,
+		snap.LeafID,
 	)
 
-	if name := ts.GetSessionName(); name != "" {
-		info += fmt.Sprintf("- **Name:** %s\n", name)
+	if snap.Name != "" {
+		info += fmt.Sprintf("- **Name:** %s\n", snap.Name)
 	}
 
 	m.printSystemMessage(info)
@@ -5565,6 +6520,8 @@ func (m *AppModel) updatePromptState(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resolvePrompt(app.PromptResponse{
 					Value:     result.value,
 					Index:     result.index,
+					Values:    result.values,
+					Indices:   result.indices,
 					Confirmed: result.confirmed,
 				})
 			}
@@ -5601,6 +6558,7 @@ func (m *AppModel) updatePromptState(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.notifyResize()
 		_, cmd := m.prompt.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5693,6 +6651,16 @@ func (m *AppModel) updateOverlayState(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.notifyResize()
+		_, cmd := m.overlay.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+	case tea.MouseWheelMsg:
+		// The overlay is modal, so the wheel belongs to it rather than to the
+		// scrollback behind it. Without this the wheel silently scrolled the
+		// transcript underneath a dialog the reader was trying to page through.
 		_, cmd := m.overlay.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5790,12 +6758,28 @@ func (m *AppModel) executeShellCommand(msg uicore.ShellCommandMsg) tea.Cmd {
 	}
 }
 
+// renderShellBlock frames shell command output in a content block. The border
+// is tinted to say whether the output was fed back into the conversation:
+// accent for included, muted for excluded.
+func (m *AppModel) renderShellBlock(content string, excludedFromContext bool) string {
+	theme := style.GetTheme()
+	borderClr := theme.Accent
+	if excludedFromContext {
+		borderClr = theme.Muted
+	}
+	return renderContentBlock(
+		content,
+		m.width,
+		WithAlign(lipgloss.Left),
+		WithBorderColor(borderClr),
+		WithMarginBottom(1),
+	)
+}
+
 // handleShellCommandResult processes the result of a shell command execution.
 // It prints the output to the ScrollList and optionally injects it into the
 // conversation context (for ! commands) so the LLM can see it.
 func (m *AppModel) handleShellCommandResult(msg uicore.ShellCommandResultMsg) tea.Cmd {
-	theme := style.GetTheme()
-
 	// Build the display header.
 	var header string
 	if msg.ExcludeFromContext {
@@ -5848,22 +6832,28 @@ func (m *AppModel) handleShellCommandResult(msg uicore.ShellCommandResultMsg) te
 		fmt.Fprintf(&content, "\n\nExit code: %d", msg.ExitCode)
 	}
 
-	// Choose border color: dim for excluded, accent for included.
-	borderClr := theme.Accent
-	if msg.ExcludeFromContext {
-		borderClr = theme.Muted
+	// Add shell command output to ScrollList. The rendered form is capped at
+	// maxShellDisplayLines, so the full output is kept alongside it as the
+	// item's raw content for the message inspector.
+	var raw strings.Builder
+	raw.WriteString(header)
+	if msg.Err != nil {
+		fmt.Fprintf(&raw, "\n\nError: %v", msg.Err)
+	}
+	if msg.Output != "" {
+		raw.WriteString("\n\n")
+		raw.WriteString(msg.Output)
+	} else if msg.Err == nil {
+		raw.WriteString("\n\n(no output)")
+	}
+	if msg.ExitCode != 0 {
+		fmt.Fprintf(&raw, "\n\nExit code: %d", msg.ExitCode)
 	}
 
-	rendered := renderContentBlock(
-		content.String(),
-		m.width,
-		WithAlign(lipgloss.Left),
-		WithBorderColor(borderClr),
-		WithMarginBottom(1),
-	)
-
-	// Add shell command output to ScrollList.
-	msg2 := NewStyledMessageItem(generateMessageID(), "system", rendered, rendered)
+	display, excluded := content.String(), msg.ExcludeFromContext
+	msg2 := NewThemedMessageItem(generateMessageID(), "shell", raw.String(), func() string {
+		return m.renderShellBlock(display, excluded)
+	})
 	m.messages = append(m.messages, msg2)
 	m.refreshContent()
 
@@ -5886,4 +6876,59 @@ func (m *AppModel) handleShellCommandResult(msg uicore.ShellCommandResultMsg) te
 	}
 
 	return nil
+}
+
+// computeGfxPlacement returns the escape sequence that redraws every
+// directly-placed preview image at its current position, or "" when there is
+// nothing to place.
+//
+// Direct placements are needed by terminals that carry the Kitty graphics
+// protocol but not its Unicode placeholder encoding, where an image is painted
+// over the screen at the cursor instead of travelling with the view text. That
+// makes the image's position a property of the finished layout, which is why
+// this runs from View with the assembled parts in hand.
+//
+// parts are the stacked layout sections and inputPartIndex is the position of
+// the input section within them.
+//
+// The rows are counted up from the bottom of the screen, not down from the
+// top. The composer sits at the bottom with only the status bar and an
+// optional footer beneath it, so counting upwards depends on a couple of
+// short, fixed sections. Counting downwards would instead depend on the
+// scrollback's rendered height, and any disagreement between what it was
+// allotted and what it drew would float the image away from the composer.
+func (m *AppModel) computeGfxPlacement(parts []string, inputPartIndex int) string {
+	ic, ok := m.input.(*InputComponent)
+	if !ok || inputPartIndex < 0 || inputPartIndex >= len(parts) {
+		return ""
+	}
+	placements := ic.DirectPlacements()
+	if len(placements) == 0 {
+		return ""
+	}
+
+	// Rows occupied by everything below the input section.
+	below := 0
+	for i := inputPartIndex + 1; i < len(parts); i++ {
+		below += lipgloss.Height(parts[i])
+	}
+	// Screen rows are 1-based, so the input's last row is m.height-below and
+	// its first row is that many rows further up.
+	inputTop := m.height - below - lipgloss.Height(parts[inputPartIndex]) + 1
+
+	var b strings.Builder
+	// Save the cursor, draw each image at its absolute row, then restore. The
+	// renderer owns the cursor; moving it without putting it back would leave
+	// the next frame drawing in the wrong place.
+	b.WriteString(ansi.SaveCursor)
+	for _, p := range placements {
+		row := inputTop + p.RowOffset
+		if row < 1 || row > m.height {
+			continue // scrolled out of the visible area
+		}
+		b.WriteString(ansi.CursorPosition(p.Col+1, row))
+		b.WriteString(p.Sequence)
+	}
+	b.WriteString(ansi.RestoreCursor)
+	return b.String()
 }

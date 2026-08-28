@@ -10,7 +10,7 @@ import (
 	"github.com/mark3labs/kit/internal/session"
 )
 
-// ==== Extension Types ====
+// ==== extension Types ====
 //
 // Type aliases for internal extension types exposed through the public
 // ExtensionAPI interface. External SDK consumers can use these without
@@ -53,11 +53,68 @@ type ExtensionEntry = extensions.ExtensionEntry
 // ExtensionStatusBarEntry describes a status bar entry registered by an extension.
 type ExtensionStatusBarEntry = extensions.StatusBarEntry
 
+// ExtensionShortcutInfo describes a keyboard shortcut registered by an
+// extension. Unlike the internal entry it carries no handler, so it is safe to
+// hand to presentation code.
+type ExtensionShortcutInfo struct {
+	// Key is the normalized binding, e.g. "ctrl+p".
+	Key string
+	// Description explains what the shortcut does.
+	Description string
+	// Source is the file name of the extension that registered the shortcut.
+	Source string
+}
+
 // ExtensionToolInfo describes a tool available to the agent, as seen by extensions.
 type ExtensionToolInfo = extensions.ToolInfo
 
 // ExtensionCommandDef describes a slash command registered by an extension.
 type ExtensionCommandDef = extensions.CommandDef
+
+// ExtensionSkill represents a skill in the extension-facing format returned
+// by the skill bridge methods (DiscoverSkillsForExtension and friends).
+type ExtensionSkill = extensions.Skill
+
+// ExtensionSkillLoadResult holds the outcome of loading skills from a
+// directory for extensions: the loaded skills or an error string.
+type ExtensionSkillLoadResult = extensions.SkillLoadResult
+
+// ExtensionPromptTemplate is a parsed prompt template in the extension-facing
+// format used by ParseTemplate and RenderTemplate. It is distinct from
+// PromptTemplate, which is the skill prompt-template type.
+type ExtensionPromptTemplate = extensions.PromptTemplate
+
+// ArgumentPattern describes how ParseArguments should interpret
+// command-line style input (positional variables and flags).
+type ArgumentPattern = extensions.ArgumentPattern
+
+// ParseResult holds the variables and flags produced by ParseArguments.
+type ParseResult = extensions.ParseResult
+
+// ModelCapabilities describes a model's provider, context/output limits,
+// feature support, and token pricing as reported by the model registry.
+type ModelCapabilities = extensions.ModelCapabilities
+
+// ModelPricing describes a model's token costs in US dollars per million
+// tokens. Its Known field is false when the registry has no cost data.
+type ModelPricing = extensions.ModelPricing
+
+// ModelResolutionResult is the outcome of ResolveModelChain: the first
+// available model from a preference list, its capabilities, and the
+// models attempted along the way.
+type ModelResolutionResult = extensions.ModelResolutionResult
+
+// CompleteRequest describes a one-shot LLM completion request executed by
+// ExecuteCompletion, independent of the main agent loop.
+type CompleteRequest = extensions.CompleteRequest
+
+// CompleteResponse holds the text and token usage returned by
+// ExecuteCompletion.
+type CompleteResponse = extensions.CompleteResponse
+
+// ModelInfoEntry describes one model known to the registry, as returned by
+// GetAvailableModels.
+type ModelInfoEntry = extensions.ModelInfoEntry
 
 // ExtensionAPI provides grouped access to all extension-related functionality.
 // This cleans up the main Kit API surface while keeping all extension capabilities available.
@@ -66,6 +123,11 @@ type ExtensionAPI interface {
 	SetContext(ctx ExtensionContext)
 	GetContext() ExtensionContext
 	UpdateContextModel(model string)
+	// SetTerminalSize records the current terminal dimensions so that
+	// ctx.GetTerminalSize reports live values to extension handlers.
+	SetTerminalSize(width, height int)
+	// GetTerminalSize returns the last recorded terminal dimensions.
+	GetTerminalSize() (int, int)
 
 	// Widgets
 	SetWidget(config ExtensionWidgetConfig)
@@ -122,6 +184,7 @@ type ExtensionAPI interface {
 
 	// Shortcuts
 	GetShortcuts() map[string]func()
+	GetShortcutInfos() []ExtensionShortcutInfo
 
 	// Tools
 	GetToolInfos() []ExtensionToolInfo
@@ -134,6 +197,9 @@ type ExtensionAPI interface {
 	// Events
 	EmitSessionStart()
 	EmitModelChange(newModel, previousModel, source string)
+	EmitThinkingLevelChange(newLevel, previousLevel, source string)
+	EmitTerminalResize(width, height int)
+	EmitTurnStateChange(state, previous string)
 	EmitCustomEvent(name, data string)
 	EmitBeforeFork(targetID string, isUserMsg bool, userText string) (cancelled bool, reason string)
 	EmitBeforeSessionSwitch(switchReason string) (cancelled bool, reason string)
@@ -195,6 +261,20 @@ func (e *extensionAPI) UpdateContextModel(model string) {
 		ctx.Model = model
 		e.kit.extRunner.SetContext(ctx)
 	}
+}
+
+func (e *extensionAPI) SetTerminalSize(width, height int) {
+	if e.kit.extRunner != nil {
+		e.kit.extRunner.SetTerminalSize(width, height)
+	}
+}
+
+// GetTerminalSize returns the last recorded terminal dimensions.
+func (e *extensionAPI) GetTerminalSize() (int, int) {
+	if e.kit.extRunner != nil {
+		return e.kit.extRunner.GetTerminalSize()
+	}
+	return 0, 0
 }
 
 // Widgets
@@ -458,20 +538,30 @@ func (e *extensionAPI) GetShortcuts() map[string]func() {
 	if e.kit.extRunner == nil {
 		return nil
 	}
-	entries := e.kit.extRunner.GetShortcuts()
-	if entries == nil {
+	// The runner caches the bound handler map and invalidates it on reload,
+	// so this is allocation-free on the per-key-press hot path.
+	return e.kit.extRunner.GetShortcutHandlers()
+}
+
+// GetShortcutInfos returns the effective extension shortcut bindings, sorted
+// by source file then key. Used to render the /shortcuts listing.
+func (e *extensionAPI) GetShortcutInfos() []ExtensionShortcutInfo {
+	if e.kit.extRunner == nil {
 		return nil
 	}
-	result := make(map[string]func(), len(entries))
-	for key, entry := range entries {
-		h := entry.Handler
-		r := e.kit.extRunner
-		result[key] = func() {
-			ctx := r.GetContext()
-			h(ctx)
-		}
+	entries := e.kit.extRunner.RegisteredShortcuts()
+	if len(entries) == 0 {
+		return nil
 	}
-	return result
+	infos := make([]ExtensionShortcutInfo, 0, len(entries))
+	for _, entry := range entries {
+		infos = append(infos, ExtensionShortcutInfo{
+			Key:         entry.Def.Key,
+			Description: entry.Def.Description,
+			Source:      entry.Source,
+		})
+	}
+	return infos
 }
 
 // Tools
@@ -541,6 +631,34 @@ func (e *extensionAPI) EmitModelChange(newModel, previousModel, source string) {
 			NewModel:      newModel,
 			PreviousModel: previousModel,
 			Source:        source,
+		})
+	}
+}
+
+func (e *extensionAPI) EmitThinkingLevelChange(newLevel, previousLevel, source string) {
+	if e.kit.extRunner != nil && e.kit.extRunner.HasHandlers(extensions.ThinkingLevelChange) {
+		_, _ = e.kit.extRunner.Emit(extensions.ThinkingLevelChangeEvent{
+			NewLevel:      newLevel,
+			PreviousLevel: previousLevel,
+			Source:        source,
+		})
+	}
+}
+
+func (e *extensionAPI) EmitTerminalResize(width, height int) {
+	if e.kit.extRunner != nil && e.kit.extRunner.HasHandlers(extensions.TerminalResize) {
+		_, _ = e.kit.extRunner.Emit(extensions.TerminalResizeEvent{
+			Width:  width,
+			Height: height,
+		})
+	}
+}
+
+func (e *extensionAPI) EmitTurnStateChange(state, previous string) {
+	if e.kit.extRunner != nil && e.kit.extRunner.HasHandlers(extensions.TurnStateChange) {
+		_, _ = e.kit.extRunner.Emit(extensions.TurnStateChangeEvent{
+			State:    state,
+			Previous: previous,
 		})
 	}
 }

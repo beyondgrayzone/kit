@@ -55,6 +55,20 @@ func blendHex(base, tint string, amount float64) string {
 	return fmt.Sprintf("#%02x%02x%02x", r, g, b)
 }
 
+// deriveInputBg computes the composer surface from the theme background. The
+// tint is deliberately lighter than the code-block blend: the composer must
+// read as a distinct surface without becoming the brightest thing on screen.
+func deriveInputBg(bgPair [2]string) color.Color {
+	idx := 0
+	contrast := "#000000"
+	if isDarkBackground() {
+		idx = 1
+		contrast = "#ffffff"
+	}
+	shade := blendHex(bgPair[idx], contrast, 0.04)
+	return AdaptiveColor(shade, shade)
+}
+
 // deriveDiffBg computes diff / code background colors from the theme's
 // background, success, and error hex pairs. Returns an adaptive color for each
 // diff element. The tint amounts are tuned for subtle differentiation.
@@ -75,7 +89,7 @@ func deriveDiffBg(bgPair, successPair, errorPair [2]string) (diffInsert, diffDel
 
 	// Pick the correct index based on detected background.
 	idx := 0
-	if isDarkBg {
+	if isDarkBackground() {
 		idx = 1
 	}
 	insL, delL, eqL, missL := derive(idx)
@@ -167,6 +181,7 @@ func makeTheme(p presetColors) Theme {
 	// Derive diff/code backgrounds from the theme's own palette.
 	t.DiffInsertBg, t.DiffDeleteBg, t.DiffEqualBg, t.DiffMissingBg,
 		t.CodeBg, t.GutterBg, t.WriteBg = deriveDiffBg(p.background, p.success, p.error_)
+	t.InputBg = deriveInputBg(p.background)
 	// Markdown colors.
 	t.Markdown = MarkdownThemeColors{
 		Text:    t.Text,
@@ -527,6 +542,7 @@ func ApplyTheme(name string) error {
 		return err
 	}
 	SetTheme(t)
+	activeThemeName = name
 	_ = prefs.SaveThemePreference(name)
 	return nil
 }
@@ -540,6 +556,7 @@ func ApplyThemeWithoutSave(name string) error {
 		return err
 	}
 	SetTheme(t)
+	activeThemeName = name
 	return nil
 }
 
@@ -626,6 +643,7 @@ type themeFileConfig struct {
 	CodeBg        adaptiveColorPair `json:"code-bg,omitzero" yaml:"code-bg,omitempty"`
 	GutterBg      adaptiveColorPair `json:"gutter-bg,omitzero" yaml:"gutter-bg,omitempty"`
 	WriteBg       adaptiveColorPair `json:"write-bg,omitzero" yaml:"write-bg,omitempty"`
+	InputBg       adaptiveColorPair `json:"input-bg,omitzero" yaml:"input-bg,omitempty"`
 
 	Markdown struct {
 		Text    adaptiveColorPair `json:"text,omitzero" yaml:"text,omitempty"`
@@ -718,6 +736,7 @@ func fileConfigToTheme(cfg themeFileConfig) Theme {
 		CodeBg:        cfg.CodeBg.resolve(derivedCodeBg),
 		GutterBg:      cfg.GutterBg.resolve(derivedGutterBg),
 		WriteBg:       cfg.WriteBg.resolve(derivedWriteBg),
+		InputBg:       cfg.InputBg.resolve(deriveInputBg(bgPair)),
 
 		Markdown: MarkdownThemeColors{
 			Text:    cfg.Markdown.Text.resolve(def.Markdown.Text),

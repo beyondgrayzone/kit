@@ -84,6 +84,9 @@ func buildInteractiveExtensionContext(deps extensionContextDeps) extensions.Cont
 			TotalCacheWriteTokens: stats.TotalCacheWriteTokens,
 			TotalCost:             stats.TotalCost,
 			RequestCount:          stats.RequestCount,
+			// Costs are recorded as 0 under OAuth, so surface the flag that
+			// explains why rather than leaving extensions to guess.
+			IsOAuth: usageTracker.IsOAuth(),
 		}
 	}
 	ec.Exit = func() { appInstance.QuitFromExtension() }
@@ -158,6 +161,24 @@ func buildInteractiveExtensionContext(deps extensionContextDeps) extensions.Cont
 			return extensions.PromptSelectResult{Cancelled: true}
 		}
 		return extensions.PromptSelectResult{Value: resp.Value, Index: resp.Index}
+	}
+	ec.PromptMultiSelect = func(config extensions.PromptMultiSelectConfig) extensions.PromptMultiSelectResult {
+		ch := make(chan app.PromptResponse, 1)
+		appInstance.SendPromptRequest(app.PromptRequestEvent{
+			PromptType:      "multiselect",
+			Message:         config.Message,
+			Options:         config.Options,
+			DefaultSelected: config.DefaultSelected,
+			ResponseCh:      ch,
+		})
+		resp := <-ch
+		if resp.Cancelled {
+			return extensions.PromptMultiSelectResult{Cancelled: true}
+		}
+		return extensions.PromptMultiSelectResult{
+			Values:  resp.Values,
+			Indices: resp.Indices,
+		}
 	}
 	ec.PromptConfirm = func(config extensions.PromptConfirmConfig) extensions.PromptConfirmResult {
 		ch := make(chan app.PromptResponse, 1)
@@ -281,10 +302,45 @@ func buildInteractiveExtensionContext(deps extensionContextDeps) extensions.Cont
 		)
 	}
 	ec.SetTheme = func(name string) error {
-		return ui.ApplyTheme(name)
+		if err := ui.ApplyTheme(name); err != nil {
+			return err
+		}
+		// Notify the TUI so components caching theme-derived styling repaint.
+		go appInstance.NotifyThemeChange()
+		return nil
 	}
 	ec.ListThemes = func() []string {
 		return ui.ListThemes()
+	}
+	ec.GetTheme = func() extensions.ThemeColors {
+		t := ui.GetTheme()
+		hex := ui.HexOf
+		return extensions.ThemeColors{
+			Name:        ui.CurrentThemeName(),
+			Dark:        ui.IsDarkBackground(),
+			Primary:     hex(t.Primary),
+			Secondary:   hex(t.Secondary),
+			Success:     hex(t.Success),
+			Warning:     hex(t.Warning),
+			Error:       hex(t.Error),
+			Info:        hex(t.Info),
+			Text:        hex(t.Text),
+			Muted:       hex(t.Muted),
+			VeryMuted:   hex(t.VeryMuted),
+			Background:  hex(t.Background),
+			Border:      hex(t.Border),
+			MutedBorder: hex(t.MutedBorder),
+			System:      hex(t.System),
+			Tool:        hex(t.Tool),
+			Accent:      hex(t.Accent),
+			Highlight:   hex(t.Highlight),
+			MdHeading:   hex(t.Markdown.Heading),
+			MdLink:      hex(t.Markdown.Link),
+			MdKeyword:   hex(t.Markdown.Keyword),
+			MdString:    hex(t.Markdown.String),
+			MdNumber:    hex(t.Markdown.Number),
+			MdComment:   hex(t.Markdown.Comment),
+		}
 	}
 
 	// Skill context-injection (drives a new agent turn through the TUI).

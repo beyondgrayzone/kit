@@ -31,8 +31,10 @@ The `//go:build ignore` tag prevents `go build` from compiling the file directly
 
 Extensions are auto-loaded from these directories:
 
-- `~/.config/kit/extensions/*.go` (global, single files)
-- `~/.config/kit/extensions/*/main.go` (global, subdirectories)
+- `/usr/share/kit/extensions/*.go` (system-wide, single files)
+- `/usr/share/kit/extensions/*/main.go` (system-wide, subdirectories)
+- `~/.config/kit/extensions/*.go` (user, single files)
+- `~/.config/kit/extensions/*/main.go` (user, subdirectories)
 - `.kit/extensions/*.go` (project-local, single files)
 - `.kit/extensions/*/main.go` (project-local, subdirectories)
 
@@ -55,7 +57,7 @@ The `Init` function receives an `ext.API` object for registering handlers, and e
 
 ## Lifecycle Events
 
-Kit provides 21 lifecycle events. Each handler receives an event struct and a `Context`.
+Kit provides 30 lifecycle events. Each handler receives an event struct and a `Context`.
 
 ### Session Events
 
@@ -229,7 +231,37 @@ api.OnModelChange(func(e ext.ModelChangeEvent, ctx ext.Context) {
     // e.PreviousModel string
     // e.Source string — "extension" or "user"
 })
+
+// Extended-thinking effort level changed.
+api.OnThinkingLevelChange(func(e ext.ThinkingLevelChangeEvent, ctx ext.Context) {
+    // e.NewLevel, e.PreviousLevel string — off, none, minimal, low, medium, high
+    // e.Source string — "user" (/thinking or shift+tab) or "model_fallback"
+    //   ("model_fallback" = automatic downgrade because the newly selected
+    //    model does not support the previous level)
+})
 ```
+
+### UI Events
+
+Interactive TUI only; these do not fire in headless, ACP, or script mode.
+
+```go
+// Terminal resized. Also fires once at startup with the initial size.
+api.OnTerminalResize(func(e ext.TerminalResizeEvent, ctx ext.Context) {
+    // e.Width, e.Height int
+})
+
+// UI entered or left the working state.
+api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
+    // e.State, e.Previous string — "working" or "idle"
+})
+```
+
+`OnTurnStateChange` is a **superset of `OnAgentStart`/`OnAgentEnd`**: it also
+covers work that never reaches the agent loop (shell commands run with `!`) and
+fires on every path back to idle, including cancellation and error. Use it to
+drive a spinner or turn timer; use `OnAgentStart`/`OnAgentEnd` when you
+specifically care about agent turns and their token usage.
 
 ### Context Filtering
 
@@ -354,6 +386,32 @@ api.RegisterShortcut(ext.ShortcutDef{
     // handler runs when shortcut is pressed
 })
 ```
+
+Handlers run in a goroutine, so they can safely block on prompts or I/O.
+`/shortcuts` lists every registered binding, grouped by extension file.
+
+**Key names are normalized.** Modifier order and casing don't matter:
+`"Ctrl+Shift+S"`, `"control+shift+s"` and `"shift+ctrl+s"` are the same binding.
+`control`, `option`/`opt`, `cmd`/`command` and `win` alias to `ctrl`, `alt`,
+`meta` and `super`. Key-name spellings fold too (`escape` → `esc`,
+`return` → `enter`, `pgdn`/`pagedown` → `pgdown`).
+
+A shifted key works spelled either way — `"shift+a"` and `"A"` match the same
+press, as do `"shift+/"` and `"?"`. A bare single character keeps its case,
+since `"A"` and `"a"` are different presses.
+
+| Key | Behaviour |
+|-----|-----------|
+| `ctrl+c` | **Rejected at load** — Kit consumes it before extensions are consulted, so the handler could never fire |
+| `esc`, `ctrl+x`, `pgup`, `pgdown`, `ctrl+home`, `ctrl+end`, `shift+tab`, `enter`, `tab`, `up`, `down` | Accepted, but logs a warning: the shortcut shadows Kit's built-in binding |
+| everything else | Fires normally |
+
+An armed `Ctrl+X` leader chord beats shortcuts, so binding `"s"` won't break
+`Ctrl+X s`. Shortcuts don't fire during modal prompts, overlays, or message
+navigation.
+
+**Prefer modifier combinations.** A bare `"s"` fires on every press of that key
+outside a modal — including while typing a slash command.
 
 ---
 
@@ -538,6 +596,43 @@ ctx.SetEditorText("prefilled")     // set editor text content
 - `ext.EditorKeyRemap` — remap to a different key: `EditorKeyAction{Type: ext.EditorKeyRemap, RemappedKey: "up"}`
 - `ext.EditorKeySubmit` — submit text: `EditorKeyAction{Type: ext.EditorKeySubmit, SubmitText: "text"}`
 
+**`HandleKey` runs synchronously on the TUI event loop** — unlike a shortcut
+handler, blocking here freezes the whole interface. Keep it fast; hand slow work
+to a goroutine.
+
+It is also the last hook before the editor, so it never sees keys an earlier
+stage consumed: `ctrl+c`, any registered extension shortcut, `esc` during a
+running turn, `ctrl+x` and its chord suffix, and scrollback keys like `pgup`.
+
+### Terminal Size
+
+```go
+width, height := ctx.GetTerminalSize()  // 0, 0 outside the interactive TUI
+```
+
+Footer, header, and widget content is rendered at **full terminal width with no
+truncation** — a longer line wraps and silently consumes a row of scrollback.
+Measure and truncate before calling `SetFooter`/`SetHeader`/`SetWidget`, and
+re-render on `OnTerminalResize`.
+
+This is a **function, not a field**, so it reports the live size. A long-lived
+goroutine (a ticking clock in a footer, say) that captured a `Context` still
+observes resizes; a struct field would freeze at the value copied when the
+handler was invoked.
+
+Note that multi-byte characters occupy more than one column — count display
+width, not bytes or runes, when fitting to `width`.
+
+### Thinking Level
+
+```go
+level := ctx.GetThinkingLevel()  // "off", "none", "minimal", "low", "medium", "high"
+```
+
+Models without reasoning support report `"off"`. To distinguish "reasoning is
+switched off" from "this model cannot reason at all", pair it with
+`ctx.GetModelCapabilities("").Reasoning`.
+
 ### UI Visibility
 
 ```go
@@ -555,6 +650,16 @@ ctx.SetUIVisibility(ext.UIVisibility{
 stats := ctx.GetContextStats()     // .EstimatedTokens, .ContextLimit, .UsagePercent, .MessageCount
 msgs := ctx.GetMessages()          // []ext.SessionMessage on current branch
 path := ctx.GetSessionPath()       // file path of session JSONL
+
+// Aggregated token usage and cost for the session (interactive TUI only):
+usage := ctx.GetSessionUsage()
+// usage.TotalInputTokens, .TotalOutputTokens
+// usage.TotalCacheReadTokens, .TotalCacheWriteTokens
+// usage.TotalCost float64 — USD
+// usage.RequestCount int
+// usage.IsOAuth bool — true for subscription credentials (Claude Pro/Max).
+//   TotalCost is always 0 under OAuth because the user is not billed per
+//   token; check this flag to distinguish "not billed" from "$0 spent".
 
 // Append-only log in the session tree (fork-aware, walked on every branch read):
 id, err := ctx.AppendEntry("my-type", "data string")
@@ -1415,6 +1520,7 @@ result := ctx.ResolveModelChain([]string{
 // Get capabilities for a specific model
 caps, err := ctx.GetModelCapabilities("anthropic/claude-sonnet-4")
 // caps.Provider, caps.ModelID, caps.ContextLimit, caps.Reasoning, caps.Streaming
+// caps.Pricing — ext.ModelPricing, see below
 
 // Check if a model is available (provider exists)
 available := ctx.CheckModelAvailable("anthropic/claude-sonnet-4")  // bool
@@ -1422,6 +1528,34 @@ available := ctx.CheckModelAvailable("anthropic/claude-sonnet-4")  // bool
 // Get current provider/model ID
 provider := ctx.GetCurrentProvider()  // "anthropic"
 modelID := ctx.GetCurrentModelID()    // "claude-sonnet-4"
+```
+
+### Model Pricing
+
+`ModelCapabilities.Pricing` and `ModelInfoEntry.Pricing` expose registry token
+costs in **USD per million tokens**, so a cost is `tokens * rate / 1_000_000`.
+
+```go
+caps, _ := ctx.GetModelCapabilities("")  // empty = current model
+p := caps.Pricing
+// p.Input, p.Output           float64 — $ per 1M tokens
+// p.CacheRead, p.CacheWrite   float64 — only valid when the Has* flag is true
+// p.HasCacheRead, p.HasCacheWrite bool
+// p.Known                     bool
+```
+
+**Always check `Known` before rendering cost.** It is false for local models and
+custom OpenAI-compatible endpoints, where every rate is zero — without the flag
+an unpriced model is indistinguishable from a free one. Likewise, check
+`HasCacheRead` rather than assuming a zero `CacheRead` means free cache reads.
+
+Computing prompt-cache savings:
+
+```go
+usage := ctx.GetSessionUsage()
+if p.Known && p.HasCacheRead {
+    saved := float64(usage.TotalCacheReadTokens) * (p.Input - p.CacheRead) / 1000000
+}
 ```
 
 ## Key Files for Reference

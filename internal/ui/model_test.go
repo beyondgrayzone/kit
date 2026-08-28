@@ -8,7 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/mark3labs/kit/internal/app"
-	"github.com/mark3labs/kit/internal/session"
+	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/ui/core"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
@@ -25,6 +25,20 @@ type stubAppController struct {
 	clearQueueCalled int
 	clearMsgCalled   int
 	queueLen         int
+
+	// hasSession controls whether SessionSnapshot reports an active session,
+	// and sessionHistory is what SessionHistory returns for it.
+	hasSession     bool
+	sessionHistory []message.Message
+
+	// sessions/allSessions back the session listing methods, deleted records
+	// the paths passed to DeleteSession, and listErr/deleteErr let a test
+	// force the failure paths.
+	sessions    []app.SessionSummary
+	allSessions []app.SessionSummary
+	deleted     []string
+	listErr     error
+	deleteErr   error
 }
 
 func (s *stubAppController) Run(prompt string) int {
@@ -57,15 +71,55 @@ func (s *stubAppController) CompactConversation(_ string) error {
 	return nil
 }
 
-func (s *stubAppController) GetTreeSession() *session.TreeManager {
+func (s *stubAppController) SessionSnapshot() (app.SessionSnapshot, bool) {
+	if !s.hasSession {
+		return app.SessionSnapshot{}, false
+	}
+	return app.SessionSnapshot{ID: "stub-session"}, true
+}
+
+func (s *stubAppController) SessionTree() []app.TreeNodeView {
 	return nil
 }
 
-func (s *stubAppController) SwitchTreeSession(_ *session.TreeManager) {
-	// no-op in tests
+func (s *stubAppController) SessionHistory() []message.Message {
+	return s.sessionHistory
 }
 
-func (s *stubAppController) SendEvent(_ tea.Msg) {
+func (s *stubAppController) SetSessionName(_ string) error {
+	return app.ErrNoSession
+}
+
+func (s *stubAppController) NewSession(_ string) error {
+	return app.ErrNoSession
+}
+
+func (s *stubAppController) ForkSession(_, _ string) error {
+	return app.ErrNoSession
+}
+
+func (s *stubAppController) ListSessions(_ string) ([]app.SessionSummary, error) {
+	return s.sessions, s.listErr
+}
+
+func (s *stubAppController) ListAllSessions() ([]app.SessionSummary, error) {
+	return s.allSessions, s.listErr
+}
+
+func (s *stubAppController) DeleteSession(path string) error {
+	s.deleted = append(s.deleted, path)
+	return s.deleteErr
+}
+
+func (s *stubAppController) ExportSession(_ string) (string, int, error) {
+	return "", 0, app.ErrNoSession
+}
+
+func (s *stubAppController) WriteShareableSession(_, _ string) (string, error) {
+	return "", app.ErrNoSession
+}
+
+func (s *stubAppController) SendUIMessage(_ tea.Msg) {
 	// no-op in tests
 }
 
@@ -111,7 +165,9 @@ func (s *stubStreamComponent) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (s *stubStreamComponent) View() tea.View             { return tea.NewView("") }
 func (s *stubStreamComponent) Reset()                     { s.resetCalled++; s.renderedContent = "" }
 func (s *stubStreamComponent) GetRenderedContent() string { return s.renderedContent }
-func (s *stubStreamComponent) SpinnerView() string        { return "" }
+func (s *stubStreamComponent) ActivityDot() string        { return "" }
+func (s *stubStreamComponent) IsSpinning() bool           { return false }
+func (s *stubStreamComponent) ActivityPhrase() string     { return "" }
 func (s *stubStreamComponent) SetThinkingVisible(bool)    {}
 func (s *stubStreamComponent) HasReasoning() bool         { return false }
 func (s *stubStreamComponent) UpdateTheme()               {}
@@ -190,8 +246,8 @@ func TestStateTransition_InputToWorking(t *testing.T) {
 }
 
 // TestStateTransition_WorkingToInput_StepComplete verifies that StepCompleteEvent
-// transitions from stateWorking back to stateInput and keeps stream content
-// visible (deferred flush — no Reset until next SpinnerEvent{Show: true}).
+// transitions from stateWorking back to stateInput and resets the stream (its
+// content is already mirrored in the ScrollList).
 func TestStateTransition_WorkingToInput_StepComplete(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream, _ := newTestAppModel(ctrl)
@@ -202,14 +258,14 @@ func TestStateTransition_WorkingToInput_StepComplete(t *testing.T) {
 	if m.state != stateInput {
 		t.Fatalf("expected stateInput after StepCompleteEvent, got %v", m.state)
 	}
-	if stream.resetCalled != 0 {
-		t.Fatalf("expected stream NOT reset on StepCompleteEvent (deferred flush), got %d resets", stream.resetCalled)
+	if stream.resetCalled != 1 {
+		t.Fatalf("expected stream reset once on StepCompleteEvent, got %d resets", stream.resetCalled)
 	}
 }
 
 // TestStateTransition_WorkingToInput_StepError verifies that StepErrorEvent
-// transitions from stateWorking back to stateInput and keeps stream content
-// visible (deferred flush — no Reset until next SpinnerEvent{Show: true}).
+// transitions from stateWorking back to stateInput and resets the stream (its
+// content is already mirrored in the ScrollList).
 func TestStateTransition_WorkingToInput_StepError(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream, _ := newTestAppModel(ctrl)
@@ -220,8 +276,8 @@ func TestStateTransition_WorkingToInput_StepError(t *testing.T) {
 	if m.state != stateInput {
 		t.Fatalf("expected stateInput after StepErrorEvent, got %v", m.state)
 	}
-	if stream.resetCalled != 0 {
-		t.Fatalf("expected stream NOT reset on StepErrorEvent (deferred flush), got %d resets", stream.resetCalled)
+	if stream.resetCalled != 1 {
+		t.Fatalf("expected stream reset once on StepErrorEvent, got %d resets", stream.resetCalled)
 	}
 }
 
@@ -244,8 +300,8 @@ func TestStepError_nilErr(t *testing.T) {
 // --------------------------------------------------------------------------
 
 // TestStateTransition_WorkingToInput_StepCancelled verifies that StepCancelledEvent
-// transitions from stateWorking back to stateInput and keeps stream content
-// visible (deferred flush — no Reset until next SpinnerEvent{Show: true}).
+// transitions from stateWorking back to stateInput and resets the stream (the
+// partial response is already mirrored in the ScrollList).
 func TestStateTransition_WorkingToInput_StepCancelled(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream, _ := newTestAppModel(ctrl)
@@ -256,8 +312,8 @@ func TestStateTransition_WorkingToInput_StepCancelled(t *testing.T) {
 	if m.state != stateInput {
 		t.Fatalf("expected stateInput after StepCancelledEvent, got %v", m.state)
 	}
-	if stream.resetCalled != 0 {
-		t.Fatalf("expected stream NOT reset on StepCancelledEvent (deferred flush), got %d resets", stream.resetCalled)
+	if stream.resetCalled != 1 {
+		t.Fatalf("expected stream reset once on StepCancelledEvent, got %d resets", stream.resetCalled)
 	}
 }
 
@@ -276,9 +332,10 @@ func TestStepCancelled_clearsCanceling(t *testing.T) {
 	}
 }
 
-// TestStepCancelled_preservesStreamContent verifies that StepCancelledEvent
-// does NOT flush stream content — it stays visible for deferred flush.
-func TestStepCancelled_preservesStreamContent(t *testing.T) {
+// TestStepCancelled_clearsStreamContent verifies that StepCancelledEvent drops
+// the stream component's copy of the partial response. Leaving it behind makes
+// the next SpinnerEvent{Show: true} re-render it below the Interrupted receipt.
+func TestStepCancelled_clearsStreamContent(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream, _ := newTestAppModel(ctrl)
 	m.state = stateWorking
@@ -286,8 +343,35 @@ func TestStepCancelled_preservesStreamContent(t *testing.T) {
 
 	_ = sendMsg(m, app.StepCancelledEvent{})
 
-	if stream.renderedContent != "partial assistant response" {
-		t.Fatal("expected stream content preserved after StepCancelledEvent")
+	if stream.renderedContent != "" {
+		t.Fatalf("expected stream content cleared after StepCancelledEvent, got %q", stream.renderedContent)
+	}
+}
+
+// TestStepCancelled_noDuplicateOnNextTurn verifies the end-to-end shape of the
+// interrupt bug: after a cancelled turn, printing a system message and then
+// starting a new turn must not re-append the cancelled response.
+func TestStepCancelled_noDuplicateOnNextTurn(t *testing.T) {
+	ctrl := &stubAppController{}
+	m, stream, _ := newTestAppModel(ctrl)
+	m.state = stateWorking
+	stream.renderedContent = "partial assistant response"
+
+	m = sendMsg(m, app.StepCancelledEvent{})
+	// Something is printed after the interrupt (e.g. "Switched to <model>"),
+	// so the trailing item is no longer a StreamingMessageItem.
+	m.printSystemMessage("Switched to anthropic/claude-opus-5")
+	before := len(m.messages)
+
+	m = sendMsg(m, app.SpinnerEvent{Show: true})
+
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Render(80), "partial assistant response") {
+			t.Fatal("cancelled response re-appended to ScrollList on next turn")
+		}
+	}
+	if len(m.messages) != before {
+		t.Fatalf("expected no new messages from SpinnerEvent, got %d new", len(m.messages)-before)
 	}
 }
 
@@ -520,12 +604,34 @@ func TestWindowResize_distributeHeight(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, _, _ := newTestAppModel(ctrl)
 
-	// With height=30, scroll height = 30 - 1 (separator) - 8 (input) - 1 (statusBar) = 20
+	// With height=30: the separator collapses to 0 when nothing is queued,
+	// the stub input falls back to the 3-line composer estimate, the activity
+	// row is absent while idle, and the status bar is always 1 line.
+	// 30 - 0 - 3 - 0 - 1 = 26.
 	m = sendMsg(m, tea.WindowSizeMsg{Width: 80, Height: 30})
 	_ = m
 
-	if m.scrollList.height != 20 {
-		t.Fatalf("expected scroll list height=20, got %d", m.scrollList.height)
+	if m.scrollList.height != 26 {
+		t.Fatalf("expected scroll list height=26, got %d", m.scrollList.height)
+	}
+}
+
+// TestActivityRow_ReservesLineWhileWorking verifies the activity row costs
+// exactly one line of transcript while the agent is working, and none at rest.
+func TestActivityRow_ReservesLineWhileWorking(t *testing.T) {
+	ctrl := &stubAppController{}
+	m, _, _ := newTestAppModel(ctrl)
+	m = sendMsg(m, tea.WindowSizeMsg{Width: 80, Height: 30})
+
+	idleHeight := m.scrollList.height
+
+	m.state = stateWorking
+	m.layoutDirty = true
+	m.distributeHeight()
+
+	if got := m.scrollList.height; got != idleHeight-1 {
+		t.Fatalf("expected working height=%d (one line for the activity row), got %d",
+			idleHeight-1, got)
 	}
 }
 
@@ -533,9 +639,9 @@ func TestWindowResize_distributeHeight(t *testing.T) {
 // Step complete behavior
 // --------------------------------------------------------------------------
 
-// TestStepComplete_preservesStreamContent verifies that StepCompleteEvent
-// does NOT flush stream content — it stays visible for deferred flush.
-func TestStepComplete_preservesStreamContent(t *testing.T) {
+// TestStepComplete_clearsStreamContent verifies that StepCompleteEvent drops
+// the stream component's copy of the response (the ScrollList already has it).
+func TestStepComplete_clearsStreamContent(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream, _ := newTestAppModel(ctrl)
 	m.state = stateWorking
@@ -544,8 +650,8 @@ func TestStepComplete_preservesStreamContent(t *testing.T) {
 
 	_ = sendMsg(m, app.StepCompleteEvent{ResponseText: "final answer"})
 
-	if stream.renderedContent != "rendered assistant text" {
-		t.Fatal("expected stream content preserved after StepCompleteEvent")
+	if stream.renderedContent != "" {
+		t.Fatalf("expected stream content cleared after StepCompleteEvent, got %q", stream.renderedContent)
 	}
 }
 
@@ -1246,7 +1352,7 @@ func TestNewSessionRequestEvent_cancelledByExtension(t *testing.T) {
 	})
 	// The before-hook runs in a goroutine, which sends back a
 	// beforeSessionSwitchResultMsg. Pump that synchronously by reading
-	// the SendEvent call indirectly: SendEvent on stub is a no-op so we
+	// the SendUIMessage call indirectly: SendUIMessage on stub is a no-op so we
 	// need to dispatch the message ourselves to simulate the round trip.
 	sendMsg(m, beforeSessionSwitchResultMsg{
 		cancelled:     true,

@@ -345,9 +345,11 @@ kit -e examples/extensions/minimal.go
 
 ### Extension Capabilities
 
-**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnLLMUsage, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
+**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnLLMUsage, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnThinkingLevelChange, OnTerminalResize, OnTurnStateChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
 
 `OnAgentEnd` carries per-turn aggregates (`ToolCallCount`, `ToolNames`, `LLMCallCount`, `InputTokensDelta`, `OutputTokensDelta`, `CostDelta`, `DurationMs`) so observers don't need to maintain parallel bookkeeping. `OnLLMUsage` fires after each LLM provider call with token + cost deltas attributed to that specific call/model — use it for accurate budget enforcement *between* calls instead of waiting for the turn to finish.
+
+`OnTurnStateChange` is a superset of `OnAgentStart`/`OnAgentEnd`: it also covers work that never reaches the agent loop (shell commands) and fires on every path back to idle, including cancellation and error — use it for spinners and turn timers, and `OnAgentStart`/`OnAgentEnd` when you specifically care about agent turns. `OnTerminalResize` and `OnTurnStateChange` fire in the interactive TUI only.
 
 **Custom Components**:
 - **Tools**: Add new tools the LLM can invoke
@@ -355,7 +357,7 @@ kit -e examples/extensions/minimal.go
 - **Options**: Register configurable extension options
 - **Session State**: Last-write-wins key-value store via `ctx.SetState` / `GetState` / `DeleteState` / `ListState`, persisted to a per-session sidecar file outside the conversation tree
 - **Widgets**: Persistent status displays above/below input
-- **Headers/Footers**: Persistent content above/below the conversation
+- **Headers/Footers**: Persistent content above/below the conversation (rendered at full width without truncation — size with `ctx.GetTerminalSize()`)
 - **Status Bar**: Custom status bar entries
 - **Shortcuts**: Global keyboard shortcuts
 - **Overlays**: Modal dialogs with markdown content
@@ -365,7 +367,7 @@ kit -e examples/extensions/minimal.go
 - **Interactive Prompts**: Select, confirm, input, and multi-select dialogs
 - **Subagents**: Spawn in-process child Kit instances
 - **LLM Completion**: Direct model calls via `Complete()`
-- **Themes**: Register and switch color themes via `RegisterTheme`, `SetTheme`, `ListThemes`
+- **Themes**: Register, switch, and read color themes via `RegisterTheme`, `SetTheme`, `ListThemes`, `GetTheme` (read the active palette to paint widgets in the user's theme)
 - **Custom Events**: Inter-extension communication via `EmitCustomEvent`
 
 **Bridged SDK APIs** (NEW): Extensions can now access internal SDK capabilities:
@@ -373,6 +375,8 @@ kit -e examples/extensions/minimal.go
 - **Skill Loading**: Dynamically load and inject skills at runtime (`LoadSkill`, `DiscoverSkills`, `InjectSkillAsContext`)
 - **Template Parsing**: Parse and render templates with `{{variables}}` (`ParseTemplate`, `RenderTemplate`), parse CLI-style arguments (`ParseArguments`, `SimpleParseArguments`), and evaluate model conditionals (`EvaluateModelConditional`, `RenderWithModelConditionals`)
 - **Model Resolution**: Resolve model fallback chains (`ResolveModelChain`), query model capabilities (`GetModelCapabilities`, `CheckModelAvailable`), and extract provider/model ID (`GetCurrentProvider`, `GetCurrentModelID`)
+- **Model Pricing**: Per-million-token costs on `ModelCapabilities.Pricing` and `ModelInfoEntry.Pricing` — check `Pricing.Known` before rendering a cost, since local and OpenAI-compatible models report no pricing
+- **Usage & Environment**: Session tokens and cost via `GetSessionUsage` (including `IsOAuth`, since subscriptions report `$0` cost), terminal dimensions via `GetTerminalSize`, and reasoning effort via `GetThinkingLevel`
 
 ### Extension Examples
 
@@ -403,6 +407,8 @@ See the `examples/extensions/` directory:
 - [`prompt-demo.go`](examples/extensions/prompt-demo.go) - Interactive prompts (select/confirm/input)
 - [`prompt-templates.go`](examples/extensions/prompt-templates.go) - **NEW** Frontmatter-driven templates with model switching and skill injection
 - [`protected-paths.go`](examples/extensions/protected-paths.go) - Path protection for sensitive files
+- [`status-footer.go`](examples/extensions/status-footer.go) - **NEW** Configurable status bar footer (model, context, cache, cost, clock, turn timing)
+- [`subagent-monitor.go`](examples/extensions/subagent-monitor.go) - **NEW** Live subagent dashboard: per-frame `Render` strip, `RefreshHz` animation, theme-aware colors, and a real `ShowOverlay` modal for the full transcript (`ctrl+alt+s`)
 - [`subagent-widget.go`](examples/extensions/subagent-widget.go) - Multi-agent orchestration with status widget
 - [`subagent-test.go`](examples/extensions/subagent-test.go) - Subagent testing utilities
 - [`summarize.go`](examples/extensions/summarize.go) - Conversation summarization
@@ -417,12 +423,21 @@ Also see [`.kit/extensions/go-edit-lint.go`](.kit/extensions/go-edit-lint.go) (i
 ### Loading Extensions
 
 **Auto-discovery** (loads automatically):
-- `~/.config/kit/extensions/*.go` (global single files)
-- `~/.config/kit/extensions/*/main.go` (global subdirectory extensions)
+- `/usr/share/kit/extensions/*.go` (system-wide single files)
+- `/usr/share/kit/extensions/*/main.go` (system-wide subdirectory extensions)
+- `~/.config/kit/extensions/*.go` (user single files)
+- `~/.config/kit/extensions/*/main.go` (user subdirectory extensions)
 - `.kit/extensions/*.go` (project-local single files)
 - `.kit/extensions/*/main.go` (project-local subdirectory extensions)
 - `~/.local/share/kit/git/` (global git-installed packages)
 - `.kit/git/` (project-local git-installed packages)
+
+The system-wide directory serves packaged installs (rpm, deb, ...). Set
+`KIT_SYSTEM_EXTENSIONS_DIR` to use other directories (separated by the platform
+list separator: `:` on Unix, `;` on Windows), or set it empty to disable
+system-wide discovery. Packagers can change the
+compiled-in default with
+`-ldflags "-X github.com/mark3labs/kit/internal/extensions.SystemExtensionsDir=/opt/kit/extensions"`.
 
 **Explicit loading**:
 ```bash
@@ -1162,7 +1177,13 @@ routes:
 kit --model opencode/claude-haiku-4-5 "Hello"     # → Anthropic wire
 kit --model opencode/gpt-5 "Hello"                # → OpenAI wire
 kit --model opencode/gemini-3.5-flash "Hello"     # → Google wire
+kit --model opencode/grok-4.6 "Hello"             # → OpenAI Responses wire
 ```
+
+When an aggregator mixes wires inside one catalog without publishing a hint for
+every family, Kit pins the family itself. opencode's `gpt-*` and `grok-*` models
+answer only on the OpenAI Responses API — their `/chat/completions` route
+returns HTTP 500/503 — so Kit routes them to the Responses wire automatically.
 
 ### Provider Overrides
 

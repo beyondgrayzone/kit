@@ -161,10 +161,10 @@ func (r *MessageRenderer) RenderUserMessage(content string, timestamp time.Time)
 		content,
 		r.width,
 		WithAlign(lipgloss.Left),
-		WithBorderColor(theme.Success),
-		WithPaddingTop(0),
-		WithPaddingBottom(0),
-		WithMarginBottom(1),
+		// The gutter marks attribution, so its color says "you". Gold was
+		// theme.Success, which reads as an outcome rather than an author.
+		WithBorderColor(theme.Accent),
+		WithMarginBottom(style.BlockGap),
 	)
 
 	return UIMessage{
@@ -203,7 +203,7 @@ func (r *MessageRenderer) RenderReasoningBlock(content string, timestamp time.Ti
 
 // RenderSystemMessage renders KIT system messages using herald Note alert
 func (r *MessageRenderer) RenderSystemMessage(content string, timestamp time.Time) UIMessage {
-	rendered := render.SystemBlock(content, r.ty, style.GetTheme())
+	rendered := render.SystemBlock(content, r.width, r.ty, style.GetTheme())
 
 	return UIMessage{
 		Type:      SystemMessage,
@@ -223,6 +223,44 @@ func (r *MessageRenderer) RenderCustomMessage(content, label string, timestamp t
 		Content:   rendered,
 		Height:    lipgloss.Height(rendered),
 		Timestamp: timestamp,
+	}
+}
+
+// RenderExtensionBlock renders a custom styled block from an extension with a
+// caller-chosen border color and optional subtitle.
+//
+// Extensions get the same geometry as every other attributed block — gutter
+// glyph in column 0, text at ContentOffset, one trailing gap — and choose only
+// the stripe color. Letting them choose more would let a single extension make
+// the transcript look inconsistent.
+func (r *MessageRenderer) RenderExtensionBlock(text, borderColor, subtitle string) UIMessage {
+	theme := style.GetTheme()
+
+	// Resolve border color: use the extension's hex value, fall back to theme info.
+	borderClr := theme.Info
+	if borderColor != "" {
+		borderClr = lipgloss.Color(borderColor)
+	}
+
+	// Build content: main text + optional subtitle line.
+	content := text
+	if subtitle != "" {
+		sub := style.GetCachedStyles().VeryMuted.Render(subtitle)
+		content = strings.TrimSuffix(content, "\n") + "\n" + sub
+	}
+
+	rendered := renderContentBlock(
+		content,
+		r.width,
+		WithAlign(lipgloss.Left),
+		WithBorderColor(borderClr),
+		WithMarginBottom(style.BlockGap),
+	)
+
+	return UIMessage{
+		Type:    SystemMessage,
+		Content: rendered,
+		Height:  lipgloss.Height(rendered),
 	}
 }
 
@@ -282,7 +320,7 @@ func (r *MessageRenderer) RenderDebugConfigMessage(config map[string]any, timest
 
 // RenderErrorMessage renders error notifications
 func (r *MessageRenderer) RenderErrorMessage(errorMsg string, timestamp time.Time) UIMessage {
-	rendered := render.ErrorBlock(errorMsg, r.ty, style.GetTheme())
+	rendered := render.ErrorBlock(errorMsg, r.width, r.ty, style.GetTheme())
 
 	return UIMessage{
 		Type:      ErrorMessage,
@@ -313,21 +351,23 @@ func (r *MessageRenderer) RenderToolMessage(toolName, toolArgs, toolResult strin
 		params = formatToolParams(toolArgs, paramBudget)
 	}
 
-	var icon string
-	iconColor := style.GetTheme().Success
+	// Routine successes get a dim marker rather than a green check. A check
+	// on every tool call spends the reader's attention on the unremarkable
+	// and leaves nothing to signal the turn actually finishing; reserving
+	// ✓ for turn completion keeps it meaningful. Failures still get a loud
+	// mark, because those genuinely need finding.
+	theme := style.GetTheme()
+	icon := "·"
+	iconColor := theme.VeryMuted
+	// theme.Tool exists so a theme can give tool calls their own identity;
+	// it defaults to the same amber as Secondary.
+	nameColor := theme.Tool
 	if isError {
 		icon = "×"
-		iconColor = style.GetTheme().Error
-	} else {
-		icon = "✓"
-	}
-
-	// Style the tool name with color
-	theme := style.GetTheme()
-	nameColor := theme.Info
-	if isError {
+		iconColor = theme.Error
 		nameColor = theme.Error
 	}
+
 	styledName := lipgloss.NewStyle().Foreground(nameColor).Bold(true).Render(displayName)
 	styledIcon := lipgloss.NewStyle().Foreground(iconColor).Render(icon)
 
@@ -362,8 +402,11 @@ func (r *MessageRenderer) RenderToolMessage(toolName, toolArgs, toolResult strin
 
 	// Wrap all tool errors in a herald Caution alert so the error text
 	// renders inside a contained block instead of spilling into the layout.
+	// The alert is nested inside the tool block, so it is indented to the
+	// content column rather than restarting its own bar at column 0.
 	if isError && strings.TrimSpace(body) != "" {
-		body = r.ty.Alert(herald.AlertCaution, body)
+		body = r.ty.Alert(herald.AlertCaution, render.AlertBody(body, style.BodyWidth(r.width)))
+		body = style.Indent(body, style.ContentOffset)
 	}
 
 	// Compose: icon + name + params, then body
@@ -372,6 +415,28 @@ func (r *MessageRenderer) RenderToolMessage(toolName, toolArgs, toolResult strin
 		"",
 		body,
 	)
+
+	// An extension renderer may claim the block's stripe color and background.
+	// Tool blocks are otherwise unattributed (no gutter), so the stripe is
+	// added only when asked for — it marks "this tool is special" rather than
+	// restyling every tool call.
+	if extRd != nil && (extRd.BorderColor != "" || extRd.Background != "") {
+		opts := []renderingOption{
+			WithAlign(lipgloss.Left),
+			WithPaddingTop(0),
+			WithPaddingBottom(0),
+		}
+		if extRd.BorderColor != "" {
+			opts = append(opts, WithBorderColor(lipgloss.Color(extRd.BorderColor)))
+		} else {
+			opts = append(opts, WithNoBorder())
+		}
+		if extRd.Background != "" {
+			opts = append(opts, WithBackground(lipgloss.Color(extRd.Background)))
+		}
+		fullContent = renderContentBlock(fullContent, r.width, opts...)
+	}
+
 	fullContent = styleMarginBottom1.Render(fullContent)
 
 	return UIMessage{

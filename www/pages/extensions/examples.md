@@ -14,7 +14,10 @@ Kit ships with a rich set of example extensions in the `examples/extensions/` di
 | [`minimal.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/minimal.go) | Clean UI with custom footer |
 | [`branded-output.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/branded-output.go) | Branded output rendering |
 | [`header-footer-demo.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/header-footer-demo.go) | Custom headers and footers |
+| [`status-footer.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/status-footer.go) | Configurable status bar footer: model, context, cache, cost, clock, turn timing |
 | [`widget-status.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/widget-status.go) | Persistent status widgets |
+| [`arbitrary-ui.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/arbitrary-ui.go) | Animated dashboard — per-frame `Render` widgets, `RefreshHz`, markdown headers, multi-select, styled tool blocks |
+| [`bad-apple.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/bad-apple.go) | 30fps ASCII video in a widget — stress test for the `Render`/`RefreshHz` path |
 | [`overlay-demo.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/overlay-demo.go) | Modal dialogs |
 | [`tool-renderer-demo.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/tool-renderer-demo.go) | Custom tool call rendering |
 | [`custom-editor-demo.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/custom-editor-demo.go) | Vim-like modal editor |
@@ -37,6 +40,7 @@ Kit ships with a rich set of example extensions in the `examples/extensions/` di
 | Extension | Description |
 |-----------|-------------|
 | [`prompt-demo.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/prompt-demo.go) | Interactive prompts (select/confirm/input) |
+| [`ask-question.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/ask-question.go) | `ask_question` tool — the agent asks you multiple-choice questions in a themed modal popup (`Render` widget + editor interceptor + `GetTheme`) |
 | [`bookmark.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/bookmark.go) | Bookmark conversations |
 | [`inline-bash.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/inline-bash.go) | Inline bash execution |
 | [`interactive-shell.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/interactive-shell.go) | Interactive shell integration |
@@ -73,6 +77,7 @@ These examples demonstrate the new bridged SDK APIs that give extensions access 
 | Extension | Description |
 |-----------|-------------|
 | [`kit-kit.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/kit-kit.go) | Kit-in-Kit sub-agent spawning |
+| [`subagent-monitor.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/subagent-monitor.go) | Live subagent dashboard with a composited full-transcript modal |
 | [`subagent-widget.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/subagent-widget.go) | Multi-agent orchestration with status widget |
 | [`subagent-test.go`](https://github.com/mark3labs/kit/blob/master/examples/extensions/subagent-test.go) | Subagent testing utilities |
 

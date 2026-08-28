@@ -20,6 +20,7 @@ import (
 	"github.com/mark3labs/kit/internal/ui"
 	"github.com/mark3labs/kit/internal/ui/commands"
 	"github.com/mark3labs/kit/internal/ui/progress"
+	"github.com/mark3labs/kit/internal/ui/termgfx"
 	"github.com/mark3labs/kit/internal/watcher"
 	kit "github.com/mark3labs/kit/pkg/kit"
 	"github.com/spf13/cobra"
@@ -339,6 +340,7 @@ func init() {
 
 	// Bind flags to viper for config file support
 	_ = viper.BindPFlag("system-prompt", rootCmd.PersistentFlags().Lookup("system-prompt"))
+	_ = viper.BindPFlag("no-session", rootCmd.PersistentFlags().Lookup("no-session"))
 	_ = viper.BindPFlag("model", rootCmd.PersistentFlags().Lookup("model"))
 	_ = viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug"))
 	_ = viper.BindPFlag("max-steps", rootCmd.PersistentFlags().Lookup("max-steps"))
@@ -520,8 +522,11 @@ func widgetProviderForUI(k *kit.Kit) func(string) []ui.WidgetData {
 		widgets := make([]ui.WidgetData, len(configs))
 		for i, c := range configs {
 			widgets[i] = ui.WidgetData{
+				ID:          c.ID,
 				Text:        c.Content.Text,
 				Markdown:    c.Content.Markdown,
+				Render:      c.Content.Render,
+				RefreshHz:   c.Content.RefreshHz,
 				BorderColor: c.Style.BorderColor,
 				NoBorder:    c.Style.NoBorder,
 			}
@@ -547,6 +552,8 @@ func headerFooterProviderForUI(k *kit.Kit, getter func() []extensions.HeaderFoot
 			widgets[i] = ui.WidgetData{
 				Text:        c.Content.Text,
 				Markdown:    c.Content.Markdown,
+				Render:      c.Content.Render,
+				RefreshHz:   c.Content.RefreshHz,
 				BorderColor: c.Style.BorderColor,
 				NoBorder:    c.Style.NoBorder,
 			}
@@ -718,6 +725,29 @@ func globalShortcutsProviderForUI(k *kit.Kit) func() map[string]func() {
 	}
 	return func() map[string]func() {
 		return k.Extensions().GetShortcuts()
+	}
+}
+
+// shortcutListProviderForUI returns a callback that lists extension-registered
+// shortcuts for the /shortcuts command, converting them to the UI's type.
+func shortcutListProviderForUI(k *kit.Kit) func() []ui.ShortcutInfo {
+	if !k.Extensions().HasExtensions() {
+		return nil
+	}
+	return func() []ui.ShortcutInfo {
+		infos := k.Extensions().GetShortcutInfos()
+		if len(infos) == 0 {
+			return nil
+		}
+		out := make([]ui.ShortcutInfo, 0, len(infos))
+		for _, info := range infos {
+			out = append(out, ui.ShortcutInfo{
+				Key:         info.Key,
+				Description: info.Description,
+				Source:      info.Source,
+			})
+		}
+		return out
 	}
 }
 
@@ -893,7 +923,7 @@ func runNormalMode(ctx context.Context) error {
 	kitOpts := &kit.Options{
 		Quiet:            quietFlag,
 		Debug:            debugMode,
-		NoSession:        noSessionFlag,
+		NoSession:        viper.GetBool("no-session"),
 		Continue:         continueFlag,
 		SessionPath:      sessionPath,
 		AutoCompact:      autoCompactFlag,
@@ -1017,6 +1047,14 @@ func runNormalMode(ctx context.Context) error {
 	// Set up extension context and emit SessionStart.
 	if kitInstance.Extensions().HasExtensions() {
 		cwd, _ := os.Getwd()
+		// Seed the size before SessionStart so handlers can lay out during
+		// startup, ahead of the TUI's first WindowSizeMsg. Only in the
+		// interactive TUI: headless runs have no chrome to size, and
+		// terminalSize()'s 80x24 fallback would contradict the documented
+		// (0, 0) that GetTerminalSize reports outside the TUI.
+		if positionalPrompt == "" {
+			kitInstance.Extensions().SetTerminalSize(terminalSize())
+		}
 		extCtx := buildInteractiveExtensionContext(extensionContextDeps{
 			ctx:          ctx,
 			cwd:          cwd,
@@ -1161,6 +1199,7 @@ func runNormalMode(ctx context.Context) error {
 	emitBeforeSessionSwitch := beforeSessionSwitchProviderForUI(kitInstance)
 	emitRawInput := rawInputProviderForUI(kitInstance)
 	getGlobalShortcuts := globalShortcutsProviderForUI(kitInstance)
+	getShortcutList := shortcutListProviderForUI(kitInstance)
 	getExtensionCommands := func() []commands.ExtensionCommand {
 		return extensionCommandsForUI(kitInstance)
 	}
@@ -1277,6 +1316,18 @@ func runNormalMode(ctx context.Context) error {
 	}
 	emitModelChangeForUI := func(newModel, previousModel, source string) {
 		kitInstance.Extensions().EmitModelChange(newModel, previousModel, source)
+	}
+	emitThinkingLevelChangeForUI := func(newLevel, previousLevel, source string) {
+		kitInstance.Extensions().EmitThinkingLevelChange(newLevel, previousLevel, source)
+	}
+	emitTerminalResizeForUI := func(width, height int) {
+		// Record the size first so a handler calling ctx.GetTerminalSize
+		// during this event sees the new value rather than the old one.
+		kitInstance.Extensions().SetTerminalSize(width, height)
+		kitInstance.Extensions().EmitTerminalResize(width, height)
+	}
+	emitTurnStateChangeForUI := func(state, previous string) {
+		kitInstance.Extensions().EmitTurnStateChange(state, previous)
 	}
 
 	// Build thinking level callback.
@@ -1412,9 +1463,13 @@ func runNormalMode(ctx context.Context) error {
 		emitBeforeSessionSwitch:  emitBeforeSessionSwitch,
 		emitRawInput:             emitRawInput,
 		getGlobalShortcuts:       getGlobalShortcuts,
+		getShortcutList:          getShortcutList,
 		getExtensionCommands:     getExtensionCommands,
 		setModel:                 setModelForUI,
 		emitModelChange:          emitModelChangeForUI,
+		emitThinkingLevelChange:  emitThinkingLevelChangeForUI,
+		emitTerminalResize:       emitTerminalResizeForUI,
+		emitTurnStateChange:      emitTurnStateChangeForUI,
 		isReasoningModel:         kitInstance.IsReasoningModel(),
 		thinkingLevel:            kitInstance.GetThinkingLevel(),
 		setThinkingLevel:         setThinkingLevelForUI,
@@ -1536,6 +1591,17 @@ func runNonInteractiveModeApp(ctx context.Context, deps runModeDeps, prompt stri
 // runInteractiveModeBubbleTea. Grouping them into a single struct keeps the
 // call sites and signatures readable and makes it trivial to add a new
 // provider callback without touching every call chain.
+// terminalSize reports the current terminal dimensions, falling back to a
+// conventional 80x24 when stdout is not a TTY. Shared by the TUI and the
+// extension context so both start from the same numbers.
+func terminalSize() (int, int) {
+	w, h, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w == 0 {
+		return 80, 24
+	}
+	return w, h
+}
+
 type runModeDeps struct {
 	appInstance              *app.App
 	cli                      *ui.CLI // non-interactive only
@@ -1570,9 +1636,13 @@ type runModeDeps struct {
 	emitBeforeFork           func(string, bool, string) (bool, string)
 	emitBeforeSessionSwitch  func(string, string) (bool, string)
 	getGlobalShortcuts       func() map[string]func()
+	getShortcutList          func() []ui.ShortcutInfo
 	getExtensionCommands     func() []commands.ExtensionCommand
 	setModel                 func(string) error
 	emitModelChange          func(string, string, string)
+	emitThinkingLevelChange  func(string, string, string)
+	emitTerminalResize       func(int, int)
+	emitTurnStateChange      func(string, string)
 	emitRawInput             func(string, string)
 	isReasoningModel         bool
 	thinkingLevel            string
@@ -1694,14 +1764,16 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 		// TUI is running. Point it at the same file so no structured log
 		// output reaches the terminal.
 		charmlog.SetOutput(logFile)
+		// --debug turns on the structured debug output that diagnoses
+		// terminal-capability and layout decisions. Without this the default
+		// Info level silently drops it.
+		if debugMode {
+			charmlog.SetLevel(charmlog.DebugLevel)
+		}
 	}
 
 	// Determine terminal size; fall back gracefully.
-	termWidth, termHeight, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || termWidth == 0 {
-		termWidth = 80
-		termHeight = 24
-	}
+	termWidth, termHeight := terminalSize()
 
 	cwd, _ := os.Getwd()
 
@@ -1742,9 +1814,13 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 		EmitBeforeSessionSwitch:  deps.emitBeforeSessionSwitch,
 		EmitRawInput:             deps.emitRawInput,
 		GetGlobalShortcuts:       deps.getGlobalShortcuts,
+		GetShortcutList:          deps.getShortcutList,
 		GetExtensionCommands:     deps.getExtensionCommands,
 		SetModel:                 deps.setModel,
 		EmitModelChange:          deps.emitModelChange,
+		EmitThinkingLevelChange:  deps.emitThinkingLevelChange,
+		EmitTerminalResize:       deps.emitTerminalResize,
+		EmitTurnStateChange:      deps.emitTurnStateChange,
 		ThinkingLevel:            deps.thinkingLevel,
 		IsReasoningModel:         deps.isReasoningModel,
 		SetThinkingLevel:         deps.setThinkingLevel,
@@ -1754,6 +1830,18 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 		GetMCPResources:          mcpGetResources,
 		MCPResourceReader:        mcpResourceReader,
 	})
+
+	// Resolve terminal capabilities (background, colour profile) now, before
+	// the TUI takes over stdin. The detection runs a synchronous OSC query, so
+	// it must happen here rather than lazily mid-render where it would race the
+	// event loop. No-op if a theme in config already resolved them.
+	ui.ResolveTerminalCapabilities()
+
+	// Detect the inline-graphics protocols the terminal honours, for the same
+	// reason and at the same point: the probe reads raw replies from stdin, so
+	// it must finish before the event loop owns that fd. Image previews fall
+	// back to half-block thumbnails when the probe finds no support.
+	termgfx.Resolve()
 
 	program := tea.NewProgram(appModel)
 

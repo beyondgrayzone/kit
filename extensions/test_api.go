@@ -117,6 +117,24 @@ func NewTestAPI(ext *LoadedExtension) API {
 				return nil
 			})
 		},
+		onThinkingLevelChange: func(h func(ThinkingLevelChangeEvent, Context)) {
+			reg(ThinkingLevelChange, func(e Event, c Context) Result {
+				h(e.(ThinkingLevelChangeEvent), c)
+				return nil
+			})
+		},
+		onTerminalResize: func(h func(TerminalResizeEvent, Context)) {
+			reg(TerminalResize, func(e Event, c Context) Result {
+				h(e.(TerminalResizeEvent), c)
+				return nil
+			})
+		},
+		onTurnStateChange: func(h func(TurnStateChangeEvent, Context)) {
+			reg(TurnStateChange, func(e Event, c Context) Result {
+				h(e.(TurnStateChangeEvent), c)
+				return nil
+			})
+		},
 		onContextPrepare: func(h func(ContextPrepareEvent, Context) *ContextPrepareResult) {
 			reg(ContextPrepare, func(e Event, c Context) Result {
 				r := h(e.(ContextPrepareEvent), c)
@@ -172,7 +190,9 @@ func NewTestAPI(ext *LoadedExtension) API {
 			ext.Options = append(ext.Options, opt)
 		},
 		registerShortcutFn: func(def ShortcutDef, handler func(Context)) {
-			ext.Shortcuts = append(ext.Shortcuts, ShortcutEntry{Def: def, Handler: handler})
+			if entry, ok := prepareShortcut(def, handler, ext.Path); ok {
+				ext.Shortcuts = append(ext.Shortcuts, entry)
+			}
 		},
 		registerMessageRendererFn: func(config MessageRendererConfig) {
 			ext.MessageRenderers = append(ext.MessageRenderers, config)

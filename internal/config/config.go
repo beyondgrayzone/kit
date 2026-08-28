@@ -228,17 +228,21 @@ type GenerationParams struct {
 // or other custom/ prefixed models. These models are loaded from the config file
 // and merged into the custom provider in the model registry.
 type CustomModelConfig struct {
-	Name         string      `json:"name" yaml:"name"`
-	BaseURL      string      `json:"baseUrl,omitempty" yaml:"baseUrl,omitempty"`
-	APIKey       string      `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
-	APIModelName string      `json:"apiModelName,omitempty" yaml:"apiModelName,omitempty"`
-	Family       string      `json:"family,omitempty" yaml:"family,omitempty"`
-	Attachment   bool        `json:"attachment,omitempty" yaml:"attachment,omitempty"`
-	Reasoning    bool        `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
-	Temperature  bool        `json:"temperature,omitempty" yaml:"temperature,omitempty"`
-	Knowledge    string      `json:"knowledge,omitempty" yaml:"knowledge,omitempty"`
-	Cost         CostConfig  `json:"cost" yaml:"cost"`
-	Limit        LimitConfig `json:"limit" yaml:"limit"`
+	Name         string `json:"name" yaml:"name"`
+	BaseURL      string `json:"baseUrl,omitempty" yaml:"baseUrl,omitempty"`
+	APIKey       string `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
+	APIModelName string `json:"apiModelName,omitempty" yaml:"apiModelName,omitempty"`
+	Family       string `json:"family,omitempty" yaml:"family,omitempty"`
+	Attachment   bool   `json:"attachment,omitempty" yaml:"attachment,omitempty"`
+	Reasoning    bool   `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
+	Temperature  bool   `json:"temperature,omitempty" yaml:"temperature,omitempty"`
+	Knowledge    string `json:"knowledge,omitempty" yaml:"knowledge,omitempty"`
+	// Cost is a pointer so an omitted "cost" block (pricing unknown) stays
+	// distinguishable from an explicitly configured zero rate (a free model).
+	// Must match models.CustomModelConfig, which is what actually decodes
+	// this section.
+	Cost  *CostConfig `json:"cost,omitempty" yaml:"cost,omitempty"`
+	Limit LimitConfig `json:"limit" yaml:"limit"`
 
 	// Generation parameter defaults for this model.
 	// These are applied when the user hasn't explicitly set the corresponding
@@ -292,6 +296,14 @@ type Config struct {
 
 	// Custom model definitions (under custom/ provider)
 	CustomModels map[string]CustomModelConfig `json:"customModels,omitempty" yaml:"customModels,omitempty"`
+
+	// Bash tool timeouts (in seconds). BashTimeout sets the default per-call
+	// timeout applied when the model does not specify one (built-in default
+	// 120s). BashMaxTimeout caps the maximum timeout a bash tool call may
+	// request via its timeout argument (built-in default 600s). Zero values
+	// preserve the built-in defaults.
+	BashTimeout    int `json:"bash-timeout,omitempty" yaml:"bash-timeout,omitempty"`
+	BashMaxTimeout int `json:"bash-max-timeout,omitempty" yaml:"bash-max-timeout,omitempty"`
 
 	// Per-model generation parameter overrides. Keys are "provider/model" strings
 	// (e.g. "anthropic/claude-sonnet-4-5-20250929", "openai/gpt-4o"). These

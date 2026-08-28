@@ -2,6 +2,9 @@ package extensions
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 )
 
 // ErrAgentBusy is returned (wrapped) when an extension API call that requires
@@ -686,6 +689,21 @@ type Context struct {
 	// ListThemes returns the names of all available themes.
 	ListThemes func() []string
 
+	// GetTheme returns the colors of the currently active theme, already
+	// resolved for the terminal's light/dark appearance and formatted as
+	// "#rrggbb" hex strings.
+	//
+	// Use it to draw widget content that follows the user's theme instead of
+	// hardcoding a palette. Pair it with ThemeColors.ANSI to emit escape
+	// sequences:
+	//
+	//	theme := ctx.GetTheme()
+	//	line := theme.ANSI(theme.Accent, "selected")
+	//
+	// Call it inside the render path rather than caching the result, so a
+	// theme switch is picked up on the next frame.
+	GetTheme func() ThemeColors
+
 	// ReloadExtensions hot-reloads all extensions from disk. Existing
 	// extensions receive a SessionShutdown event, then new code is loaded
 	// and receives a SessionStart event. Event handlers, commands,
@@ -834,8 +852,10 @@ type Context struct {
 	// ResolveModelChain attempts each model in order until one is available.
 	ResolveModelChain func(preferences []string) ModelResolutionResult
 
-	// GetModelCapabilities returns capabilities for a specific model.
-	// If model is empty, uses current model.
+	// GetModelCapabilities returns capabilities for a specific model,
+	// including its context/output limits and token pricing. Pass an empty
+	// string for the model currently in use. The second return value is an
+	// error message, empty on success.
 	GetModelCapabilities func(model string) (ModelCapabilities, string)
 
 	// CheckModelAvailable verifies if a model string is valid.
@@ -846,6 +866,29 @@ type Context struct {
 
 	// GetCurrentModelID returns just the model ID part of current model.
 	GetCurrentModelID func() string
+
+	// GetTerminalSize returns the current terminal width and height in columns
+	// and rows. Both are 0 outside the interactive TUI (headless, ACP, script
+	// mode), so guard before dividing or subtracting.
+	//
+	// Content passed to SetFooter, SetHeader and SetWidget is rendered at full
+	// terminal width with no truncation: a wider line wraps and silently
+	// consumes an extra row of scrollback. Measure with this before handing
+	// text to those calls.
+	//
+	// This is a function, not a field, so that it reports the live size. A
+	// long-lived goroutine that captured a Context still observes resizes,
+	// whereas a struct field would freeze at the value copied when the
+	// handler was invoked.
+	GetTerminalSize func() (int, int)
+
+	// GetThinkingLevel returns the active extended-thinking effort level:
+	// "off", "none", "minimal", "low", "medium", or "high". Models that do
+	// not support reasoning report "off".
+	//
+	// Pair with GetModelCapabilities("").Reasoning to tell "reasoning is
+	// switched off" apart from "this model cannot reason at all".
+	GetThinkingLevel func() string
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1058,45 @@ type ModelCapabilities struct {
 	Reasoning bool
 	// Streaming indicates if the model supports streaming.
 	Streaming bool
+	// Pricing holds the model's per-million-token costs. Pricing.Known is
+	// false when the registry has no cost data for the model.
+	Pricing ModelPricing
+}
+
+// ModelPricing describes a model's token costs, expressed in US dollars per
+// one million tokens (the unit used by the models.dev registry). Extensions
+// use it to compute costs or savings that Kit does not report directly —
+// for example the value of prompt-cache reads:
+//
+//	caps, _ := ctx.GetModelCapabilities("")
+//	usage := ctx.GetSessionUsage()
+//	if caps.Pricing.Known && caps.Pricing.HasCacheRead {
+//	    saved := float64(usage.TotalCacheReadTokens) *
+//	        (caps.Pricing.Input - caps.Pricing.CacheRead) / 1_000_000
+//	}
+//
+// Costs for a raw token count are therefore tokens * rate / 1_000_000.
+type ModelPricing struct {
+	// Input is the cost per million input (prompt) tokens.
+	Input float64
+	// Output is the cost per million output (completion) tokens.
+	Output float64
+	// CacheRead is the cost per million tokens read from the prompt cache.
+	// Only meaningful when HasCacheRead is true.
+	CacheRead float64
+	// CacheWrite is the cost per million tokens written to the prompt cache.
+	// Only meaningful when HasCacheWrite is true.
+	CacheWrite float64
+	// HasCacheRead is true when the model publishes a cache-read rate.
+	// When false, the provider either does not support prompt caching or the
+	// registry has no rate for it — do not assume CacheRead is 0.
+	HasCacheRead bool
+	// HasCacheWrite is true when the model publishes a cache-write rate.
+	HasCacheWrite bool
+	// Known is true when the registry supplied pricing for this model. When
+	// false every other field is zero and costs cannot be computed; this is
+	// normal for local models and custom OpenAI-compatible endpoints.
+	Known bool
 }
 
 // ModelResolutionResult reports model chain resolution outcome.
@@ -1167,9 +1249,17 @@ type SessionUsage struct {
 	// TotalCacheWriteTokens is the sum of cache write tokens.
 	TotalCacheWriteTokens int
 	// TotalCost is the total cost in USD across all requests.
+	// Always 0 when IsOAuth is true, and also 0 when the active model has no
+	// pricing in the registry — check IsOAuth to tell the two apart.
 	TotalCost float64
 	// RequestCount is the number of LLM requests made in this session.
 	RequestCount int
+	// IsOAuth is true when the active provider credential is an OAuth token
+	// (e.g. a Claude subscription) rather than a per-token billed API key.
+	// Under OAuth the user is not charged per request, so TotalCost is
+	// deliberately reported as 0. Extensions that render cost should check
+	// this flag to distinguish "free under subscription" from "$0.00 spent".
+	IsOAuth bool
 }
 
 // PrintBlockOpts configures a custom styled block for PrintBlock.
@@ -1219,6 +1309,9 @@ type API struct {
 	registerCmdFn             func(CommandDef)
 	registerToolRendererFn    func(ToolRenderConfig)
 	onModelChange             func(func(ModelChangeEvent, Context))
+	onThinkingLevelChange     func(func(ThinkingLevelChangeEvent, Context))
+	onTerminalResize          func(func(TerminalResizeEvent, Context))
+	onTurnStateChange         func(func(TurnStateChangeEvent, Context))
 	onContextPrepare          func(func(ContextPrepareEvent, Context) *ContextPrepareResult)
 	onBeforeFork              func(func(BeforeForkEvent, Context) *BeforeForkResult)
 	onBeforeSessionSwitch     func(func(BeforeSessionSwitchEvent, Context) *BeforeSessionSwitchResult)
@@ -1423,6 +1516,59 @@ func (a *API) OnModelChange(handler func(ModelChangeEvent, Context)) {
 	}
 }
 
+// OnThinkingLevelChange registers a handler that fires after the extended
+// thinking effort level changes, whether from the /thinking command, the
+// shift+tab shortcut, or an automatic downgrade on model switch.
+//
+// Example — keep a footer in sync with the effort level:
+//
+//	api.OnThinkingLevelChange(func(e ext.ThinkingLevelChangeEvent, ctx ext.Context) {
+//	    ctx.SetFooter(ext.HeaderFooterConfig{
+//	        Content: ext.WidgetContent{Text: "effort: " + e.NewLevel},
+//	    })
+//	})
+func (a *API) OnThinkingLevelChange(handler func(ThinkingLevelChangeEvent, Context)) {
+	a.onThinkingLevelChange(handler)
+}
+
+// OnTerminalResize registers a handler that fires when the terminal is
+// resized, and once at startup with the initial dimensions.
+//
+// Footer, header, and widget content is rendered at full width without
+// truncation, so an over-long line wraps and eats a row of scrollback. Use
+// this to re-render chrome at the new width.
+//
+// Example:
+//
+//	api.OnTerminalResize(func(e ext.TerminalResizeEvent, ctx ext.Context) {
+//	    ctx.SetFooter(ext.HeaderFooterConfig{
+//	        Content: ext.WidgetContent{Text: fit(line, e.Width)},
+//	    })
+//	})
+func (a *API) OnTerminalResize(handler func(TerminalResizeEvent, Context)) {
+	a.onTerminalResize(handler)
+}
+
+// OnTurnStateChange registers a handler that fires when the UI enters or
+// leaves its working state.
+//
+// This covers every busy/idle transition, including shell commands that never
+// reach the agent loop and turns that end in cancellation or error — cases
+// AgentStart/AgentEnd do not report. Use it to drive a spinner or turn timer.
+//
+// Example — time every turn:
+//
+//	api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
+//	    if e.State == "working" {
+//	        started = time.Now()
+//	    } else {
+//	        elapsed = time.Since(started)
+//	    }
+//	})
+func (a *API) OnTurnStateChange(handler func(TurnStateChangeEvent, Context)) {
+	a.onTurnStateChange(handler)
+}
+
 // OnContextPrepare registers a handler that fires after the context window is
 // built from the session tree (including compaction) and before the messages
 // are sent to the LLM. The handler can inspect the context and return a
@@ -1478,6 +1624,22 @@ func (a *API) RegisterOption(opt OptionDef) {
 // with text input. If multiple extensions register the same key, the last
 // registration wins. The handler runs in a goroutine so it can call blocking
 // APIs like PromptSelect without stalling the TUI event loop.
+//
+// Keys are normalized at registration, so "Ctrl+Shift+S", "control+shift+s"
+// and "shift+ctrl+s" all resolve to the same binding. Both spellings of a
+// shifted key work: "shift+a" and "A" match the same press.
+//
+// Two classes of binding are handled specially:
+//
+//   - "ctrl+c" is reserved. Kit consumes it for cancel/quit before extensions
+//     are consulted, so the registration is rejected with a logged warning
+//     rather than silently never firing.
+//   - Keys bound by Kit itself ("esc", "ctrl+x", "pgup", "enter", ...) are
+//     accepted but log a warning, because the shortcut dispatcher runs first
+//     and will shadow the built-in behaviour.
+//
+// An armed Ctrl+X leader chord takes precedence over shortcuts, so binding a
+// chord suffix does not break the built-in chords.
 func (a *API) RegisterShortcut(def ShortcutDef, handler func(Context)) {
 	if a.registerShortcutFn != nil {
 		a.registerShortcutFn(def, handler)
@@ -1642,13 +1804,51 @@ const (
 )
 
 // WidgetContent describes what to render in a widget slot.
+//
+// Content is resolved in priority order: Render (if non-nil), then Text.
+// Render gives the extension the terminal width and takes whatever string it
+// returns verbatim, so it can emit arbitrary ANSI, box drawing, sparklines,
+// or per-frame animation. Text is the simple declarative form.
 type WidgetContent struct {
-	// Text is the content to display.
+	// Text is the content to display. Ignored when Render is non-nil.
 	Text string
 
 	// Markdown, when true, renders Text as styled markdown instead of
-	// plain text.
+	// plain text. Ignored when Render is non-nil — a Render function is
+	// expected to do its own styling.
 	Markdown bool
+
+	// Render, if non-nil, produces the widget body on every frame. It
+	// receives the width in columns available for content (the gutter and
+	// padding are already subtracted) and returns the string to display,
+	// which Kit uses verbatim. Returning an empty string hides the widget.
+	//
+	// Because it runs on every frame it must be cheap and must not block:
+	// no network calls, no locks held across the call. Compute in an event
+	// handler or goroutine, store the result, and format it here.
+	//
+	// IMPORTANT (Yaegi): assign an anonymous closure, or declare the target
+	// function ABOVE this code. A bare reference to a function declared
+	// later in the file silently renders nothing. See the extension docs.
+	Render func(width int) string
+
+	// RefreshHz requests continuous repainting for an animated widget.
+	//
+	// Kit's animation clock is demand-driven: it runs while the startup logo
+	// or the activity spinner needs it and stops otherwise, so an idle
+	// session costs nothing. A widget that only reads state repaints
+	// whenever something else already caused a render, which when idle means
+	// roughly twice a second (the input cursor blink). That is fine for a
+	// counter and visibly choppy for a spinner or a sweeping gradient.
+	//
+	// Set RefreshHz to the rate the widget wants (1..30) and Kit keeps the
+	// shared clock alive and calls Render at approximately that rate. Zero
+	// (the default) means static: no clock is held open.
+	//
+	// This is a real cost. A non-zero value means the app never idles, so
+	// ask for the lowest rate that looks right — 4-8Hz for a status pulse,
+	// 10-15Hz for a spinner, 30 only for smooth motion.
+	RefreshHz int
 }
 
 // WidgetStyle configures the visual appearance of a widget.
@@ -1802,7 +2002,10 @@ type UIVisibility struct {
 	HideStartupMessage bool // Hide the "Model loaded..." startup block
 	HideStatusBar      bool // Hide the "provider · model  Tokens: ..." line
 	HideSeparator      bool // Hide the "────────" divider between stream and input
-	HideInputHint      bool // Hide the "enter submit · ctrl+j..." hint below input
+	// HideInputHint is retained for compatibility and has no effect. The
+	// submit hint is no longer a separate line below the composer; it lives
+	// in the placeholder and disappears as soon as the user types.
+	HideInputHint bool
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,6 +2132,9 @@ type ModelInfoEntry struct {
 	OutputLimit int
 	// Reasoning is true if the model supports extended thinking.
 	Reasoning bool
+	// Pricing holds the model's per-million-token costs. Pricing.Known is
+	// false when the registry has no cost data for the model.
+	Pricing ModelPricing
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,8 +2206,9 @@ type CommandDef struct {
 // characters like "a" or "x" which conflict with text input.
 type ShortcutDef struct {
 	// Key is the key binding (e.g., "ctrl+p", "alt+t", "f1", "ctrl+shift+s").
+	// Normalized at registration: modifier order and casing do not matter.
 	Key string
-	// Description explains what the shortcut does (shown in /shortcuts help).
+	// Description explains what the shortcut does (shown in /shortcuts).
 	Description string
 }
 
@@ -2031,9 +2238,14 @@ type MessageRendererConfig struct {
 	Name string
 
 	// Render produces the styled output string from raw content. Receives
-	// the content and the terminal width in columns. Return the final
-	// ANSI-styled string to print; it will be emitted via tea.Println
-	// (or plain stdout in non-interactive mode).
+	// the content and the terminal width in columns.
+	//
+	// The returned string is NOT emitted verbatim: in interactive mode Kit
+	// re-wraps it to the content width and nests it inside a system message
+	// block (gutter glyph plus indent), so box drawing that assumes full
+	// terminal width will be wrapped a second time. Size output to roughly
+	// width-4 and prefer inline styling over full-width frames. For output
+	// Kit uses as-is, use a widget with a Render callback instead.
 	Render func(content string, width int) string
 }
 
@@ -2167,24 +2379,42 @@ type EditorKeyAction struct {
 //
 // Uses concrete function fields instead of interfaces for Yaegi safety.
 //
-// IMPORTANT (Yaegi limitation): Function fields MUST be set using anonymous
-// function literals (closures), NOT bare function references. Yaegi does not
-// correctly propagate return values from named function references assigned to
-// struct fields. Wrap any named function in a closure:
+// IMPORTANT (Yaegi limitation — forward references lose their bodies):
+// If you reference a function BY NAME from inside a function literal, and
+// that function is declared LATER in the file, Yaegi builds the wrapper
+// before the function is compiled. The field then holds a callable that does
+// nothing and returns zero values — no panic, no error. This affects every
+// Kit API taking a function, and also direct arguments such as
+// api.OnToolCall(fn) and api.RegisterShortcut(def, fn).
 //
-//	// WRONG — Yaegi returns zero values:
-//	ctx.SetEditor(ext.EditorConfig{HandleKey: myHandler, Render: myRender})
-//
-//	// CORRECT — closure wrapper works:
-//	ctx.SetEditor(ext.EditorConfig{
-//	    HandleKey: func(k string, t string) ext.EditorKeyAction { return myHandler(k, t) },
-//	    Render:    func(w int, c string) string { return myRender(w, c) },
+//	// BROKEN — myHandler is declared below this closure:
+//	api.OnAgentStart(func(e ext.AgentStartEvent, ctx ext.Context) {
+//	    ctx.SetEditor(ext.EditorConfig{HandleKey: myHandler})
 //	})
+//	func myHandler(k, t string) ext.EditorKeyAction { ... }
+//
+// Any one of these fixes it:
+//
+//  1. Declare helpers ABOVE the code that references them (simplest).
+//  2. Wrap in an anonymous closure:
+//     HandleKey: func(k string, t string) ext.EditorKeyAction { return myHandler(k, t) }
+//  3. Assign to a local first: f := myHandler; ...{HandleKey: f}
+//
+// Verified against yaegi v0.12.0-v0.16.1; not fixed upstream.
 type EditorConfig struct {
 	// HandleKey intercepts key presses before they reach the built-in editor.
-	// It receives the key name (e.g., "a", "enter", "ctrl+c", "backspace")
+	// It receives the key name (e.g., "a", "enter", "alt+p", "backspace")
 	// and the editor's current text content. Return an EditorKeyAction to
 	// control how the key is handled.
+	//
+	// Unlike RegisterShortcut handlers, this is called synchronously on the
+	// TUI event loop: a blocking call here freezes the whole interface. Keep
+	// it fast, and dispatch slow work to a goroutine.
+	//
+	// The interceptor is the last hook before the editor, so it never sees
+	// keys an earlier stage consumed — among them "ctrl+c", any registered
+	// extension shortcut, "esc" while a turn is running, "ctrl+x" and its
+	// chord suffix, and the scrollback bindings such as "pgup".
 	//
 	// If nil, all keys pass through to the built-in editor unchanged.
 	HandleKey func(key string, currentText string) EditorKeyAction
@@ -2443,6 +2673,59 @@ type ModelChangeEvent struct {
 func (e SessionShutdownEvent) Type() EventType { return SessionShutdown }
 
 func (e ModelChangeEvent) Type() EventType { return ModelChange }
+
+// ThinkingLevelChangeEvent fires after the extended-thinking effort level
+// changes. Handlers that display the level should re-read it here rather than
+// caching a value from session start.
+type ThinkingLevelChangeEvent struct {
+	// NewLevel is the level now in effect: "off", "none", "minimal", "low",
+	// "medium", or "high".
+	NewLevel string
+	// PreviousLevel is the level before the change.
+	PreviousLevel string
+	// Source indicates what triggered the change:
+	//   "user"           — the /thinking command or the shift+tab shortcut
+	//   "model_fallback" — an automatic downgrade because the newly selected
+	//                      model does not support the previous level
+	Source string
+}
+
+func (e ThinkingLevelChangeEvent) Type() EventType { return ThinkingLevelChange }
+
+// TerminalResizeEvent fires when the terminal is resized, and once at startup
+// with the initial dimensions so a handler can lay out without waiting for the
+// user to resize. Interactive TUI only.
+//
+// The same values are available through Context.GetTerminalSize();
+// this event exists so extensions can re-render chrome immediately instead of
+// polling.
+type TerminalResizeEvent struct {
+	// Width is the new terminal width in columns.
+	Width int
+	// Height is the new terminal height in rows.
+	Height int
+}
+
+func (e TerminalResizeEvent) Type() EventType { return TerminalResize }
+
+// TurnStateChangeEvent fires when the UI enters or leaves its working state.
+//
+// This is a superset of AgentStart/AgentEnd: it also covers work that never
+// reaches the agent loop (shell commands run with "!"), and it fires on every
+// path back to idle, including cancellation and error. Use it for UI that must
+// track whether Kit is busy — a spinner or a turn timer — and use
+// AgentStart/AgentEnd when you specifically care about agent turns and their
+// token usage.
+//
+// Interactive TUI only.
+type TurnStateChangeEvent struct {
+	// State is the state just entered: "working" or "idle".
+	State string
+	// Previous is the state left behind, using the same vocabulary.
+	Previous string
+}
+
+func (e TurnStateChangeEvent) Type() EventType { return TurnStateChange }
 
 // ContextPrepareEvent fires after the context window is built from the session
 // tree and before the messages are sent to the LLM. Handlers can inspect the
@@ -2753,6 +3036,86 @@ type LLMUsageEvent struct {
 }
 
 func (e LLMUsageEvent) Type() EventType { return LLMUsage }
+
+// ThemeColors holds the active theme's colors as "#rrggbb" hex strings, with
+// the light/dark variants already resolved for the terminal's appearance.
+// Returned by ctx.GetTheme().
+//
+// It is the read counterpart to ThemeColorConfig: that type describes a theme
+// being registered (light and dark for each slot), this one reports the colors
+// actually in effect right now.
+type ThemeColors struct {
+	// Name is the active theme's name, e.g. "catppuccin".
+	Name string
+	// Dark is true when the resolved colors are the dark variants.
+	Dark bool
+
+	Primary     string
+	Secondary   string
+	Success     string
+	Warning     string
+	Error       string
+	Info        string
+	Text        string
+	Muted       string
+	VeryMuted   string
+	Background  string
+	Border      string
+	MutedBorder string
+	System      string
+	Tool        string
+	Accent      string
+	Highlight   string
+
+	// Markdown/syntax highlighting colors.
+	MdHeading string
+	MdLink    string
+	MdKeyword string
+	MdString  string
+	MdNumber  string
+	MdComment string
+}
+
+// ANSI wraps text in a truecolor foreground escape for the given theme hex
+// color and resets afterwards. An empty or malformed color returns text
+// unchanged, so a partially-defined theme degrades to plain output rather
+// than leaking escape codes.
+//
+// Widget Render output is used verbatim, so this is how an extension paints
+// arbitrary UI in the user's theme.
+func (t ThemeColors) ANSI(hexColor, text string) string {
+	r, g, b, ok := parseThemeHex(hexColor)
+	if !ok {
+		return text
+	}
+	return fmt.Sprintf("\033[38;2;%d;%d;%dm%s\033[0m", r, g, b, text)
+}
+
+// ANSIBold is ANSI with the bold attribute set.
+func (t ThemeColors) ANSIBold(hexColor, text string) string {
+	r, g, b, ok := parseThemeHex(hexColor)
+	if !ok {
+		return "\033[1m" + text + "\033[0m"
+	}
+	return fmt.Sprintf("\033[1;38;2;%d;%d;%dm%s\033[0m", r, g, b, text)
+}
+
+// parseThemeHex accepts "#rgb" and "#rrggbb" (with or without the leading #).
+func parseThemeHex(s string) (r, g, b int, ok bool) {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "#")
+	switch len(s) {
+	case 3:
+		s = string([]byte{s[0], s[0], s[1], s[1], s[2], s[2]})
+	case 6:
+	default:
+		return 0, 0, 0, false
+	}
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	return int(v>>16) & 0xFF, int(v>>8) & 0xFF, int(v) & 0xFF, true
+}
 
 // ThemeColor is an adaptive color pair with light and dark hex values.
 // Either field may be empty to inherit from the default theme.

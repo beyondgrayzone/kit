@@ -10,9 +10,8 @@ import (
 )
 
 // newTestAppModelWithRealStream builds an AppModel wired to a REAL
-// StreamComponent (not the stub) so the spinner rendering and tick-loop
-// forwarding through the AppModel's Update default-case can be exercised
-// end-to-end.
+// StreamComponent (not the stub) so the spinner rendering and its advance on
+// the shared frame clock can be exercised end-to-end.
 func newTestAppModelWithRealStream(ctrl AppController) (*AppModel, *StreamComponent) {
 	stream := NewStreamComponent(80, "test-model")
 	input := &stubInputComponent{}
@@ -59,6 +58,21 @@ func execCmds(t *testing.T, cmd tea.Cmd) []tea.Msg {
 	return []tea.Msg{msg}
 }
 
+// advanceFrames drives n beats of the AppModel's shared animation clock.
+//
+// Ticks are synthesized at the clock's current generation rather than driven
+// off the real timer, so a test that needs a second of animation does not take
+// a second to run.
+func advanceFrames(m *AppModel, n int) *AppModel {
+	for range n {
+		m, _ = sendMsgExec(m, frameTickMsg{
+			generation: m.frames.generation,
+			frame:      m.frames.frame + 1,
+		})
+	}
+	return m
+}
+
 // TestSpinnerShowsToolName_TextThenTool covers the scenario where the model
 // streams text BEFORE making a tool call. In this case ToolCallStartedEvent
 // triggers flushStreamContent() which calls stream.Reset() (clearing
@@ -93,23 +107,25 @@ func TestSpinnerShowsToolName_TextThenTool(t *testing.T) {
 	if !stream.spinning {
 		t.Fatalf("expected spinner restarted after flushStreamContent Reset + ToolExecutionEvent")
 	}
-	statusBar := m.renderStatusBar()
-	if !strings.Contains(statusBar, "bash") {
-		t.Fatalf("expected status bar to show 'bash' after text-then-tool flow, got: %q", statusBar)
+	// Live activity now renders in the activity row above the composer, not
+	// in the ambient status bar.
+	m.state = stateWorking
+	activity := m.renderActivityRow()
+	if !strings.Contains(activity, "Running") {
+		t.Fatalf("expected activity row to show the bash command after text-then-tool flow, got: %q", activity)
 	}
 
 	// Simulate a LONG-running bash: drive several spinner ticks and confirm
-	// the tool label persists and the frame keeps advancing (the tick loop
-	// survives via the AppModel default-case forwarding).
-	gen := stream.spinnerGeneration
+	// the tool label persists and the frame keeps advancing (the shared clock
+	// keeps beating for as long as the stream reports it is spinning).
 	for i := range 5 {
 		frameBefore := stream.spinnerFrame
-		m, _ = sendMsgExec(m, streamSpinnerTickMsg{generation: gen})
+		m = advanceFrames(m, frameEverySpinner)
 		if stream.spinnerFrame != frameBefore+1 {
 			t.Fatalf("tick %d: expected frame advance, got %d -> %d", i, frameBefore, stream.spinnerFrame)
 		}
-		if sb := m.renderStatusBar(); !strings.Contains(sb, "bash") {
-			t.Fatalf("tick %d: status bar lost 'bash' label mid-execution, got: %q", i, sb)
+		if row := m.renderActivityRow(); !strings.Contains(row, "Running") {
+			t.Fatalf("tick %d: activity row lost the bash phrase mid-execution, got: %q", i, row)
 		}
 	}
 }
@@ -117,8 +133,8 @@ func TestSpinnerShowsToolName_TextThenTool(t *testing.T) {
 // TestSpinnerShowsToolNameDuringExecution drives the real StreamComponent
 // through the exact event sequence the AppModel receives when the agent runs a
 // bash tool, and asserts that the status bar visibly indicates the tool is
-// running (spinner frame + tool name), and that the spinner keeps animating via
-// tick messages forwarded through the AppModel default case.
+// running (spinner frame + tool name), and that the spinner keeps animating on
+// the shared frame clock.
 func TestSpinnerShowsToolNameDuringExecution(t *testing.T) {
 	ctrl := &stubAppController{}
 	m, stream := newTestAppModelWithRealStream(ctrl)
@@ -130,24 +146,28 @@ func TestSpinnerShowsToolNameDuringExecution(t *testing.T) {
 		t.Fatalf("expected stream.spinning=true after SpinnerEvent{Show:true}")
 	}
 
-	// The status bar should already show the spinner frame.
-	statusBar := m.renderStatusBar()
-	if !strings.Contains(statusBar, "▪") {
-		t.Fatalf("expected spinner frame in status bar after step start, got: %q", statusBar)
+	// The activity row should already show the spinner frame.
+	m.state = stateWorking
+	activity := m.renderActivityRow()
+	if !strings.Contains(activity, "▪") {
+		t.Fatalf("expected spinner frame in activity row after step start, got: %q", activity)
 	}
 
-	// 2. Drive one spinner tick to confirm the tick loop is forwarded through
-	//    the AppModel default case (this is the critical path: streamSpinnerTickMsg
-	//    has no explicit case in AppModel.Update, so it MUST reach `default:`).
+	// 2. Starting the spinner must have woken the shared clock: the component
+	//    schedules nothing itself, so if the AppModel wrapper did not start the
+	//    clock the dot would be frozen for the whole turn.
 	tickMsgs := execCmds(t, cmd)
 	if len(tickMsgs) == 0 {
-		t.Fatalf("expected SpinnerEvent to return a tick cmd, got nil")
+		t.Fatalf("expected SpinnerEvent to wake the frame clock, got no cmd")
+	}
+	if _, ok := tickMsgs[0].(frameTickMsg); !ok {
+		t.Fatalf("expected a frame clock beat, got %T", tickMsgs[0])
 	}
 	frameBefore := stream.spinnerFrame
-	m, _ = sendMsgExec(m, tickMsgs[0])
+	m = advanceFrames(m, frameEverySpinner)
 	frameAfter := stream.spinnerFrame
 	if frameAfter != frameBefore+1 {
-		t.Fatalf("expected spinner frame to advance %d -> %d+1 via AppModel default-case forwarding, got %d",
+		t.Fatalf("expected spinner frame to advance %d -> %d+1 on the shared clock, got %d",
 			frameBefore, frameBefore, frameAfter)
 	}
 
@@ -157,36 +177,24 @@ func TestSpinnerShowsToolNameDuringExecution(t *testing.T) {
 	m, _ = sendMsgExec(m, app.ToolCallStartedEvent{
 		ToolCallID: "call-1", ToolName: "bash", ToolArgs: `{"command":"ls"}`,
 	})
-	// Capture the tick cmd here so step 4 can drive a mid-execution tick.
-	_, tickCmd := sendMsgExec(m, app.ToolExecutionEvent{
+	m, _ = sendMsgExec(m, app.ToolExecutionEvent{
 		ToolCallID: "call-1", ToolName: "bash", ToolArgs: `{"command":"ls"}`, IsStarting: true,
 	})
 
-	// THE CORE ASSERTION: while bash is "running", the status bar must visibly
-	// show the tool name so the user has an indication the tool is executing.
-	statusBar = m.renderStatusBar()
-	if !strings.Contains(statusBar, "bash") {
-		t.Fatalf("expected status bar to show 'bash' while tool is executing, got: %q", statusBar)
+	// THE CORE ASSERTION: while bash is "running", the activity row must
+	// visibly describe the work so the user knows the tool is executing.
+	activity = m.renderActivityRow()
+	if !strings.Contains(activity, "Running ls") {
+		t.Fatalf("expected activity row to show the running command, got: %q", activity)
 	}
 
-	// 4. Simulate the spinner tick firing mid-execution (bash takes time).
-	//    The tick keeps the animation alive AND must preserve the tool label.
-	var midTick tea.Msg
-	if tickCmd != nil {
-		if msgs := execCmds(t, tickCmd); len(msgs) > 0 {
-			midTick = msgs[0]
-		}
-	}
-	if midTick == nil {
-		// If ToolExecutionEvent returned no new tick (spinner already
-		// running), synthesize a tick at the current generation to prove
-		// forwarding works mid-execution.
-		midTick = streamSpinnerTickMsg{generation: stream.spinnerGeneration}
-	}
-	m, _ = sendMsgExec(m, midTick)
-	statusBar = m.renderStatusBar()
-	if !strings.Contains(statusBar, "bash") {
-		t.Fatalf("expected status bar to STILL show 'bash' after a mid-execution tick, got: %q", statusBar)
+	// 4. Simulate the clock beating mid-execution (bash takes time). The beat
+	//    keeps the animation alive AND must preserve the tool label.
+	m = advanceFrames(m, frameEverySpinner)
+	m.state = stateWorking
+	activity = m.renderActivityRow()
+	if !strings.Contains(activity, "Running ls") {
+		t.Fatalf("expected activity row to STILL show the command after a mid-execution tick, got: %q", activity)
 	}
 	if !stream.spinning {
 		t.Fatalf("expected spinner to still be spinning during tool execution")
