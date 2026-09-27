@@ -192,6 +192,20 @@ func TestLogoTickSurvivesModalState(t *testing.T) {
 	}
 }
 
+func TestAppModelInitDoesNotShowStartupBanner(t *testing.T) {
+	ctrl := &stubAppController{}
+	m, _, _ := newTestAppModel(ctrl)
+
+	m.Init()
+
+	if len(m.messages) != 0 {
+		t.Fatalf("startup banner should not add messages, got %d", len(m.messages))
+	}
+	if m.splashItem != nil {
+		t.Fatal("startup banner should not be retained for animation")
+	}
+}
+
 // Extensions can suppress the splash entirely; nothing should be scheduled.
 func TestNoAnimationWhenStartupMessageHidden(t *testing.T) {
 	ctrl := &stubAppController{}

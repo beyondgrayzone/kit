@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -182,12 +183,7 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 		switch e := entry.(type) {
 		case *MessageEntry:
 			newEntry = &MessageEntry{
-				Entry: Entry{
-					Type:      EntryTypeMessage,
-					ID:        newID,
-					ParentID:  prevNewID, // Chain sequentially in new session
-					Timestamp: e.Timestamp,
-				},
+				Entry:    cloneEntry(e.Entry, newID, prevNewID),
 				Role:     e.Role,
 				Parts:    e.Parts,
 				Model:    e.Model,
@@ -200,12 +196,7 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 
 		case *ModelChangeEntry:
 			newEntry = &ModelChangeEntry{
-				Entry: Entry{
-					Type:      EntryTypeModelChange,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
+				Entry:    cloneEntry(e.Entry, newID, prevNewID),
 				Provider: e.Provider,
 				ModelID:  e.ModelID,
 			}
@@ -217,36 +208,21 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 				newTargetID = mapped
 			}
 			newEntry = &LabelEntry{
-				Entry: Entry{
-					Type:      EntryTypeLabel,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
+				Entry:    cloneEntry(e.Entry, newID, prevNewID),
 				TargetID: newTargetID,
 				Label:    e.Label,
 			}
 
 		case *SessionInfoEntry:
 			newEntry = &SessionInfoEntry{
-				Entry: Entry{
-					Type:      EntryTypeSessionInfo,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
-				Name: e.Name,
+				Entry: cloneEntry(e.Entry, newID, prevNewID),
+				Name:  e.Name,
 			}
 			newTm.sessionName = e.Name
 
 		case *ExtensionDataEntry:
 			newEntry = &ExtensionDataEntry{
-				Entry: Entry{
-					Type:      EntryTypeExtensionData,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
+				Entry:   cloneEntry(e.Entry, newID, prevNewID),
 				ExtType: e.ExtType,
 				Data:    e.Data,
 			}
@@ -258,12 +234,7 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 				newFromID = mapped
 			}
 			newEntry = &BranchSummaryEntry{
-				Entry: Entry{
-					Type:      EntryTypeBranchSummary,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
+				Entry:   cloneEntry(e.Entry, newID, prevNewID),
 				FromID:  newFromID,
 				Summary: e.Summary,
 			}
@@ -275,12 +246,7 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 				newFirstKeptID = mapped
 			}
 			newEntry = &CompactionEntry{
-				Entry: Entry{
-					Type:      EntryTypeCompaction,
-					ID:        newID,
-					ParentID:  prevNewID,
-					Timestamp: e.Timestamp,
-				},
+				Entry:            cloneEntry(e.Entry, newID, prevNewID),
 				Summary:          e.Summary,
 				FirstKeptEntryID: newFirstKeptID,
 				TokensBefore:     e.TokensBefore,
@@ -310,6 +276,20 @@ func (tm *TreeManager) ForkToNewSession(cwd string, targetID string) (*TreeManag
 	newTm.leafID = prevNewID
 
 	return newTm, nil
+}
+
+// cloneEntry builds the base envelope for an entry copied into a forked
+// session: it keeps the original type and timestamp but assigns the fresh ID
+// and the remapped parent so the copy chains sequentially in the new tree.
+// Every per-type case in ForkBranch goes through this helper, so a new base
+// field on Entry needs exactly one edit here.
+func cloneEntry(old Entry, newID, parentID string) Entry {
+	return Entry{
+		Type:      old.Type,
+		ID:        newID,
+		ParentID:  parentID,
+		Timestamp: old.Timestamp,
+	}
 }
 
 // SetParentLink records a parent session reference (and, optionally, the
@@ -841,8 +821,8 @@ func (tm *TreeManager) BuildContext() (messages []fantasy.Message, provider stri
 	// which older messages are replaced by the summary.
 	var lastCompaction *CompactionEntry
 	var compactionIndex = -1
-	for i := len(branch) - 1; i >= 0; i-- {
-		if c, ok := branch[i].(*CompactionEntry); ok {
+	for i, b := range slices.Backward(branch) {
+		if c, ok := b.(*CompactionEntry); ok {
 			lastCompaction = c
 			compactionIndex = i
 			break
@@ -1010,13 +990,6 @@ func (tm *TreeManager) GetSessionName() string {
 	return tm.sessionName
 }
 
-// GetCwd returns the working directory this session was created in.
-func (tm *TreeManager) GetCwd() string {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.header.Cwd
-}
-
 // GetFilePath returns the JSONL file path, or empty for in-memory sessions.
 func (tm *TreeManager) GetFilePath() string {
 	tm.mu.RLock()
@@ -1118,8 +1091,8 @@ func (tm *TreeManager) GetContextEntryIDs() []string {
 	// Find the last compaction entry for skip logic.
 	var lastCompaction *CompactionEntry
 	var compactionIndex = -1
-	for i := len(branch) - 1; i >= 0; i-- {
-		if c, ok := branch[i].(*CompactionEntry); ok {
+	for i, b := range slices.Backward(branch) {
+		if c, ok := b.(*CompactionEntry); ok {
 			lastCompaction = c
 			compactionIndex = i
 			break
@@ -1234,34 +1207,12 @@ func (tm *TreeManager) GetLastCompaction() *CompactionEntry {
 	}
 
 	branch := tm.getBranchLocked(tm.leafID)
-	for i := len(branch) - 1; i >= 0; i-- {
-		if c, ok := branch[i].(*CompactionEntry); ok {
+	for _, b := range slices.Backward(branch) {
+		if c, ok := b.(*CompactionEntry); ok {
 			return c
 		}
 	}
 	return nil
-}
-
-// --- Legacy bridge ---
-
-// AddLLMMessages appends multiple LLM messages as entries. This is
-// used when syncing from the agent's ConversationMessages after a step.
-// All entries are buffered and flushed to disk in a single batch.
-func (tm *TreeManager) AddLLMMessages(msgs []fantasy.Message) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	for _, msg := range msgs {
-		entry, err := NewMessageEntry(tm.leafID, message.FromLLMMessage(msg))
-		if err != nil {
-			return err
-		}
-		if err := tm.appendAndPersist(entry); err != nil {
-			return err
-		}
-		tm.leafID = entry.ID
-	}
-	return tm.flushLocked()
 }
 
 // GetLLMMessages builds the context and returns just the messages.
@@ -1436,15 +1387,41 @@ func (tm *TreeManager) buildTreeNodeDepth(id string, depth int, visited map[stri
 
 // --- Path conventions ---
 
+// BareSessionKey is the sentinel passed in place of a working directory when
+// Kit runs in bare mode. Bare sessions are not tied to a working directory —
+// that is the point of the mode — so they all share one bucket and
+// `--continue` resumes the last bare conversation from anywhere.
+//
+// [DefaultSessionDir] maps this sentinel to a directory that sits beside the
+// cwd-keyed namespace rather than inside it, so no working directory can ever
+// resolve to the bare bucket. See the comment there.
+const BareSessionKey = "__bare__"
+
+// bareSessionDirName is the on-disk home for bare sessions. It deliberately
+// lives next to "sessions", not under it: every cwd-derived key is joined
+// beneath "sessions", so keeping bare outside that subtree makes a collision
+// structurally impossible rather than merely unlikely.
+const bareSessionDirName = "bare-sessions"
+
 // DefaultSessionDir returns the default session storage directory for a cwd.
 // Convention: ~/.kit/sessions/<encoded-cwd>, where path separators are
 // encoded as "--" with no leading or trailing dashes — e.g.
 // /home/user/proj becomes home--user--proj. See encodeCwdForDir for the
 // full encoding rules (including Windows path handling).
+//
+// The bare sentinel is special-cased to ~/.kit/bare-sessions. The encoding is
+// lossy — "/__bare__" and "__bare__" both encode to "__bare__" — so routing
+// bare sessions through it would let a project directory named /__bare__ share
+// the bare bucket and have `--continue` resume the wrong conversation.
+// Matching on the raw sentinel before encoding keeps the two namespaces apart:
+// a real /__bare__ directory still gets ~/.kit/sessions/__bare__.
 func DefaultSessionDir(cwd string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
+	}
+	if cwd == BareSessionKey {
+		return filepath.Join(home, ".kit", bareSessionDirName)
 	}
 	return filepath.Join(home, ".kit", "sessions", encodeCwdForDir(cwd))
 }

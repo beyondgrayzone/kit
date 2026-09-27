@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -190,16 +191,6 @@ func (s *ScrollList) SetWidth(width int) {
 	// Width change invalidates all cached heights.
 	clear(s.heightCache)
 	s.clampOffset()
-}
-
-// SetItemGap sets the number of blank lines between items (0 = no gap).
-func (s *ScrollList) SetItemGap(gap int) {
-	s.itemGap = gap
-}
-
-// ItemGap returns the current gap between items.
-func (s *ScrollList) ItemGap() int {
-	return s.itemGap
 }
 
 // --------------------------------------------------------------------------
@@ -548,7 +539,7 @@ func (s *ScrollList) bottomOffset() (offsetIdx, offsetLine int) {
 	}
 
 	budget := s.height
-	for idx := len(s.items) - 1; idx >= 0; idx-- {
+	for idx := range slices.Backward(s.items) {
 		ih := s.itemHeight(idx)
 
 		// Account for gap *above* this item (gap between idx-1 and idx).
@@ -649,11 +640,6 @@ func (s *ScrollList) AtBottom() bool {
 	return true
 }
 
-// AtTop returns true if the viewport is at the top of the list.
-func (s *ScrollList) AtTop() bool {
-	return s.offsetIdx == 0 && s.offsetLine == 0
-}
-
 // --------------------------------------------------------------------------
 // Rendering
 // --------------------------------------------------------------------------
@@ -739,41 +725,77 @@ func (s *ScrollList) View() string {
 	return strings.Join(lines, "\n")
 }
 
-// ScrollPercent returns the current scroll position as a percentage (0.0-1.0).
-// 0.0 = at top, 1.0 = at bottom. Useful for scroll indicators.
-func (s *ScrollList) ScrollPercent() float64 {
-	if len(s.items) == 0 {
-		return 0.0
+// VisibleItem locates one item inside the rendered viewport.
+//
+// It exists for content that is drawn beside the view rather than inside it —
+// a directly-placed terminal image, which is painted at an absolute screen
+// position and must therefore be told which rows of the viewport its item
+// currently owns. See AppModel.computeGfxPlacement.
+type VisibleItem struct {
+	// Index is the item's position in the list, and Item the item itself.
+	Index int
+	Item  MessageItem
+
+	// Row is the viewport row, counted from the top of the list's own view,
+	// that the item's first drawn line lands on.
+	Row int
+
+	// SkipTop is how many of the item's leading lines are scrolled off above
+	// the viewport, and Height how many of its lines are drawn.
+	SkipTop int
+	Height  int
+
+	// Framed reports that the item is drawn inside the selection border, which
+	// shifts its content one row down and one column right.
+	Framed bool
+}
+
+// VisibleItems returns the position of every item the next View will draw.
+//
+// It walks items exactly as View does — same render path, same empty-item and
+// gap handling — so the two cannot disagree about which rows an item occupies.
+// Anything else would drift a placed image away from the cells reserved for it.
+func (s *ScrollList) VisibleItems() []VisibleItem {
+	if s.height <= 0 || len(s.items) == 0 {
+		return nil
 	}
 
-	totalHeight := 0
-	for idx := range s.items {
-		totalHeight += s.itemHeight(idx)
-	}
+	var out []VisibleItem
+	row := 0
+	remainingHeight := s.height
+	for idx := s.offsetIdx; idx < len(s.items) && remainingHeight > 0; idx++ {
+		content := s.renderItem(idx)
+		// An item that renders to nothing contributes no rows, matching View.
+		if content == "" {
+			continue
+		}
+		lines := strings.Count(content, "\n") + 1
 
-	if totalHeight <= s.height {
-		return 1.0
-	}
+		skip := 0
+		if idx == s.offsetIdx {
+			skip = s.offsetLine
+		}
+		drawn := min(lines-skip, remainingHeight)
+		if drawn > 0 {
+			out = append(out, VisibleItem{
+				Index:   idx,
+				Item:    s.items[idx],
+				Row:     row,
+				SkipTop: skip,
+				Height:  drawn,
+				Framed:  idx == s.selectedIdx,
+			})
+			row += drawn
+			remainingHeight -= drawn
+		}
 
-	linesAbove := 0
-	for i := 0; i < s.offsetIdx && i < len(s.items); i++ {
-		linesAbove += s.itemHeight(i)
+		if remainingHeight > 0 && idx < len(s.items)-1 && s.itemGap > 0 {
+			gap := min(s.itemGap, remainingHeight)
+			row += gap
+			remainingHeight -= gap
+		}
 	}
-	linesAbove += s.offsetLine
-
-	scrollableHeight := totalHeight - s.height
-	if scrollableHeight <= 0 {
-		return 1.0
-	}
-
-	percent := float64(linesAbove) / float64(scrollableHeight)
-	if percent > 1.0 {
-		percent = 1.0
-	}
-	if percent < 0.0 {
-		percent = 0.0
-	}
-	return percent
+	return out
 }
 
 // clampOffset ensures the offset values are within valid bounds after

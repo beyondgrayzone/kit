@@ -1117,6 +1117,15 @@ func (s *InputComponent) View() tea.View {
 	return tea.NewView(view.String())
 }
 
+// PopupVisible reports whether the autocomplete popup is drawn over the view.
+//
+// The popup is composited into the frame, so view text disappears behind it;
+// anything painted over the screen instead — a directly-placed image — must be
+// taken away by hand while it is up.
+func (s *InputComponent) PopupVisible() bool {
+	return s.showPopup && len(s.filtered) > 0
+}
+
 // RenderPopupBox renders the autocomplete popup for / or @ as a bare box.
 // Returns "" when the popup is not currently shown. The caller composites it
 // over the main view so the transcript stays visible around it.
@@ -1133,16 +1142,15 @@ func (s *InputComponent) RenderPopupBox(termWidth, termHeight int) string {
 
 	items := make([]PopupItem, len(s.filtered))
 	for i, m := range s.filtered {
-		desc := ""
+		desc, name, badge := "", "", ""
 		if m.Command != nil {
 			desc = m.Command.Description
-		}
-		name := ""
-		if m.Command != nil {
 			name = m.Command.Name
+			badge = commandBadge(m.Command.Category)
 		}
 		items[i] = PopupItem{
 			Label:       name,
+			Badge:       badge,
 			Description: desc,
 		}
 	}
@@ -1542,4 +1550,22 @@ func (s *InputComponent) UpdateTheme() {
 	styles := s.textarea.Styles()
 	applyComposerStyles(&styles, style.GetTheme())
 	s.textarea.SetStyles(styles)
+}
+
+// commandBadge maps a SlashCommand category to the short kind tag shown in
+// the / autocomplete popup. Built-in commands get no badge — they are the
+// default kind and tagging every row would just add noise.
+func commandBadge(category string) string {
+	switch category {
+	case "Skills":
+		return "skill"
+	case "Prompts":
+		return "prompt"
+	case "Extensions":
+		return "ext"
+	case "MCP Prompts":
+		return "mcp"
+	default:
+		return ""
+	}
 }

@@ -99,10 +99,13 @@ host, err := kit.New(ctx, &kit.Options{
     NoSession:    true,                       // Ephemeral mode
 
     // Tool options
-    Tools:            []kit.Tool{kit.NewBashTool()}, // Replace default tool set
+    Tools:            []kit.Tool{kit.NewShellTool(kit.WithShell([]string{"busybox", "ash"}))}, // Replace default tool set; a hand-built tool takes its own options
     ExtraTools:       []kit.Tool{myTool},            // Add alongside defaults
     DisableCoreTools: true,                        // Use no core tools (0 tools)
     CoreToolList      []string,                    // List of core tools to include, if empty (default) use all.
+    Shell:            []string{"busybox", "ash"},  // Shell for the default core tool set: the shell plus its own leading arguments (default bash)
+    ShellTimeout:     120,                         // Default shell-tool timeout in seconds
+    ShellMaxTimeout:  600,                         // Ceiling a single shell call may request in seconds
 
     // Configuration
     SkipConfig:   true,                        // Skip .kit.yml files (viper defaults + env vars still apply)
@@ -416,6 +419,8 @@ msg  := kit.ConvertFromLLMMessage(lMsg)  // LLMMessage  → SDK Message
 - `NewTool[T]` / `NewParallelTool[T]` - Create a typed custom tool
 - `NewRawTool(name, desc, schema, fn)` - Create a schema-driven tool when the
   input shape isn't known at compile time (skill/MCP catalogs)
+- `FilterCoreToolNames(include, exclude)` - Resolve an effective core tool
+  name list from include/exclude filters (nil means "all core tools")
 - `LoadSkillsFromFS(fsys, root)` - `fs.FS`-typed skill loader (embed.FS,
   fstest.MapFS, per-tenant virtual filesystems)
 - `CollapseBranch(fromID, toID, summary)` - Collapse a branch range into a

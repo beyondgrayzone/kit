@@ -12,6 +12,7 @@ import (
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/colorprofile"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 // Enhanced styling utilities and theme definitions
@@ -643,8 +644,7 @@ func logoScannerIntensity(x int, t float64) float64 {
 // Fixed-width block art cannot wrap, so below the width it needs the wordmark
 // degrades to a plain bold "KIT" rather than spilling across the terminal.
 func KitLogoLines(contentWidth int) []string {
-	return []string{}
-	// return KitLogoLinesAt(contentWidth, KitLogoAnimationFrames)
+	return KitLogoLinesAt(contentWidth, KitLogoAnimationFrames)
 }
 
 // KitLogoLinesAt returns the wordmark at the given startup-animation frame.
@@ -659,7 +659,34 @@ func KitLogoLines(contentWidth int) []string {
 // unpadded — a rectangular buffer would emit trailing spaces on the short
 // rows, and the block is deliberately ragged so it can sit at any left offset.
 func KitLogoLinesAt(contentWidth, frame int) []string {
-	return []string{}
+	theme := GetTheme()
+	if contentWidth < kitLogoWidth {
+		return []string{lipgloss.NewStyle().Bold(true).Foreground(theme.Primary).Render("KIT")}
+	}
+
+	shine := logoShineColor()
+
+	out := make([]string, 0, len(kitLogoArt))
+	for y, line := range kitLogoArt {
+		runes := []rune(line)
+		buf := uv.NewBuffer(len(runes), 1)
+		for x, r := range runes {
+			if r == ' ' {
+				continue
+			}
+			c := kitLogoRestColor(x, theme.Primary, theme.Accent)
+			if amt := kitLogoHighlight(x, y, frame); amt > 0 {
+				c = blendColors(c, shine, amt)
+			}
+			buf.SetCell(x, 0, &uv.Cell{
+				Content: string(r),
+				Width:   1,
+				Style:   uv.Style{Fg: c},
+			})
+		}
+		out = append(out, buf.Render())
+	}
+	return out
 }
 
 // kitLogoHighlight returns how far the cell at (x, y) has been pulled toward

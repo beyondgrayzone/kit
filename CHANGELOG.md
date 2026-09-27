@@ -1,3 +1,6 @@
+# Changelog (Till 0.105.0)
+- Merge local changes with upstream
+
 # Changelog (Till 0.88.0)
 - Merge v0.86.0 custom changes into v0.88.0
   - Auth refactor with credential manager and device flow for Copilot

@@ -22,7 +22,7 @@ Available tools:
 - read: Read file or directory contents (supports pagination via offset/limit)
 - write: Create or overwrite files
 - edit: Make surgical edits to files (find exact text and replace)
-- bash: Execute bash commands with timeout support
+- shell: Execute commands through the configured shell (bash by default), with timeout support
 - grep: Search file contents using regex patterns (respects .gitignore)
 - find: Search for files by glob pattern (respects .gitignore)
 - ls: List directory contents
@@ -30,11 +30,11 @@ Available tools:
 In addition to the tools above, you may have access to other custom tools from MCP servers and extensions.
 
 Guidelines:
-- Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)
+- Prefer grep/find/ls tools over shell for file exploration (faster, respects .gitignore)
 - Use read to examine files before editing
 - Use edit for precise changes (old text must match exactly, including whitespace)
 - Use write only for new files or complete rewrites
-- When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did
+- When summarizing your actions, output plain text directly - do NOT use cat or the shell tool to display what you did
 - Be concise in your responses
 - Show file paths clearly when working with files`
 
@@ -73,7 +73,7 @@ func setSDKDefaults(v *viper.Viper) {
 	v.SetDefault("main-gpu", 0)
 }
 
-// InitConfig initializes the process-global viper configuration system.
+// InitConfig initializes the process-global configuration store.
 // It searches for config files in standard locations and loads them with
 // environment variable substitution.
 //
@@ -81,14 +81,40 @@ func setSDKDefaults(v *viper.Viper) {
 // debug: if true, print warnings about missing configs to stderr.
 //
 // This wraps [initConfig] using the process-global store and is retained for
-// the CLI, which binds its flags to the global viper.
+// the CLI, which binds its flags to that global store.
 func InitConfig(configFile string, debug bool) error {
-	return initConfig(viper.GetViper(), configFile, debug)
+	return initConfig(viper.GetViper(), configFile, debug, false)
+}
+
+// ConfigInitOptions controls configuration discovery for
+// [InitConfigWithOptions].
+type ConfigInitOptions struct {
+	// ConfigFile is an explicit config file path. Empty means search the
+	// default locations (working directory, then home directory).
+	ConfigFile string
+
+	// Debug prints warnings about missing configs to stderr.
+	Debug bool
+
+	// Bare skips config discovery in the current working directory, so a
+	// project-local .kit.yml cannot contribute settings — most importantly
+	// mcpServers, which spawn processes, and system-prompt. The home
+	// directory config is still loaded, as are KIT_* environment overrides.
+	// An explicit ConfigFile is always honoured.
+	Bare bool
+}
+
+// InitConfigWithOptions initializes the process-global configuration store
+// with explicit control over discovery. Use it instead of [InitConfig]
+// when project-local configuration must be ignored.
+func InitConfigWithOptions(opts ConfigInitOptions) error {
+	return initConfig(viper.GetViper(), opts.ConfigFile, opts.Debug, opts.Bare)
 }
 
 // initConfig loads configuration into the supplied per-instance store. When v
-// is nil the process-global store is used.
-func initConfig(v *viper.Viper, configFile string, debug bool) error {
+// is nil the process-global store is used. When bare is true the working
+// directory is excluded from the config search path.
+func initConfig(v *viper.Viper, configFile string, debug, bare bool) error {
 	if v == nil {
 		v = viper.GetViper()
 	}
@@ -119,8 +145,12 @@ func initConfig(v *viper.Viper, configFile string, debug bool) error {
 		return fmt.Errorf("error finding home directory: %w", err)
 	}
 
-	// Current directory has higher priority than home directory.
-	v.AddConfigPath(".")
+	// Current directory has higher priority than home directory. Bare mode
+	// drops the working directory entirely so an unfamiliar project cannot
+	// inject settings simply because Kit was started inside it.
+	if !bare {
+		v.AddConfigPath(".")
+	}
 	v.AddConfigPath(home)
 
 	configLoaded := false
@@ -145,7 +175,11 @@ func initConfig(v *viper.Viper, configFile string, debug bool) error {
 }
 
 // LoadConfigWithEnvSubstitution loads a config file with ${ENV_VAR} expansion
-// into the process-global viper store.
+// into the process-global configuration store.
+//
+// Deprecated: Use [InitConfig] or [InitConfigWithOptions] with an explicit
+// ConfigFile instead. [New] loads configuration automatically; this function
+// has no callers and will be removed in a future release.
 func LoadConfigWithEnvSubstitution(configPath string) error {
 	return loadConfigWithEnvSubstitution(viper.GetViper(), configPath)
 }

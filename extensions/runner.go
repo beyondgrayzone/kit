@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mark3labs/kit/internal/core"
 	"github.com/spf13/viper"
 )
 
@@ -100,7 +101,6 @@ type Runner struct {
 	customEditor    *EditorConfig             // nil = no custom editor interceptor
 	uiVisibility    *UIVisibility             // nil = show everything (default)
 	disabledTools   map[string]bool           // nil = all tools enabled
-	customEventSubs map[string][]func(string) // inter-extension event bus
 	optionOverrides map[string]string         // runtime option overrides
 	configStore     *viper.Viper              // per-instance config store (nil = global)
 	state           map[string]string         // session-scoped extension state (last-write-wins)
@@ -469,8 +469,12 @@ func (r *Runner) GetContext() Context {
 // HasHandlers returns true if any loaded extension has at least one handler
 // registered for the given event type.
 func (r *Runner) HasHandlers(event EventType) bool {
-	for i := range r.extensions {
-		if len(r.extensions[i].Handlers[event]) > 0 {
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+
+	for i := range exts {
+		if len(exts[i].Handlers[event]) > 0 {
 			return true
 		}
 	}
@@ -489,20 +493,27 @@ func (r *Runner) HasHandlers(event EventType) bool {
 //
 // Panics in handlers are recovered and logged; they do not crash the process.
 func (r *Runner) Emit(event Event) (Result, error) {
+	// Snapshot extensions and extMu together: Reload swaps both under the
+	// write lock, so capturing them in one critical section guarantees the
+	// index used for exts is valid for mus. Reading them separately (or not
+	// at all) could pair a new, longer extensions slice with the previous,
+	// shorter mutex slice and panic on mus[i].
 	r.mu.RLock()
 	ctx := r.ctx
+	exts := r.extensions
+	mus := r.extMu
 	r.mu.RUnlock()
 
 	var accumulated Result
 
-	for i := range r.extensions {
-		ext := &r.extensions[i]
+	for i := range exts {
+		ext := &exts[i]
 		handlers := ext.Handlers[event.Type()]
 		if len(handlers) == 0 {
 			continue
 		}
 
-		r.extMu[i].lock()
+		mus[i].lock()
 		for _, handler := range handlers {
 			result, err := safeCall(handler, event, ctx)
 			if err != nil {
@@ -515,7 +526,7 @@ func (r *Runner) Emit(event Event) (Result, error) {
 
 			// Check for blocking/short-circuit results.
 			if isBlocking(result) {
-				r.extMu[i].unlock()
+				mus[i].unlock()
 				return result, nil
 			}
 
@@ -523,25 +534,33 @@ func (r *Runner) Emit(event Event) (Result, error) {
 			// the caller is responsible for applying the modifications.
 			accumulated = result
 		}
-		r.extMu[i].unlock()
+		mus[i].unlock()
 	}
 	return accumulated, nil
 }
 
 // RegisteredTools returns all custom tools registered by loaded extensions.
 func (r *Runner) RegisteredTools() []ToolDef {
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+
 	var tools []ToolDef
-	for i := range r.extensions {
-		tools = append(tools, r.extensions[i].Tools...)
+	for i := range exts {
+		tools = append(tools, exts[i].Tools...)
 	}
 	return tools
 }
 
 // RegisteredCommands returns all slash commands registered by loaded extensions.
 func (r *Runner) RegisteredCommands() []CommandDef {
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+
 	var cmds []CommandDef
-	for i := range r.extensions {
-		cmds = append(cmds, r.extensions[i].Commands...)
+	for i := range exts {
+		cmds = append(cmds, exts[i].Commands...)
 	}
 	return cmds
 }
@@ -791,15 +810,68 @@ func (r *Runner) GetUIVisibility() *UIVisibility {
 // Tool renderer management
 // ---------------------------------------------------------------------------
 
-// GetToolRenderer returns the custom renderer for the named tool, or nil if
-// no extension registered a renderer for it. If multiple extensions register
-// renderers for the same tool, the last one (by load order) wins. Thread-safe
-// (extensions are immutable after loading).
+// hasCustomToolIn reports whether one of these extensions registered a tool of
+// its own under this name. The earlier-name compatibility stands down when one
+// does, because the name then belongs to that tool rather than to the core
+// shell tool. It operates on a snapshot of r.extensions; the caller takes it
+// under r.mu, as Reload swaps the slice under the write lock.
+func hasCustomToolIn(exts []LoadedExtension, name string) bool {
+	for _, ext := range exts {
+		for _, tool := range ext.Tools {
+			if tool.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// shadowsShellToolNameIn reports whether one of these extensions registered a
+// tool under either name of the core shell tool. The names are then ambiguous,
+// so the earlier-name fallback stands down rather than guess.
+func shadowsShellToolNameIn(exts []LoadedExtension) bool {
+	return hasCustomToolIn(exts, core.LegacyShellToolName) || hasCustomToolIn(exts, core.ShellToolName)
+}
+
+// GetToolRenderer returns the custom renderer for the named tool, or nil when
+// no extension registered one. If several extensions register renderers for
+// the same tool, the last one by load order wins.
 func (r *Runner) GetToolRenderer(toolName string) *ToolRenderConfig {
-	// Walk extensions in reverse so last-registered wins.
-	for _, ext := range slices.Backward(r.extensions) {
+	// Snapshot under the read lock: Reload swaps r.extensions under the
+	// write lock, and this can run on the UI goroutine while the watcher
+	// reloads.
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+
+	// A renderer that names the tool as written wins, so a custom tool that
+	// really is named "bash" keeps its own renderer whatever the load order.
+	if renderer := findToolRendererIn(exts, func(name string) bool {
+		return name == toolName
+	}); renderer != nil {
+		return renderer
+	}
+	// Failing that, the shell tool answers to the name it had before its
+	// shell became configurable: an extension written before the rename
+	// keeps rendering live calls, and a session recorded before it replays
+	// with its renderer. This applies to the core tool only, so an extension
+	// that registers a tool of its own under either name keeps its renderer
+	// to itself and leaves the core tool with the default rendering.
+	if shadowsShellToolNameIn(exts) {
+		return nil
+	}
+	normalized := core.NormalizeCoreToolName(toolName)
+	return findToolRendererIn(exts, func(name string) bool {
+		return core.NormalizeCoreToolName(name) == normalized
+	})
+}
+
+// findToolRendererIn returns the first renderer whose tool name satisfies
+// match, walking extensions in reverse so the last registered one wins.
+func findToolRendererIn(exts []LoadedExtension, match func(string) bool) *ToolRenderConfig {
+	for _, ext := range slices.Backward(exts) {
 		for _, renderer := range slices.Backward(ext.ToolRenderers) {
-			if renderer.ToolName == toolName {
+			if match(renderer.ToolName) {
 				return &renderer
 			}
 		}
@@ -999,16 +1071,22 @@ func (r *Runner) SaveStateToFile(path string) error {
 // The caller is responsible for emitting SessionShutdown before calling
 // Reload and SessionStart after.
 func (r *Runner) Reload(exts []LoadedExtension) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.extensions = exts
-	r.invalidateShortcutsLocked()
-	// Re-initialize per-extension mutexes to match the new extension count.
+	// Build the new mutex slice before taking the lock; init() on a fresh
+	// reentrantMu cannot block.
 	mus := make([]reentrantMu, len(exts))
 	for i := range mus {
 		mus[i].init()
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// extensions and extMu are indexed in lockstep by Emit, so they must be
+	// swapped together. Replacing extensions alone left extMu too short
+	// whenever a reload added an extension, and the next Emit panicked with
+	// "index out of range" on r.extMu[i].
+	r.extensions = exts
 	r.extMu = mus
+	r.invalidateShortcutsLocked()
 	r.widgets = nil
 	r.statusEntries = nil
 	r.headers = nil
@@ -1016,7 +1094,6 @@ func (r *Runner) Reload(exts []LoadedExtension) {
 	r.customEditor = nil
 	r.uiVisibility = nil
 	r.disabledTools = nil
-	r.customEventSubs = nil
 	// optionOverrides and state are intentionally preserved across reloads:
 	// they represent user/session intent (not extension code) and would be
 	// surprising to lose on a hot-reload.
@@ -1026,24 +1103,15 @@ func (r *Runner) Reload(exts []LoadedExtension) {
 // Inter-extension event bus
 // ---------------------------------------------------------------------------
 
-// SubscribeCustomEvent registers a handler for a named custom event. Handlers
-// execute in registration order when EmitCustomEvent is called. Thread-safe.
-func (r *Runner) SubscribeCustomEvent(name string, handler func(string)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.customEventSubs == nil {
-		r.customEventSubs = make(map[string][]func(string))
-	}
-	r.customEventSubs[name] = append(r.customEventSubs[name], handler)
-}
-
-// EmitCustomEvent dispatches a named event to all subscribed handlers.
-// Handlers run synchronously in extension load order. Panics are recovered
+// EmitCustomEvent dispatches a named event to all handlers registered via
+// api.OnCustomEvent. Handlers run synchronously in extension load order. Panics are recovered
 // and logged. Thread-safe.
 func (r *Runner) EmitCustomEvent(name, data string) {
-	// Collect handlers: extension-registered (Init-time) + dynamic subs.
+	// extensions and extMu are snapshotted together for the same reason as
+	// in Emit — Reload may swap them concurrently.
 	r.mu.RLock()
-	dynamicHandlers := r.customEventSubs[name]
+	exts := r.extensions
+	mus := r.extMu
 	r.mu.RUnlock()
 
 	safeInvoke := func(h func(string)) {
@@ -1056,20 +1124,16 @@ func (r *Runner) EmitCustomEvent(name, data string) {
 	}
 
 	// Extension-registered handlers first (in load order).
-	for i := range r.extensions {
-		extHandlers := r.extensions[i].CustomEventHandlers[name]
+	for i := range exts {
+		extHandlers := exts[i].CustomEventHandlers[name]
 		if len(extHandlers) == 0 {
 			continue
 		}
-		r.extMu[i].lock()
+		mus[i].lock()
 		for _, h := range extHandlers {
 			safeInvoke(h)
 		}
-		r.extMu[i].unlock()
-	}
-	// Then dynamic subscriptions (not extension-scoped, no per-ext lock).
-	for _, h := range dynamicHandlers {
-		safeInvoke(h)
+		mus[i].unlock()
 	}
 }
 
@@ -1088,8 +1152,16 @@ func (r *Runner) SetActiveTools(names []string) {
 		return
 	}
 	active := make(map[string]bool, len(names))
+	// A list written for an earlier KIT keeps enabling the shell tool. The
+	// alias applies to the core tool only: when an extension registers a
+	// tool of its own under the earlier name, that name selects that tool
+	// and nothing else, so a restriction never admits more than it names.
+	aliasCoreTool := !shadowsShellToolNameIn(r.extensions)
 	for _, n := range names {
 		active[n] = true
+		if aliasCoreTool {
+			active[core.NormalizeCoreToolName(n)] = true
+		}
 	}
 	r.disabledTools = active // non-nil = only these tools are allowed
 }
@@ -1145,8 +1217,11 @@ func (r *Runner) GetOption(name string) string {
 	}
 
 	// 4. Default from registered option defs.
-	for i := range r.extensions {
-		for _, opt := range r.extensions[i].Options {
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+	for i := range exts {
+		for _, opt := range exts[i].Options {
 			if opt.Name == name {
 				return opt.Default
 			}
@@ -1169,9 +1244,13 @@ func (r *Runner) SetOption(name, value string) {
 
 // RegisteredOptions returns all option definitions from all loaded extensions.
 func (r *Runner) RegisteredOptions() []OptionDef {
+	r.mu.RLock()
+	exts := r.extensions
+	r.mu.RUnlock()
+
 	var opts []OptionDef
-	for i := range r.extensions {
-		opts = append(opts, r.extensions[i].Options...)
+	for i := range exts {
+		opts = append(opts, exts[i].Options...)
 	}
 	return opts
 }

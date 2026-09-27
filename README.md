@@ -13,12 +13,14 @@
 
 # KIT (Knowledge Inference Tool)
 
+> This is special fork to support next gen [super power](https://github.com/beyondgrayzone/ext)
+
 A powerful, extensible AI coding agent CLI with multi-provider support, built-in tools, and a rich extension system.
 
 ## Features
 
 - **Multi-Provider LLM Support**: Anthropic, OpenAI, Google Gemini, Ollama, Azure OpenAI, AWS Bedrock, OpenRouter, and more
-- **Built-in Core Tools**: bash (with interactive sudo password prompt), read, write, edit, grep, find, ls, subagent - no MCP overhead
+- **Built-in Core Tools**: shell (configurable shell, bash by default, with interactive sudo password prompt), read, write, edit, grep, find, ls, subagent - no MCP overhead
 - **Named Agents**: Reusable subagent presets defined in markdown with per-agent tool allowlists, advertised to the LLM for delegation
 - **Smart @ Attachments**: Binary files auto-detected via MIME type, MCP resources via `@mcp:server:uri`
 - **MCP Integration**: Connect external MCP servers for expanded capabilities
@@ -31,6 +33,8 @@ A powerful, extensible AI coding agent CLI with multi-provider support, built-in
 - **Non-Interactive Mode**: Script-friendly positional args with JSON output
 - **GitHub Integration**: Scaffold a GitHub Actions workflow with `kit github install` to run Kit as a collaborator/reviewer on `/kit` comments
 - **ACP Server**: Run Kit as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio
+- **Sessions**: `kit attach` runs a detachable session on a local daemon (tmux-style: `Ctrl+]` `d` detach, `s` switch, `c` new, `n`/`p` cycle) and its picker lists sessions on this machine *and* every paired host; `kit ls` lists them
+- **Remote Sessions**: `kit daemon` on one machine; pair a client once with `kit daemon pair` + `kit remote --pair <code>` (accept/reject on the host), then connect any time with `kit remote --host <name>` — sessions can be detached (`Ctrl+] d`) and reattached from the in-client session list, or shared by several clients at once (tmux-style mirrored view) — end-to-end encrypted iroh transport, revocable public-key credentials, clipboard image paste from the client machine, systemd service support
 - **Go SDK**: Embed Kit in your own applications with full agent lifecycle events (30+ event types) and behavior-modifying hooks
 
 ## Installation
@@ -86,8 +90,9 @@ kit --model anthropic/claude-sonnet-latest
 ### Non-Interactive Mode
 
 ```bash
-# Get JSON output for scripting
-kit "Explain main.go" --json
+# Get JSON output for scripting (stdout carries only the JSON envelope,
+# so it pipes straight into jq; banners and warnings go to stderr)
+kit "Explain main.go" --json | jq -r .response
 
 # Quiet mode (final response only)
 kit "Run tests" --quiet
@@ -108,7 +113,7 @@ kit acp
 kit acp --debug
 ```
 
-The ACP server exposes Kit's full capabilities — LLM execution, tool calls (bash, read, write, edit, grep, etc.), and session persistence — over the standard ACP protocol. Sessions are persisted to Kit's normal JSONL session files, so they can be resumed later.
+The ACP server exposes Kit's full capabilities — LLM execution, tool calls (shell, read, write, edit, grep, etc.), and session persistence — over the standard ACP protocol. Sessions are persisted to Kit's normal JSONL session files, so they can be resumed later.
 
 ## Configuration
 
@@ -132,14 +137,19 @@ thinking-level: off       # off, none, minimal, low, medium, high
 no-core-tools: false      # set to true to disable all built-in core tools
 exclude-core-tools:       # List of core tools to exclude, mutually exclusive to `include-core-tools`
 #include-core-tools:
-# - "bash"                # List of core tools to exclude, mutually exclusive to `exclude-core-tools`
+# - "shell"               # List of core tools to exclude, mutually exclusive to `exclude-core-tools`
+shell: "bash"             # shell the shell tool runs commands through, plus
+                          # its own leading arguments, e.g. "busybox ash". Set
+                          # this on images that do not ship bash
+shell-timeout: 120        # default per-call timeout in seconds
+shell-max-timeout: 600    # ceiling a single call may request
 
 # Skills — all keys are optional
 no-skills: false          # set to true to disable all skill loading
 skill:                    # explicit skill files/dirs (disables auto-discovery)
   - /path/to/skill.md
 skills-dir: ""            # scan this directory directly for skills (overrides auto-discovery)
-skill-disable:            # hide skills from the model catalog by name (still usable via /skill:)
+skill-disable:            # hide skills from the model catalog by name (still usable via /<name>)
   - some-skill
 
 # Named agents
@@ -216,9 +226,10 @@ mcpServers:
 # Extensions and tools
 --extension, -e          Load additional extension file(s) (repeatable)
 --no-extensions          Disable all extensions
---no-core-tools          Disable all built-in core tools (bash, read, write, edit, grep, find, ls, subagent)
+--no-core-tools          Disable all built-in core tools (shell, read, write, edit, grep, find, ls, subagent)
 --include-core-tools
 --exclude-core-tools     Mutually exclusive lists of core tool names to include or not to include in agent
+--shell                  Shell the shell tool runs commands through, e.g. "/bin/dash" or "busybox ash" (default "bash")
 
 --prompt-template        Load a specific prompt template by name
 --no-prompt-templates    Disable prompt template loading
@@ -226,7 +237,7 @@ mcpServers:
 # Skills
 --skill                  Load skill file or directory (repeatable)
 --skills-dir             Scan this directory directly for skills (overrides auto-discovery)
---skill-disable          Hide a skill from the model catalog by name (repeatable); still usable via /skill:
+--skill-disable          Hide a skill from the model catalog by name (repeatable); still usable via /<name>
 --no-skills              Disable skill loading (auto-discovery and explicit)
 --no-agents              Disable named agent discovery (built-ins and definition files)
 
@@ -249,11 +260,14 @@ mcpServers:
 ### Commands
 
 ```bash
-# Authentication (for OAuth-enabled providers)
-kit auth login [provider]          # Start OAuth flow (e.g., anthropic)
+# Authentication (OAuth for anthropic/openai/copilot, API key for everything else)
+kit auth login [provider]          # Start OAuth flow (e.g., anthropic) or prompt for an API key
+kit auth login groq --api-key ...  # Store an API key without prompting
 kit auth login [provider] --set-default  # Set provider's default model as system default
 kit auth logout [provider]         # Remove credentials for provider
 kit auth status                    # Check authentication status
+# Stored keys ($XDG_CONFIG_HOME/.kit/credentials.json) win over env vars; env vars stay the fallback.
+# No key yet? Kit still starts — use /connect inside the TUI to add one.
 
 # GitHub Copilot login (experimental; requires active Copilot subscription)
 kit auth login copilot
@@ -274,7 +288,9 @@ kit install -u <git-url>     # Update an already-installed package
 kit install --uninstall <pkg> # Remove an installed package
 
 # Skills
-kit skill                    # Install the Kit extensions skill via skills.sh
+kit skill list               # List discovered skills with scope and spec warnings
+kit skill validate <path>    # Validate a skill against the agentskills.io spec
+kit skill install            # Install the Kit skills (kit-extensions, kit-sdk) via skills.sh
 
 # GitHub integration
 kit github install           # Scaffold .github/workflows/kit.yml (run Kit on '/kit' comments)
@@ -285,6 +301,25 @@ kit github install --no-secret # Skip the offer to set the provider secret via t
 # ACP server
 kit acp                      # Start as ACP agent (stdio JSON-RPC)
 kit acp --debug              # With debug logging to stderr
+
+# Detachable sessions (survive closing the terminal; Ctrl+] is the prefix)
+kit attach                   # Pick a live session (local or paired host), or start one
+kit attach 3                 # Attach straight to session 3
+kit attach --new             # Skip the picker, start a new session
+kit ls                       # List live sessions
+kit ls --all                 # Include sessions on every paired host
+
+# Remote sessions (host)
+kit daemon                   # Host sessions for local and paired clients
+kit daemon pair              # One-time pairing: show code, confirm here
+kit daemon status            # Endpoint, paired clients, active sessions
+kit daemon service install   # Install + start the systemd user service
+
+# Remote sessions (client)
+kit remote --pair A1B2C3D4   # Pair with a host and save it under a name
+kit remote --host homelab    # Attach to the paired host
+kit attach --host homelab    # Same, with session switching
+kit attach --all             # Pick across paired hosts without starting a local daemon
 ```
 
 ## Themes
@@ -651,10 +686,11 @@ During an interactive session, use these slash commands:
 
 | Shortcut | Description |
 |----------|-------------|
-| `Ctrl+V` | Paste an image from the clipboard — shows an inline low-res thumbnail preview (tmux/zellij-safe) |
+| `Ctrl+V` | Paste an image from the clipboard — shows an inline low-res thumbnail preview (tmux/zellij-safe); over `kit remote` it pastes from the **local** machine's clipboard |
 | `Ctrl+U` | Clear all pending image attachments |
 | `Ctrl+X e` | Open `$VISUAL`/`$EDITOR` to compose or edit your prompt |
 | `Ctrl+X s` | Steer — inject a system-level instruction mid-turn |
+| `Ctrl+]` | Session prefix in `kit attach`/`kit remote`: `d` detach · `s` switch · `c` new · `n`/`p` cycle · `w` across hosts |
 | `ESC ESC` | Cancel the current operation (tool call or streaming) |
 | `↑` / `↓` | Navigate prompt history |
 
@@ -969,7 +1005,7 @@ host.RemoveSkill("polite-french")
 host.RemoveContextFile(fmt.Sprintf("session://%s/AGENTS.md", userID))
 
 // Hide a skill from the model catalog without unloading it (still usable
-// via /skill:); EnableSkill reverses it.
+// via /<name>); EnableSkill reverses it.
 host.DisableSkill("refund-policy")
 host.EnableSkill("refund-policy")
 
@@ -1111,7 +1147,7 @@ internal/acpserver/  - ACP (Agent Client Protocol) server
 internal/clipboard/  - Cross-platform clipboard operations
 internal/compaction/ - Conversation compaction and summarization
 internal/config/     - Configuration management
-internal/core/       - Built-in tools (bash, read, write, edit, grep, find, ls)
+internal/core/       - Built-in tools (shell, read, write, edit, grep, find, ls)
 internal/extensions/ - Yaegi extension system
 internal/kitsetup/   - Initial setup wizard
 internal/message/    - Message content types and structured content blocks
@@ -1230,9 +1266,7 @@ claude-4-opus-latest      → claude-opus-4-6
 claude-4-sonnet-latest    → claude-sonnet-4-6
 claude-4-haiku-latest     → claude-haiku-4-5
 claude-3-7-sonnet-latest  → claude-3-7-sonnet-20250219
-claude-3-5-sonnet-latest   → claude-3-5-sonnet-20241022
 claude-3-5-haiku-latest   → claude-3-5-haiku-20241022
-claude-3-opus-latest      → claude-3-opus-20240229
 
 # OpenAI GPT
 o1-latest                 → o1
@@ -1244,14 +1278,18 @@ gpt-4-latest              → gpt-4o
 gpt-4                     → gpt-4o
 gpt-3.5-latest            → gpt-3.5-turbo
 gpt-3.5                   → gpt-3.5-turbo
-codex-latest              → codex-mini-latest
 
 # Google Gemini
 gemini-pro-latest         → gemini-2.5-pro
-gemini-flash-latest       → gemini-2.5-flash
 gemini-flash              → gemini-2.5-flash
 gemini-pro                → gemini-2.5-pro
+gemini-2-flash            → gemini-2.0-flash
+gemini-2-pro              → gemini-2.5-pro
 ```
+
+An alias applies only when the target model is available for the provider you
+name, so `anthropic/claude-sonnet-latest` resolves while a provider that does
+not carry that model reports a normal unknown-model error.
 
 ## Contributing
 

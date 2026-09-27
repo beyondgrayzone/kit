@@ -7,14 +7,27 @@ description: Complete reference for all Kit CLI subcommands.
 
 ## Authentication
 
-For OAuth-enabled providers like Anthropic.
+Anthropic, OpenAI and GitHub Copilot use OAuth flows. Every other provider
+in the model database takes an API key.
 
 ```bash
-kit auth login [provider]          # Start OAuth flow (e.g., anthropic)
+kit auth login [provider]          # Start OAuth flow (e.g., anthropic) or prompt for an API key
+kit auth login groq                # Prompt for a Groq API key (hidden input)
+kit auth login openrouter --api-key sk-or-...   # Store a key without prompting
 kit auth login [provider] --set-default  # Set provider's default model as system default
-kit auth logout [provider]       # Remove credentials for provider
+kit auth logout [provider]         # Remove credentials for provider
 kit auth status                    # Check authentication status
 ```
+
+Stored keys live in `$XDG_CONFIG_HOME/.kit/credentials.json` (defaults to
+`~/.config/.kit/credentials.json`, mode `0600`) and take precedence over the
+provider's environment variable (for example `GROQ_API_KEY`). The
+environment variable is still used when no key is stored.
+
+Kit starts even when the configured model has no key. The TUI shows a notice
+and refuses to send prompts until you add a key with `/connect` (or switch
+to a model whose provider has one with `/model`). One-shot prompts
+(`kit "question"`) still fail fast with the same error.
 
 ## Model database
 
@@ -31,6 +44,13 @@ The `update-models` command accepts an optional source argument:
 - A URL — fetch from a custom endpoint
 - A file path — load from a local file
 - `embedded` — reset to the bundled database
+
+Kit records the schema version of the on-disk cache. When Kit's binary
+understands catalog fields the cache was written without — reasoning options,
+long-context pricing tiers, deprecation status — the older cache is ignored
+in favour of the embedded snapshot, so a stale cache never masks metadata the
+current binary can use. Run `kit update-models` once to rewrite the cache in
+the current schema.
 
 ## Extension management
 
@@ -52,9 +72,34 @@ kit install --all            # Install all extensions without prompting
 
 ## Skills
 
+Kit implements the [Agent Skills](https://agentskills.io/specification) format. A skill is a directory with a `SKILL.md` file (YAML frontmatter + Markdown instructions) and optional `scripts/`, `references/`, and `assets/` subdirectories.
+
 ```bash
-kit skill                    # Install the Kit extensions skill via skills.sh
+kit skill list               # List discovered skills with scope, path and spec warnings
+kit skill validate <path>    # Validate a skill directory / SKILL.md against the spec
+kit skill install            # Install the Kit skills (kit-extensions, kit-sdk) via skills.sh
+kit skill                    # Same as "kit skill install"
 ```
+
+`kit skill list` honors `--skill`, `--skills-dir`, `--no-skills` and `--bare`, and never prompts for project trust (it is read-only). `kit skill validate` accepts a `SKILL.md` file, a skill directory, or a directory of skills; errors (missing `name`/`description`) make the exit code non-zero, while warnings (name format, length limits, name/directory mismatch, body over 500 lines) are informational.
+
+### Activating skills
+
+Skills load in three tiers, following the spec's progressive-disclosure model:
+
+1. **Catalog** — at startup the model sees every skill's `name`, `description` and location in an `<available_skills>` block in the system prompt.
+2. **Instructions** — the full `SKILL.md` body is loaded when a skill is activated, either by the model (the `activate_skill` tool, or a `read` of the listed location) or by you.
+3. **Resources** — bundled files are listed in a `<skill_resources>` block and read on demand.
+
+To activate a skill yourself, type its name as a slash command, optionally followed by a request:
+
+```
+/pdf-processing extract the tables from report.pdf
+```
+
+The `/` autocomplete popup lists every loaded skill that is not shadowed by another slash command (see precedence below) with a `[skill]` badge next to it — hidden-from-model skills included, since hiding only affects the model-facing catalog (prompt templates show `[prompt]`, extension commands `[ext]`, MCP prompts `[mcp]`). Kit wraps the skill body in a `<skill_content>` block, appends your text, and sends it as the turn. Activated skill content is protected from `/compact` pruning.
+
+Slash-name precedence is: built-in commands, extension commands, MCP prompts (`/server:prompt`), prompt templates, then skills. A skill whose name is already taken is left out of the popup and a warning is logged, so rename one side if that happens.
 
 ### Skills CLI flags
 
@@ -70,7 +115,7 @@ kit --skill ./skill1.md --skill ./skill2.md "prompt"
 # Scan a directory directly for skills (overrides auto-discovery)
 kit --skills-dir /path/to/skills "prompt"
 
-# Hide a skill from the model catalog by name (still usable via /skill:)
+# Hide a skill from the model catalog by name (still usable via /<name>)
 kit --skill-disable noisy-skill "prompt"
 
 # Disable all skill loading (auto-discovery and explicit)
@@ -88,7 +133,7 @@ Skills follow the [agentskills.io](https://agentskills.io/specification) convent
 
 When two skills share the same `name`, the project-level one takes precedence over the user-level one. Use `--skills-dir` to scan one directory directly instead (it is **not** treated as a parent of `.agents`/`.kit` — the directory itself is scanned). `--skill` loads files explicitly (which disables auto-discovery), and `--no-skills` suppresses all skill loading regardless of other flags.
 
-Disabled skills (`--skill-disable`, the `skill-disable` config key, or `disable-model-invocation: true` in a skill's frontmatter) are hidden from the model-facing `<available_skills>` catalog but remain available for explicit activation via the `/skill:<name>` command.
+Disabled skills (`--skill-disable`, the `skill-disable` config key, or `disable-model-invocation: true` in a skill's frontmatter) are hidden from the model-facing `<available_skills>` catalog but remain available for explicit activation via the `/<name>` slash command.
 
 ### Skill frontmatter
 
@@ -96,20 +141,20 @@ A skill is a markdown file (`SKILL.md` in a directory, or a standalone `.md`/`.t
 
 ```yaml
 ---
-name: pdf-extractor                 # required
+name: pdf-extractor                 # required; lowercase, digits, single hyphens; must match the directory
 description: Use when extracting tables from PDFs   # required (drives model discovery)
 license: MIT                        # optional, SPDX identifier
-compatibility: claude-code, cursor  # optional, targeted environments
-allowed-tools: read, bash           # optional (experimental) tool restriction
+compatibility: Requires python3 and pdftotext  # optional, environment requirements (max 500 chars)
+allowed-tools: Read Bash(pdftotext:*)  # optional (experimental); parsed, not enforced by Kit
 disable-model-invocation: false     # optional; true hides from the catalog
-metadata:                           # optional arbitrary key/value pairs
+metadata:                           # optional arbitrary string key/value pairs
   author: you
 tags: [pdf, data]                   # Kit extension
 when: on-demand                     # Kit extension
 ---
 ```
 
-`name` and `description` are required — a skill missing its description is skipped with a logged warning, since the description is the sole basis on which the model decides relevance. Descriptions are XML-escaped before they enter the catalog, so characters like `<`, `>`, and `&` are safe. A skill directory may bundle `scripts/`, `references/`, and `assets/` subdirectories; when a skill is activated those files are enumerated in a `<skill_resources>` block so the model knows what it can read.
+`name` and `description` are required — a skill missing its description is skipped with a logged warning, since the description is the sole basis on which the model decides relevance. Other spec constraints (name is 1–64 chars of `a-z0-9-` with no leading/trailing/double hyphen and matches the parent directory; description ≤ 1024 chars; `compatibility` ≤ 500 chars; body under 500 lines) are checked leniently: the skill still loads, and the deviation is reported by `kit skill list` / `kit skill validate`. Descriptions are XML-escaped before they enter the catalog, so characters like `<`, `>`, and `&` are safe. A skill directory may bundle `scripts/`, `references/`, and `assets/` subdirectories; when a skill is activated those files are enumerated in a `<skill_resources>` block so the model knows what it can read.
 
 ### Project trust prompt
 
@@ -164,8 +209,9 @@ These commands are available inside the Kit TUI during an interactive session:
 | `/tools` | List available MCP tools |
 | `/servers` | Show connected MCP servers |
 | `/model [name]` | Switch model or open model selector |
-| `/theme [name]` | Switch color theme or list available themes |
-| `/thinking [level]` | Set thinking level (off, none, minimal, low, medium, high) |
+| `/connect [provider]` | Add an API key for a provider. Opens a searchable provider list, then a masked key input. The key is saved to the credentials file and the active model is reconnected when it belongs to that provider. `/connect groq` skips the list. Alias: `/login`. |
+| `/theme [name]` | Switch color theme. Running with no argument opens a modal picker showing every built-in and user theme. |
+| `/thinking [level]` | Set thinking level. Running with no argument opens a modal picker showing only the levels the current model accepts; passing a level (`off`, `none`, `minimal`, `low`, `medium`, `high`) switches directly, substituting with the nearest supported level when needed. |
 | `/compact [focus]` | Summarize older messages to free context |
 | `/clear` | Clear conversation |
 | `/clear-queue` | Clear queued messages |
@@ -234,6 +280,8 @@ Set `KIT_IMAGE_PROTOCOL=kitty` to force the graphics protocol, or `KIT_IMAGE_PRO
 
 You can also attach image files by referencing them with `@path/to/image.png` — binary files are auto-detected by MIME type. See [Quick Start](/quick-start) for the `@` attachment syntax.
 
+**In a remote session** (`kit remote --host <name>`), `Ctrl+V` attaches an image from the **local machine's** clipboard: it is streamed to the host over the tunnel and attached to the session with the same thumbnail preview. The clipboard tools only need to exist on the machine you are typing on. See [Remote sessions](/advanced/remote-sessions).
+
 ## Prompt templates
 
 ### Creating templates
@@ -252,11 +300,13 @@ Save to `~/.kit/prompts/review.md` or `.kit/prompts/review.md`.
 
 ### Using templates
 
-Templates appear as slash commands:
+Templates appear as slash commands, tagged `[prompt]` in the autocomplete popup:
 
 ```
 /review error handling
 ```
+
+A template and a [skill](#activating-skills) with the same name cannot both be reached: the template wins and the skill is left out of the popup with a logged warning.
 
 ### Argument placeholders
 
@@ -288,3 +338,102 @@ Run Kit as an [ACP (Agent Client Protocol)](https://agentclientprotocol.com) age
 kit acp                      # Start as ACP agent
 kit acp --debug              # With debug logging to stderr
 ```
+
+## Detachable sessions
+
+Run Kit inside a session that survives closing your terminal, and switch
+between several of them like tmux or zellij. Sessions are hosted by a
+background daemon; `kit attach` starts one automatically if none is
+running. See [Remote sessions](/advanced/remote-sessions) for the full
+picture.
+
+```bash
+kit attach                        # Pick a live session (local or paired host), or start one
+kit attach 3                      # Attach straight to session 3
+kit attach --new                  # Skip the picker, start a new session
+kit attach --host homelab         # Attach on a paired remote host
+kit attach --all                  # Pick across paired hosts without starting a local daemon
+
+kit ls                            # List live sessions on this machine
+kit ls --all                      # Include sessions on every paired host
+```
+
+The `kit attach` picker lists this machine's sessions **and** those on
+every paired host, grouped by host name, so it is the one command that
+shows everything you can attach to. Querying those hosts costs up to eight
+seconds when one is asleep (in parallel, so eight seconds total); `--new`
+and `kit attach <id>` skip it, because neither opens a picker.
+
+Every new session starts with the working-directory picker, whichever way
+you create it — `kit attach`, `kit attach --new`, or `Ctrl+] c`. `--new`
+skips the *session* picker, not the directory one. Once a directory is
+chosen the session behaves exactly like a local `kit`.
+
+You can also run the directory picker outside a session with
+[`kit --pick-dir`](/cli/flags); the daemon uses that same flag to start
+each session.
+
+Inside a session, `Ctrl+]` is the multiplexer prefix:
+
+| Chord | Action |
+|-------|--------|
+| `Ctrl+] d` | Detach; the session keeps running |
+| `Ctrl+] s` | Switch to another session |
+| `Ctrl+] c` | Start a new session |
+| `Ctrl+] n` / `Ctrl+] p` | Next / previous session |
+| `Ctrl+] w` | Switch across paired hosts |
+| `Ctrl+] Ctrl+]` | Send a literal `Ctrl+]` to the session |
+
+The prefix is deliberately not `Ctrl+X`: that belongs to the session itself
+([steering](#mid-turn-steering), [external editor](#external-editor)), so
+the keymap is identical whether Kit runs locally or through a session.
+`Ctrl+X d` still detaches too, kept for compatibility with earlier
+releases.
+
+Sessions survive a client disconnect, but not a restart of the hosting
+daemon — see [Sessions and daemon
+restarts](/advanced/remote-sessions#sessions-and-daemon-restarts).
+
+A session renders into your terminal but is spawned by the daemon, so the
+client forwards its `TERM`, `COLORTERM` and background color when it
+attaches — otherwise a session would inherit the daemon's environment and
+render a truecolor theme in the wrong palette. See [Terminal and
+colors](/advanced/remote-sessions#terminal-and-colors).
+
+## Remote sessions
+
+Run Kit as a daemon on one machine and attach to it from another over an
+end-to-end encrypted iroh connection. All work runs on the daemon host; see
+[Remote sessions](/advanced/remote-sessions) for the full picture.
+
+```bash
+# On the host
+kit daemon                        # Host sessions for paired clients (Ctrl+C stops)
+kit daemon pair                   # One-time pairing: show code, confirm on this terminal
+kit daemon pair --list            # List paired clients (fingerprints)
+kit daemon pair --revoke <fp>     # Revoke a client
+kit daemon status                 # Endpoint, paired clients, active sessions
+kit daemon service install        # Install + start the systemd user service
+kit daemon service remove         # Stop and uninstall the service
+
+# On the client (first time — the host terminal asks you to accept)
+kit remote --pair A1B2C3D4        # Pair and save the host under a name
+
+# On the client (any time after)
+kit remote --host homelab         # Attach to the paired host
+kit attach --host homelab         # Same, with session switching (Ctrl+] s)
+kit remote --list                 # List paired hosts
+kit remote --forget homelab       # Forget a saved host
+```
+
+Pairing is one-time and human-approved: the code only works while the
+`kit daemon pair` window is open, and the host must accept the request on
+its terminal. After pairing, the client authenticates with its own signing
+key — no code involved — and the host can revoke it at any time. Each
+client picks a working directory and gets a private session; multiple
+clients can hold sessions at the same time and `/quit` closes only that
+client's connection. `Ctrl+] d` detaches (`Ctrl+X d` still works, for
+compatibility) — the session keeps running on the
+host and can be reattached later (or shared by several clients at once, with
+every attached terminal mirroring the same screen). Only one daemon may run
+per user.

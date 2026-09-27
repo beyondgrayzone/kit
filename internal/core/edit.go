@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -207,8 +208,7 @@ func applyEdits(content string, edits []replacement) (string, []matchedReplaceme
 
 	// Apply edits in reverse order (end to start) to maintain stable offsets
 	result := normalizedContent
-	for i := len(matched) - 1; i >= 0; i-- {
-		m := matched[i]
+	for _, m := range slices.Backward(matched) {
 		result = result[:m.start] + m.newText + result[m.end:]
 	}
 
@@ -230,13 +230,11 @@ func findMatch(content string, edit replacement) (*matchedReplacement, error) {
 		// Use the matched text from content for the replacement
 		matchedText := content[idx : idx+matchLen]
 		return &matchedReplacement{
-			replacement: replacement{
-				oldText:     matchedText,
-				newText:     edit.newText,
-				originalOld: edit.originalOld,
-				originalNew: edit.originalNew,
-				index:       edit.index,
-			},
+			oldText:        matchedText,
+			newText:        edit.newText,
+			originalOld:    edit.originalOld,
+			originalNew:    edit.originalNew,
+			index:          edit.index,
 			start:          idx,
 			end:            idx + matchLen,
 			usedFuzzyMatch: true,

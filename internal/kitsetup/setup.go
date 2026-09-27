@@ -6,6 +6,7 @@ package kitsetup
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"charm.land/fantasy"
 
@@ -44,12 +45,15 @@ type AgentSetupOptions struct {
 	// NamedAgents lists discovered named agent definitions to advertise in
 	// the subagent tool description.
 	NamedAgents []core.NamedAgentSpec
-	// BashTimeout sets the default per-call timeout (seconds) for the bash
+	// ShellTimeout sets the default per-call timeout (seconds) for the shell
 	// tool. Zero uses the built-in default (120s).
-	BashTimeout int
-	// BashMaxTimeout caps the maximum timeout (seconds) a bash tool call may
+	ShellTimeout int
+	// ShellMaxTimeout caps the maximum timeout (seconds) a shell tool call may
 	// request. Zero uses the built-in default (600s).
-	BashMaxTimeout int
+	ShellMaxTimeout int
+	// Shell is the argument vector prefix the shell tool runs a command
+	// string through. Empty uses the built-in default ["bash"].
+	Shell []string
 	// ToolWrapper is an optional function that wraps tools after extension
 	// wrapping. Used by the SDK hook system. Both wrappers compose:
 	// extension wrapper runs first (inner), then this wrapper (outer).
@@ -71,6 +75,13 @@ type AgentSetupOptions struct {
 	// NoExtensions skips extension loading. When false, viper is consulted.
 	// Only meaningful when ProviderConfig is also set.
 	NoExtensions bool
+	// AllowMissingCredentials lets agent creation succeed when the provider
+	// has no credentials; the agent then reports the error via
+	// ProviderError until a working model is installed with SetModel.
+	AllowMissingCredentials bool
+	// Bare restricts extension loading to paths named explicitly via
+	// --extension / -e. No system, user or project directory is scanned.
+	Bare bool
 	// MaxSteps overrides the agent step limit. 0 means use viper value.
 	// Only meaningful when ProviderConfig is also set.
 	MaxSteps int
@@ -245,9 +256,11 @@ func SetupAgent(ctx context.Context, opts AgentSetupOptions) (*AgentSetupResult,
 	} else {
 		// Normal loading with discovery
 		var extErr error
-		extRunner, extCreationOpts, extErr = loadExtensions(v)
+		extRunner, extCreationOpts, extErr = loadExtensions(v, opts.Bare)
 		if extErr != nil {
-			fmt.Printf("Warning: Failed to load extensions: %v\n", extErr)
+			// stderr: stdout is reserved for the response payload in
+			// --quiet / --json mode.
+			fmt.Fprintf(os.Stderr, "Warning: Failed to load extensions: %v\n", extErr)
 		}
 	}
 
@@ -272,26 +285,28 @@ func SetupAgent(ctx context.Context, opts AgentSetupOptions) (*AgentSetupResult,
 	}
 
 	a, err := agent.CreateAgent(ctx, &agent.AgentCreationOptions{
-		ModelConfig:       modelConfig,
-		MCPConfig:         opts.MCPConfig,
-		SystemPrompt:      systemPrompt,
-		MaxSteps:          maxSteps,
-		StreamingEnabled:  streamingEnabled,
-		ShowSpinner:       opts.ShowSpinner,
-		Quiet:             opts.Quiet,
-		SpinnerFunc:       opts.SpinnerFunc,
-		DebugLogger:       debugLogger,
-		AuthHandler:       opts.AuthHandler,
-		TokenStoreFactory: opts.TokenStoreFactory,
-		CoreTools:         opts.CoreTools,
-		CoreToolList:      opts.CoreToolList,
-		ToolWrapper:       toolWrapper,
-		ExtraTools:        extraTools,
-		NamedAgents:       opts.NamedAgents,
-		BashTimeout:       opts.BashTimeout,
-		BashMaxTimeout:    opts.BashMaxTimeout,
-		OnMCPServerLoaded: opts.OnMCPServerLoaded,
-		MCPTaskConfig:     opts.MCPTaskConfig,
+		ModelConfig:             modelConfig,
+		MCPConfig:               opts.MCPConfig,
+		SystemPrompt:            systemPrompt,
+		MaxSteps:                maxSteps,
+		StreamingEnabled:        streamingEnabled,
+		ShowSpinner:             opts.ShowSpinner,
+		Quiet:                   opts.Quiet,
+		SpinnerFunc:             opts.SpinnerFunc,
+		DebugLogger:             debugLogger,
+		AllowMissingCredentials: opts.AllowMissingCredentials,
+		AuthHandler:             opts.AuthHandler,
+		TokenStoreFactory:       opts.TokenStoreFactory,
+		CoreTools:               opts.CoreTools,
+		CoreToolList:            opts.CoreToolList,
+		ToolWrapper:             toolWrapper,
+		ExtraTools:              extraTools,
+		NamedAgents:             opts.NamedAgents,
+		ShellTimeout:            opts.ShellTimeout,
+		ShellMaxTimeout:         opts.ShellMaxTimeout,
+		Shell:                   opts.Shell,
+		OnMCPServerLoaded:       opts.OnMCPServerLoaded,
+		MCPTaskConfig:           opts.MCPTaskConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent: %w", err)
@@ -315,12 +330,12 @@ type extensionCreationOpts struct {
 // and returns the tool wrapper/extra tools. The supplied store is used to
 // resolve the "extension" config key and is attached to the runner so
 // extension option lookups stay isolated to this Kit instance.
-func loadExtensions(v *viper.Viper) (*extensions.Runner, extensionCreationOpts, error) {
+func loadExtensions(v *viper.Viper, bare bool) (*extensions.Runner, extensionCreationOpts, error) {
 	if v == nil {
 		v = viper.GetViper()
 	}
 	extraPaths := v.GetStringSlice("extension")
-	loaded, err := extensions.LoadExtensions(extraPaths)
+	loaded, err := extensions.LoadExtensionsScoped(extraPaths, bare)
 	if err != nil {
 		return nil, extensionCreationOpts{}, err
 	}

@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"charm.land/fantasy"
@@ -308,8 +309,8 @@ func FindCutPoint(messages []fantasy.Message, keepRecentTokens int) int {
 
 	accumulated := 0
 
-	for i := len(messages) - 1; i >= 0; i-- {
-		accumulated += estimateSingleMessageTokens(messages[i])
+	for i, message := range slices.Backward(messages) {
+		accumulated += estimateSingleMessageTokens(message)
 		if accumulated > keepRecentTokens {
 			cut := i + 1
 
@@ -390,7 +391,7 @@ func newFileOps() *fileOps {
 }
 
 // extractFileOps scans messages for tool calls and extracts file paths.
-// It recognises the built-in Kit tools: read, write, edit, bash, grep, find, ls.
+// It recognises the built-in Kit tools: read, write, edit, shell, grep, find, ls.
 func extractFileOps(messages []fantasy.Message) *fileOps {
 	ops := newFileOps()
 	for _, msg := range messages {
@@ -489,8 +490,11 @@ func roleLabel(role fantasy.MessageRole) string {
 // explicitly-activated skill content. Such messages are exempt from
 // compaction pruning per the agentskills.io spec (issue #65, gap #7): an
 // activated skill must remain in context verbatim instead of being folded
-// into a lossy summary.
-var skillContentMarkers = []string{"<skill ", "<skill>", "<skill_content"}
+// into a lossy summary. Every activation path (activate_skill tool, the
+// /<name> slash command, and extension injection) emits <skill_content>; the
+// bare <skill> forms are kept so sessions recorded by older builds stay
+// protected.
+var skillContentMarkers = []string{"<skill_content", "<skill ", "<skill>"}
 
 // isProtectedMessage reports whether msg carries explicitly-activated skill
 // content that must survive compaction unchanged.

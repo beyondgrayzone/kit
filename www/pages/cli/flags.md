@@ -38,7 +38,80 @@ These flags control Kit's behavior. When a prompt is passed as a positional argu
 | `--max-steps` | — | `0` | Maximum agent steps (0 for unlimited) |
 | `--stream` | — | `true` | Enable streaming output |
 | `--compact` | — | `false` | Enable compact output mode |
+| `--pick-dir` | — | `false` | Choose a working directory with a picker before starting. [Detachable sessions](/cli/commands#detachable-sessions) always start this way, including with `kit attach --new`, so the flag is only needed when running `kit` directly |
 | `--auto-compact` | — | `false` | Compact proactively when near the context limit (reactive compact-and-retry on provider overflow errors is [always on](/sessions#reactive-compaction-on-overflow)) |
+
+## Context
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--bare` | — | `false` | No project context — skip all automatic discovery |
+
+`--bare` starts Kit without reading anything from the directory it runs in, so
+you can ask a question without first loading whatever project you happen to be
+standing in. It disables:
+
+- project context files (`AGENTS.md`)
+- skills, from both project and user directories
+- extensions, from every source — project, user and system directories
+- named agent definitions
+- prompt template directories
+- project-local `.kit.yml`
+
+Your home `~/.kit.yml` still loads, so API keys and your default model keep
+working, as do `KIT_*` environment variables and an explicit `--config` file.
+
+Anything you name on the command line still applies — `--extension`,
+`--skill`, `--prompt-template`, `--system-prompt` and `@file` attachments are
+unaffected. Bare mode suppresses what Kit finds on its own, never what you
+asked for.
+
+Core tools stay enabled and the working directory is unchanged, so the agent
+can still read files when you ask it to. Combine with `--no-core-tools` for a
+pure question-answering session:
+
+```bash
+kit --bare "why does a TLS handshake fail with an SNI mismatch"
+kit --bare --no-core-tools "explain the CAP theorem"
+kit --bare -e ~/my-ext.go "..."   # explicit extension still loads
+```
+
+Because a bare session is not tied to a directory, bare sessions share a
+single store rather than the usual per-directory one. `kit --bare -c` resumes
+your last bare conversation from anywhere on the filesystem.
+
+`--bare` cannot be set from a config file. It exists to ignore project
+configuration, so allowing a project config to enable it would be
+self-defeating.
+
+## Tools
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--shell` | — | `bash` | Shell the shell tool and the interactive `!` commands run through: the shell plus its own leading arguments, e.g. `/bin/dash` or `"busybox ash"` |
+| `--no-core-tools` | — | `false` | Disable all built-in core tools |
+| `--include-core-tools` | — | — | Comma-separated list of core tools to include (mutually exclusive with `--exclude-core-tools`) |
+| `--exclude-core-tools` | — | — | Comma-separated list of core tools to exclude (mutually exclusive with `--include-core-tools`) |
+| `--mcp` | — | — | Add an MCP server for this run (repeatable). `name=command args...` starts a local stdio server; `name=https://...` connects to a remote server |
+
+### One-off MCP servers
+
+`--mcp` adds a server without a config file. Each value is `name=spec`. When
+`spec` starts with `http://` or `https://` Kit connects to a remote server;
+otherwise `spec` is a command line for a local stdio server. Quotes and
+backslashes group arguments the way a shell does, so an argument can contain
+spaces.
+
+```bash
+kit --mcp 'browser=lightpanda mcp' "open example.com and read the title"
+kit --mcp 'docs=https://mcp.example.com/mcp' "..."
+kit --mcp 'fs=npx -y @modelcontextprotocol/server-filesystem "/my dir"' \
+    --mcp 'browser=lightpanda mcp' "..."
+```
+
+A flag server with the same name as a `mcpServers` entry in `.kit.yml`
+replaces that entry for the run. For `environment`, `allowedTools`, `headers`
+and the other per-server fields, use the [config file](/configuration#mcp-server-configuration).
 
 ## Extensions
 
@@ -55,7 +128,7 @@ These flags control Kit's behavior. When a prompt is passed as a positional argu
 |------|-------|---------|-------------|
 | `--skill` | — | — | Load skill file or directory (repeatable) |
 | `--skills-dir` | — | — | Scan this directory directly for skills (overrides auto-discovery) |
-| `--skill-disable` | — | — | Hide a skill from the model catalog by name (repeatable); still usable via `/skill:` |
+| `--skill-disable` | — | — | Hide a skill from the model catalog by name (repeatable); still usable via `/<name>` |
 | `--no-skills` | — | `false` | Disable skill loading (auto-discovery and explicit) |
 | `--no-agents` | — | `false` | Disable named agent discovery (built-ins and [definition files](/advanced/subagents#named-agents)) |
 

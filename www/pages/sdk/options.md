@@ -122,7 +122,7 @@ defaults for samplers).
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `MaxTokens` | `int` | auto-resolved | Max output tokens per response. `0` = auto-resolve; non-zero suppresses automatic right-sizing (same semantics as `--max-tokens`). |
-| `ThinkingLevel` | `string` | auto-resolved | Reasoning effort: `"off"`, `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`. `""` falls through to config/env/per-model/`"off"`. |
+| `ThinkingLevel` | `string` | auto-resolved | Reasoning effort: `"off"`, `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`. `""` falls through to config/env/per-model/`"off"`. A level the active model does not accept is substituted with the nearest supported one; call [`SupportedThinkingLevels`](/sdk/overview#reasoning-support-per-model) to check first when the exact level matters. |
 | `Temperature` | `*float32` | — | Sampling randomness. Pointer type so explicit `0.0` is distinguishable from "unset". |
 | `TopP` | `*float32` | — | Nucleus sampling cutoff. `nil` leaves provider/per-model default. |
 | `TopK` | `*int32` | — | Top-K sampling limit. `nil` leaves provider/per-model default. |
@@ -183,7 +183,7 @@ from the host machine.
 | `SkipConfig` | `bool` | `false` | Skip `.kit.yml` file loading (viper defaults + env vars still apply) |
 | `Skills` | `[]string` | — | Explicit skill files/dirs to load |
 | `SkillsDir` | `string` | — | Scan this directory directly for skills (overrides auto-discovery; scanned as-is) |
-| `SkillsDisable` | `[]string` | — | Skill names to hide from the model catalog (still usable via `/skill:`) |
+| `SkillsDisable` | `[]string` | — | Skill names to hide from the model catalog (still usable via `/<name>`) |
 | `SkillTrustPrompt` | `func(projectDir string, skillCount int) TrustDecision` | `nil` | Callback gating project-local skill loading on a trust decision (see below) |
 | `NoSkills` | `bool` | `false` | Disable skill loading entirely |
 
@@ -501,8 +501,6 @@ host, _ := kit.New(ctx, &kit.Options{CoreToolList: list})
 ```
 
 `DisableCoreTools: true` is the chat-only shortcut for an empty core set.
-`CoreToolFilterHelper(*viper.Viper)` is deprecated — prefer
-`FilterCoreToolNames`, which does not expose the configuration library.
 
 Create custom tools with `kit.NewTool` — no external dependencies needed:
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,8 +53,8 @@ const DefaultNewSessionIdleWait = 10 * time.Minute
 // In interactive mode the caller creates a tea.Program and registers it via
 // SetProgram; App then sends events to it as agent work progresses.
 //
-// In non-interactive mode the caller uses RunOnce, which writes the response
-// directly to an io.Writer.
+// In non-interactive mode the caller uses RunOnceWithFiles or
+// RunOnceWithDisplay, which write the response directly to stdout.
 //
 // App satisfies the ui.AppController interface defined in internal/ui/model.go:
 //
@@ -504,8 +505,8 @@ func (a *App) PopLastUserMessage() (string, []kit.LLMFilePart, error) {
 	// Walk the current branch backwards to find the most recent user message.
 	branch := ts.GetBranch("")
 	var target *session.MessageEntry
-	for i := len(branch) - 1; i >= 0; i-- {
-		me, ok := branch[i].(*session.MessageEntry)
+	for _, b := range slices.Backward(branch) {
+		me, ok := b.(*session.MessageEntry)
 		if !ok {
 			continue
 		}
@@ -779,15 +780,10 @@ func (a *App) releaseBusyAfterCompact() {
 // Non-interactive execution
 // --------------------------------------------------------------------------
 
-// RunOnce executes a single agent step synchronously and prints the final
-// response text to stdout. No intermediate events are emitted. Blocks until
-// the step completes or ctx is cancelled.
-func (a *App) RunOnce(ctx context.Context, prompt string) error {
-	return a.RunOnceWithFiles(ctx, prompt, nil)
-}
-
 // RunOnceWithFiles executes a single agent step synchronously with optional
-// multimodal file attachments. Prints the response to stdout and returns.
+// multimodal file attachments. Prints the final response text to stdout and
+// returns. No intermediate events are emitted. Blocks until the step
+// completes or ctx is cancelled.
 func (a *App) RunOnceWithFiles(ctx context.Context, prompt string, files []kit.LLMFilePart) error {
 	stepCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -807,15 +803,10 @@ func (a *App) RunOnceWithFiles(ctx context.Context, prompt string, files []kit.L
 	return nil
 }
 
-// RunOnceResult executes a single agent step synchronously and returns the
-// full TurnResult without printing anything. This is used by --json mode to
-// capture structured output for serialization.
-func (a *App) RunOnceResult(ctx context.Context, prompt string) (*kit.TurnResult, error) {
-	return a.RunOnceResultWithFiles(ctx, prompt, nil)
-}
-
 // RunOnceResultWithFiles executes a single agent step synchronously with
-// optional multimodal file attachments and returns the full TurnResult.
+// optional multimodal file attachments and returns the full TurnResult
+// without printing anything. This is used by --json mode to capture
+// structured output for serialization.
 func (a *App) RunOnceResultWithFiles(ctx context.Context, prompt string, files []kit.LLMFilePart) (*kit.TurnResult, error) {
 	stepCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1393,6 +1384,13 @@ func (a *App) PrintFromExtension(level, text string) {
 	case "info":
 		fmt.Fprintf(os.Stderr, "[INFO] %s\n", text)
 	default:
+		// Quiet and JSON modes reserve stdout for the response payload, so
+		// unlevelled extension output goes to stderr too — otherwise a
+		// single ctx.Print breaks `kit "..." --json | jq`.
+		if a.opts.Quiet {
+			fmt.Fprintln(os.Stderr, text)
+			return
+		}
 		fmt.Println(text)
 	}
 }

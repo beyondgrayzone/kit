@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"charm.land/fantasy"
 	log "github.com/charmbracelet/log"
 
+	"github.com/mark3labs/kit/internal/auth"
 	"github.com/mark3labs/kit/internal/config"
 	"github.com/mark3labs/kit/internal/core"
 	"github.com/mark3labs/kit/internal/message"
@@ -27,6 +31,13 @@ type AgentConfig struct {
 	MaxSteps         int
 	StreamingEnabled bool
 	DebugLogger      tools.DebugLogger
+
+	// AllowMissingCredentials lets NewAgent succeed when the configured
+	// provider has no API key or OAuth token. The agent then carries a
+	// placeholder model that fails every LLM call with the original error
+	// (see ProviderError) until SetModel installs a working provider. Used
+	// by the interactive TUI so the user can add a key from inside the app.
+	AllowMissingCredentials bool
 
 	// AuthHandler handles OAuth authorization for remote MCP servers.
 	// When set, remote transports are configured with OAuth support.
@@ -62,15 +73,20 @@ type AgentConfig struct {
 	// consumed when core tools are built from CoreToolList.
 	NamedAgents []core.NamedAgentSpec
 
-	// BashTimeout sets the default per-call timeout (in seconds) for the bash
+	// ShellTimeout sets the default per-call timeout (in seconds) for the shell
 	// tool. Zero uses the built-in default (120s). Only consumed when core
 	// tools are built from CoreToolList.
-	BashTimeout int
+	ShellTimeout int
 
-	// BashMaxTimeout caps the maximum timeout (in seconds) a bash tool call
+	// ShellMaxTimeout caps the maximum timeout (in seconds) a shell tool call
 	// may request. Zero uses the built-in default (600s). Only consumed when
 	// core tools are built from CoreToolList.
-	BashMaxTimeout int
+	ShellMaxTimeout int
+
+	// Shell is the argument vector prefix the shell tool runs a command
+	// string through. Empty uses the built-in default ["bash"]. Only
+	// consumed when core tools are built from CoreToolList.
+	Shell []string
 
 	// OnMCPServerLoaded, if non-nil, is called when each MCP server finishes
 	// loading (successfully or with error). The callback receives the server
@@ -124,14 +140,14 @@ type ToolCallDeltaHandler func(toolCallID, delta string)
 type ToolCallEndHandler func(toolCallID string)
 
 // ToolOutputHandler is a function type for handling streaming tool output chunks.
-// Used by tools like bash to stream output as it arrives rather than waiting
+// Used by tools like the shell tool to stream output as it arrives rather than waiting
 // for the command to complete. The isStderr flag indicates if the chunk
 // contains stderr output.
 // Note: This is an alias for core.ToolOutputCallback to avoid import cycles.
 type ToolOutputHandler = core.ToolOutputCallback
 
 // PasswordPromptHandler is a function type for password prompts.
-// Used by the bash tool when sudo requires a password. The handler receives
+// Used by the shell tool when sudo requires a password. The handler receives
 // a prompt message and returns the password and whether it was cancelled.
 // Note: This is an alias for core.PasswordPromptCallback.
 type PasswordPromptHandler = core.PasswordPromptCallback
@@ -230,8 +246,50 @@ type GenerateCallbacks struct {
 	OnPrepareStep    PrepareStepHandler
 }
 
+// HasAnyCallback reports whether any callback that can only be observed on
+// the streaming path is set. GenerateWithCallbacks uses it to choose between
+// the streaming call (which exposes per-step and per-tool lifecycle events)
+// and the simpler non-streaming call.
+//
+// Three fields are deliberately excluded because both paths honour them:
+// OnResponse fires after either call completes, and OnToolOutput /
+// OnPasswordPrompt are injected into the context for core tools regardless of
+// how the model is invoked. Every other field must appear below —
+// TestHasAnyCallbackCoversAllFields fails when a new field is added without
+// updating this method.
+func (cb GenerateCallbacks) HasAnyCallback() bool {
+	return cb.OnToolCall != nil ||
+		cb.OnToolExecution != nil ||
+		cb.OnToolResult != nil ||
+		cb.OnToolCallContent != nil ||
+		cb.OnStreamingResponse != nil ||
+		cb.OnReasoningDelta != nil ||
+		cb.OnReasoningComplete != nil ||
+		cb.OnStepMessages != nil ||
+		cb.OnStepUsage != nil ||
+		cb.OnToolCallStart != nil ||
+		cb.OnToolCallDelta != nil ||
+		cb.OnToolCallEnd != nil ||
+		cb.OnStepStart != nil ||
+		cb.OnStepFinish != nil ||
+		cb.OnTextStart != nil ||
+		cb.OnTextEnd != nil ||
+		cb.OnReasoningStart != nil ||
+		cb.OnWarnings != nil ||
+		cb.OnSource != nil ||
+		cb.OnStreamFinish != nil ||
+		cb.OnError != nil ||
+		cb.OnRetry != nil ||
+		cb.OnPrepareStep != nil
+}
+
+// ErrNoMCPServers is returned by the per-server MCP accessors (prompts,
+// resources, subscriptions) when the agent was built without any MCP servers
+// and therefore has no tool manager to route the request through.
+var ErrNoMCPServers = errors.New("no MCP servers configured")
+
 // Agent represents an AI agent with core tool integration using the LLM library.
-// Core tools (bash, read, write, edit, grep, find, ls) are registered as direct
+// Core tools (shell, read, write, edit, grep, find, ls) are registered as direct
 // AgentTool implementations — no MCP layer, no serialization overhead.
 // Additional tools from external MCP servers can be loaded alongside core tools.
 //
@@ -257,6 +315,11 @@ type Agent struct {
 	providerOptions     fantasy.ProviderOptions
 	skipMaxOutputTokens bool
 	modelConfig         *models.ProviderConfig
+
+	// providerErr is non-nil when the agent was created without a working
+	// provider (AllowMissingCredentials) and holds the creation error. It is
+	// cleared by a successful SetModel.
+	providerErr error
 
 	// authHandler and tokenStoreFactory are stored from AgentConfig so that
 	// AddMCPServer() can propagate them when creating a new MCPToolManager
@@ -307,16 +370,28 @@ type GenerateWithLoopResult struct {
 }
 
 // NewAgent creates a new Agent with core tools and optional MCP tool integration.
-// Core tools (bash, read, write, edit, grep, find, ls) are always registered.
+// Core tools (shell, read, write, edit, grep, find, ls) are always registered.
 // If MCP servers are configured, their tools are loaded in the background —
 // the agent returns immediately and is usable with core tools only. The first
-// LLM call (GenerateWithLoop) automatically waits for MCP tools to finish
+// LLM call (GenerateWithCallbacks) automatically waits for MCP tools to finish
 // loading and rebuilds the agent with the full tool set.
 func NewAgent(ctx context.Context, agentConfig *AgentConfig) (*Agent, error) {
 	// Create the LLM provider
+	var providerErr error
 	providerResult, err := models.CreateProvider(ctx, agentConfig.ModelConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create model provider: %v", err)
+		if !agentConfig.AllowMissingCredentials || !auth.IsMissingCredentials(err) {
+			return nil, fmt.Errorf("failed to create model provider: %v", err)
+		}
+		// No credentials for the configured provider. Start with a placeholder
+		// model so the caller (the interactive TUI) can come up and let the
+		// user add a key; every LLM call fails with providerErr until then.
+		providerErr = err
+		prov, name := "", ""
+		if agentConfig.ModelConfig != nil {
+			prov, name, _ = models.ParseModelString(agentConfig.ModelConfig.ModelString)
+		}
+		providerResult = &models.ProviderResult{Model: models.NewUnavailableModel(prov, name, err)}
 	}
 
 	// Register core tools (direct AgentTool implementations, no MCP overhead).
@@ -335,11 +410,14 @@ func NewAgent(ctx context.Context, agentConfig *AgentConfig) (*Agent, error) {
 		if len(agentConfig.NamedAgents) > 0 {
 			toolOpts = append(toolOpts, core.WithNamedAgents(agentConfig.NamedAgents...))
 		}
-		if agentConfig.BashTimeout > 0 {
-			toolOpts = append(toolOpts, core.WithBashTimeout(time.Duration(agentConfig.BashTimeout)*time.Second))
+		if agentConfig.ShellTimeout > 0 {
+			toolOpts = append(toolOpts, core.WithShellTimeout(time.Duration(agentConfig.ShellTimeout)*time.Second))
 		}
-		if agentConfig.BashMaxTimeout > 0 {
-			toolOpts = append(toolOpts, core.WithBashMaxTimeout(time.Duration(agentConfig.BashMaxTimeout)*time.Second))
+		if agentConfig.ShellMaxTimeout > 0 {
+			toolOpts = append(toolOpts, core.WithShellMaxTimeout(time.Duration(agentConfig.ShellMaxTimeout)*time.Second))
+		}
+		if len(agentConfig.Shell) > 0 {
+			toolOpts = append(toolOpts, core.WithShell(agentConfig.Shell))
 		}
 		coreTools = core.ListedTools(agentConfig.CoreToolList, toolOpts...)
 	}
@@ -386,6 +464,7 @@ func NewAgent(ctx context.Context, agentConfig *AgentConfig) (*Agent, error) {
 		providerOptions:     providerResult.ProviderOptions,
 		skipMaxOutputTokens: providerResult.SkipMaxOutputTokens,
 		modelConfig:         agentConfig.ModelConfig,
+		providerErr:         providerErr,
 		authHandler:         agentConfig.AuthHandler,
 		tokenStoreFactory:   agentConfig.TokenStoreFactory,
 		mcpTaskConfig:       agentConfig.MCPTaskConfig,
@@ -417,7 +496,9 @@ func NewAgent(ctx context.Context, agentConfig *AgentConfig) (*Agent, error) {
 			defer close(a.mcpReady)
 			if err := toolManager.LoadTools(ctx, agentConfig.MCPConfig); err != nil {
 				a.mcpErr = err
-				fmt.Printf("Warning: Failed to load MCP tools: %v\n", err)
+				// stderr: stdout is reserved for the response payload in
+				// --quiet / --json mode.
+				fmt.Fprintf(os.Stderr, "Warning: Failed to load MCP tools: %v\n", err)
 			}
 		}()
 	}
@@ -587,20 +668,6 @@ func buildAgentOptions(agentConfig *AgentConfig, providerResult *models.Provider
 	return agentOpts
 }
 
-// GenerateWithLoop processes messages with a custom loop that displays tool calls in real-time.
-func (a *Agent) GenerateWithLoop(ctx context.Context, messages []fantasy.Message,
-	onToolCall ToolCallHandler, onToolExecution ToolExecutionHandler, onToolResult ToolResultHandler,
-	onResponse ResponseHandler, onToolCallContent ToolCallContentHandler,
-) (*GenerateWithLoopResult, error) {
-	return a.GenerateWithCallbacks(ctx, messages, GenerateCallbacks{
-		OnToolCall:        onToolCall,
-		OnToolExecution:   onToolExecution,
-		OnToolResult:      onToolResult,
-		OnResponse:        onResponse,
-		OnToolCallContent: onToolCallContent,
-	})
-}
-
 // GenerateWithCallbacks processes messages using the agent with streaming and callbacks.
 // The agent handles the tool call loop internally. We map the rich callback system
 // to kit's existing callback interface for UI integration.
@@ -613,12 +680,12 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 	// servers are configured or tools have already been integrated.
 	a.ensureMCPTools()
 
-	// Inject tool output handler into context for use by core tools (e.g., bash).
+	// Inject tool output handler into context for use by core tools (e.g. the shell tool).
 	if cb.OnToolOutput != nil {
 		ctx = core.ContextWithToolOutputCallback(ctx, cb.OnToolOutput)
 	}
 
-	// Inject password prompt handler into context for use by bash tool.
+	// Inject password prompt handler into context for use by the shell tool.
 	if cb.OnPasswordPrompt != nil {
 		ctx = core.ContextWithPasswordPrompt(ctx, cb.OnPasswordPrompt)
 	}
@@ -633,6 +700,25 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 	// This avoids type conflicts with provider-level options.
 	history = applyCacheControlToMessages(history)
 
+	// Use the streaming path when streaming is enabled OR when any
+	// streaming-only callbacks are provided. The agent only exposes tool/step
+	// callbacks on AgentStreamCall, so Stream is required to observe tool
+	// execution in real time. The non-streaming Generate path is reserved for
+	// the simple case with no such callbacks at all.
+	if a.streamingEnabled || cb.HasAnyCallback() {
+		return a.generateStreaming(ctx, cb, messages, prompt, files, history)
+	}
+	return a.generateSimple(ctx, cb, messages, prompt, files, history)
+}
+
+// generateStreaming runs the agent loop through the streaming call so every
+// GenerateCallbacks field can be observed as the model produces output and
+// executes tools. messages is the full original conversation (used to build
+// the returned result); prompt, files and history are its split form as
+// produced by splitPromptAndHistory.
+func (a *Agent) generateStreaming(ctx context.Context, cb GenerateCallbacks, messages []fantasy.Message,
+	prompt string, files []fantasy.FilePart, history []fantasy.Message,
+) (*GenerateWithLoopResult, error) {
 	// Track tool call args per-ToolCallID so parallel tool calls in a single
 	// step don't clobber each other. Without this, OnToolResult callbacks would
 	// all see the args of the last OnToolCall in the step. The mutex guards
@@ -641,385 +727,378 @@ func (a *Agent) GenerateWithCallbacks(ctx context.Context, messages []fantasy.Me
 	toolCallArgs := make(map[string]string)
 	var toolCallArgsMu sync.Mutex
 
-	// Use the streaming path when streaming is enabled OR when any callbacks are
-	// provided. The agent only exposes tool/step callbacks on AgentStreamCall, so
-	// Stream is required to observe tool execution in real time. The non-streaming
-	// Generate path is reserved for the simple case with no callbacks at all.
-	hasCallbacks := cb.OnToolCall != nil || cb.OnToolExecution != nil || cb.OnToolResult != nil ||
-		cb.OnToolCallContent != nil || cb.OnStreamingResponse != nil || cb.OnReasoningDelta != nil ||
-		cb.OnToolCallStart != nil || cb.OnToolCallDelta != nil || cb.OnToolCallEnd != nil ||
-		cb.OnStepStart != nil || cb.OnStepFinish != nil || cb.OnTextStart != nil ||
-		cb.OnTextEnd != nil || cb.OnReasoningStart != nil || cb.OnWarnings != nil ||
-		cb.OnSource != nil || cb.OnStreamFinish != nil || cb.OnError != nil ||
-		cb.OnRetry != nil || cb.OnPrepareStep != nil
+	// Track completed step messages so we can return partial results
+	// on cancellation. The agent's Stream() discards accumulated steps
+	// when it returns an error, but the OnStepFinish callback fires
+	// for every step that completed before the error occurred.
+	var completedStepMessages []fantasy.Message
+	// persistedCount tracks how many new messages (beyond the original
+	// input) were persisted incrementally via cb.OnStepMessages, so the
+	// caller can skip them during post-generation persistence.
+	var persistedCount int
+	// stepCounter tracks the current step number for StepStart/StepFinish events.
+	var stepCounter int
 
-	if a.streamingEnabled || hasCallbacks {
-		// Track completed step messages so we can return partial results
-		// on cancellation. The agent's Stream() discards accumulated steps
-		// when it returns an error, but the OnStepFinish callback fires
-		// for every step that completed before the error occurred.
-		var completedStepMessages []fantasy.Message
-		// persistedCount tracks how many new messages (beyond the original
-		// input) were persisted incrementally via cb.OnStepMessages, so the
-		// caller can skip them during post-generation persistence.
-		var persistedCount int
-		// stepCounter tracks the current step number for StepStart/StepFinish events.
-		var stepCounter int
+	// Use the streaming agent
+	streamCall := fantasy.AgentStreamCall{
+		Prompt:   prompt,
+		Files:    files,
+		Messages: history,
 
-		// Use the streaming agent
-		streamCall := fantasy.AgentStreamCall{
-			Prompt:   prompt,
-			Files:    files,
-			Messages: history,
+		// Tool input streaming callbacks — fire during tool argument generation
+		OnToolInputStart: func(id, toolName string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnToolCallStart != nil {
+				cb.OnToolCallStart(id, toolName)
+			}
+			return nil
+		},
+		OnToolInputDelta: func(id, delta string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnToolCallDelta != nil {
+				cb.OnToolCallDelta(id, delta)
+			}
+			return nil
+		},
+		OnToolInputEnd: func(id string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnToolCallEnd != nil {
+				cb.OnToolCallEnd(id)
+			}
+			return nil
+		},
 
-			// Tool input streaming callbacks — fire during tool argument generation
-			OnToolInputStart: func(id, toolName string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnToolCallStart != nil {
-					cb.OnToolCallStart(id, toolName)
-				}
-				return nil
-			},
-			OnToolInputDelta: func(id, delta string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnToolCallDelta != nil {
-					cb.OnToolCallDelta(id, delta)
-				}
-				return nil
-			},
-			OnToolInputEnd: func(id string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnToolCallEnd != nil {
-					cb.OnToolCallEnd(id)
-				}
-				return nil
-			},
+		// Text start/end callbacks
+		OnTextStart: func(id string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnTextStart != nil {
+				cb.OnTextStart(id)
+			}
+			return nil
+		},
+		OnTextEnd: func(id string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnTextEnd != nil {
+				cb.OnTextEnd(id)
+			}
+			return nil
+		},
 
-			// Text start/end callbacks
-			OnTextStart: func(id string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnTextStart != nil {
-					cb.OnTextStart(id)
-				}
-				return nil
-			},
-			OnTextEnd: func(id string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnTextEnd != nil {
-					cb.OnTextEnd(id)
-				}
-				return nil
-			},
+		// Reasoning start callback
+		OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnReasoningStart != nil {
+				cb.OnReasoningStart(id)
+			}
+			return nil
+		},
 
-			// Reasoning start callback
-			OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnReasoningStart != nil {
-					cb.OnReasoningStart(id)
-				}
-				return nil
-			},
+		// Reasoning/thinking streaming callback
+		OnReasoningDelta: func(id, delta string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnReasoningDelta != nil {
+				cb.OnReasoningDelta(delta)
+			}
+			return nil
+		},
 
-			// Reasoning/thinking streaming callback
-			OnReasoningDelta: func(id, delta string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnReasoningDelta != nil {
-					cb.OnReasoningDelta(delta)
-				}
-				return nil
-			},
+		// Reasoning/thinking complete callback
+		OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnReasoningComplete != nil {
+				cb.OnReasoningComplete()
+			}
+			return nil
+		},
 
-			// Reasoning/thinking complete callback
-			OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnReasoningComplete != nil {
-					cb.OnReasoningComplete()
-				}
-				return nil
-			},
+		// Text streaming callback
+		OnTextDelta: func(id, text string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnStreamingResponse != nil {
+				cb.OnStreamingResponse(text)
+			}
+			return nil
+		},
 
-			// Text streaming callback
-			OnTextDelta: func(id, text string) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
+		// Warnings callback
+		OnWarnings: func(warnings []fantasy.CallWarning) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnWarnings != nil {
+				strs := make([]string, len(warnings))
+				for i, w := range warnings {
+					strs[i] = w.Message
 				}
-				if cb.OnStreamingResponse != nil {
-					cb.OnStreamingResponse(text)
-				}
-				return nil
-			},
+				cb.OnWarnings(strs)
+			}
+			return nil
+		},
 
-			// Warnings callback
-			OnWarnings: func(warnings []fantasy.CallWarning) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnWarnings != nil {
-					strs := make([]string, len(warnings))
-					for i, w := range warnings {
-						strs[i] = w.Message
-					}
-					cb.OnWarnings(strs)
-				}
-				return nil
-			},
+		// Source callback
+		OnSource: func(source fantasy.SourceContent) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnSource != nil {
+				cb.OnSource(string(source.SourceType), source.ID, source.URL, source.Title)
+			}
+			return nil
+		},
 
-			// Source callback
-			OnSource: func(source fantasy.SourceContent) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnSource != nil {
-					cb.OnSource(string(source.SourceType), source.ID, source.URL, source.Title)
-				}
-				return nil
-			},
+		// Stream finish callback (per-step stream completion)
+		OnStreamFinish: func(usage fantasy.Usage, finishReason fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cb.OnStreamFinish != nil {
+				cb.OnStreamFinish(usage, string(finishReason))
+			}
+			return nil
+		},
 
-			// Stream finish callback (per-step stream completion)
-			OnStreamFinish: func(usage fantasy.Usage, finishReason fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if cb.OnStreamFinish != nil {
-					cb.OnStreamFinish(usage, string(finishReason))
-				}
-				return nil
-			},
+		// Error callback
+		OnError: func(err error) {
+			if cb.OnError != nil {
+				cb.OnError(err)
+			}
+		},
 
-			// Error callback
-			OnError: func(err error) {
-				if cb.OnError != nil {
-					cb.OnError(err)
-				}
-			},
+		// Step start callback
+		OnStepStart: func(stepNumber int) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			stepCounter = stepNumber
+			if cb.OnStepStart != nil {
+				cb.OnStepStart(stepNumber)
+			}
+			return nil
+		},
 
-			// Step start callback
-			OnStepStart: func(stepNumber int) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				stepCounter = stepNumber
-				if cb.OnStepStart != nil {
-					cb.OnStepStart(stepNumber)
-				}
-				return nil
-			},
+		// Tool call complete - the tool has been parsed and is about to execute
+		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			toolCallArgsMu.Lock()
+			toolCallArgs[tc.ToolCallID] = tc.Input
+			toolCallArgsMu.Unlock()
 
-			// Tool call complete - the tool has been parsed and is about to execute
-			OnToolCall: func(tc fantasy.ToolCallContent) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				toolCallArgsMu.Lock()
-				toolCallArgs[tc.ToolCallID] = tc.Input
-				toolCallArgsMu.Unlock()
-
-				// Notify about the tool call
-				if cb.OnToolCall != nil {
-					cb.OnToolCall(tc.ToolCallID, tc.ToolName, tc.Input)
-				}
-
-				// Notify tool execution starting
-				if cb.OnToolExecution != nil {
-					cb.OnToolExecution(tc.ToolCallID, tc.ToolName, tc.Input, true)
-				}
-
-				return nil
-			},
-
-			// Tool result - tool execution completed
-			OnToolResult: func(tr fantasy.ToolResultContent) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				// Look up the args recorded for this specific tool call. Delete
-				// the entry so the map doesn't accumulate across steps.
-				toolCallArgsMu.Lock()
-				args := toolCallArgs[tr.ToolCallID]
-				delete(toolCallArgs, tr.ToolCallID)
-				toolCallArgsMu.Unlock()
-
-				// Notify tool execution finished
-				if cb.OnToolExecution != nil {
-					cb.OnToolExecution(tr.ToolCallID, tr.ToolName, args, false)
-				}
-
-				if cb.OnToolResult != nil {
-					// Extract result text and error status
-					resultText, isError := extractToolResultText(tr)
-					cb.OnToolResult(tr.ToolCallID, tr.ToolName, args, resultText, tr.ClientMetadata, isError)
-				}
-
-				return nil
-			},
-
-			// Step callbacks for content that accompanies tool calls
-			OnStepFinish: func(step fantasy.StepResult) error {
-				// Accumulate messages from completed steps so they can be
-				// persisted even if a later step is cancelled.
-				completedStepMessages = append(completedStepMessages, step.Messages...)
-
-				// Persist step messages incrementally so progress is saved
-				// as it happens rather than only at the end of the turn.
-				if cb.OnStepMessages != nil && len(step.Messages) > 0 {
-					cb.OnStepMessages(step.Messages)
-					persistedCount += len(step.Messages)
-				}
-
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				// Check if step has text content alongside tool calls
-				text := step.Content.Text()
-				toolCalls := step.Content.ToolCalls()
-				if text != "" && len(toolCalls) > 0 && cb.OnToolCallContent != nil {
-					cb.OnToolCallContent(text)
-				}
-				// Emit step usage for real-time cost tracking
-				if cb.OnStepUsage != nil {
-					cb.OnStepUsage(step.Usage.InputTokens, step.Usage.OutputTokens,
-						step.Usage.CacheReadTokens, step.Usage.CacheCreationTokens)
-				}
-				// Emit unified step finish event
-				if cb.OnStepFinish != nil {
-					cb.OnStepFinish(stepCounter, len(toolCalls) > 0, string(step.FinishReason), step.Usage)
-				}
-				return nil
-			},
-		}
-
-		// Always wire up PrepareStep. It serves three purposes:
-		//   1. Re-read the live tool set each step so runtime AddTools/
-		//      RemoveTools (and MCP server changes) take effect at the next
-		//      LLM step of the *current* turn, as documented. The entire
-		//      multi-step loop runs inside a single fantasy Stream call that
-		//      otherwise captures the tool snapshot taken when Stream began;
-		//      populating PrepareStepResult.Tools makes fantasy re-read tools
-		//      per step instead.
-		//   2. Steering: drain queued steer messages.
-		//   3. The OnPrepareStep hook.
-		// Steering drains its channel first, then OnPrepareStep hooks run
-		// against the (possibly already steered) messages.
-		steerCh := steerChFromContext(ctx)
-		onConsumed := steerConsumedFromContext(ctx)
-		hasSteering := steerCh != nil
-		hasPrepareStepHook := cb.OnPrepareStep != nil
-
-		streamCall.PrepareStep = func(
-			stepCtx context.Context,
-			opts fantasy.PrepareStepFunctionOptions,
-		) (context.Context, fantasy.PrepareStepResult, error) {
-			result := fantasy.PrepareStepResult{
-				Model:    opts.Model,
-				Messages: opts.Messages,
-				// Re-read the live tool set so mid-turn tool changes are
-				// honored. composeAllTools matches the composition baked
-				// into the fantasy agent, so in the steady state this is
-				// identical to the snapshot fantasy would have used.
-				Tools: a.composeAllTools(),
+			// Notify about the tool call
+			if cb.OnToolCall != nil {
+				cb.OnToolCall(tc.ToolCallID, tc.ToolName, tc.Input)
 			}
 
-			// Phase 1: Drain steering channel (if present).
-			if hasSteering {
-				var steered []SteerMessage
-				for {
-					select {
-					case msg := <-steerCh:
-						steered = append(steered, msg)
-					default:
-						goto done
-					}
-				}
-			done:
-				if len(steered) > 0 {
-					for _, sm := range steered {
-						result.Messages = append(result.Messages,
-							fantasy.NewUserMessage(sm.Text, sm.Files...))
-					}
-					if onConsumed != nil {
-						onConsumed(len(steered))
-					}
-				}
+			// Notify tool execution starting
+			if cb.OnToolExecution != nil {
+				cb.OnToolExecution(tc.ToolCallID, tc.ToolName, tc.Input, true)
 			}
 
-			// Phase 2: Run OnPrepareStep hook (if registered).
-			if hasPrepareStepHook {
-				if update := cb.OnPrepareStep(opts.StepNumber, result.Messages); update != nil {
-					if update.Messages != nil {
-						result.Messages = update.Messages
-					}
-					if update.ToolChoice != nil {
-						result.ToolChoice = update.ToolChoice
-					}
-				}
+			return nil
+		},
+
+		// Tool result - tool execution completed
+		OnToolResult: func(tr fantasy.ToolResultContent) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Look up the args recorded for this specific tool call. Delete
+			// the entry so the map doesn't accumulate across steps.
+			toolCallArgsMu.Lock()
+			args := toolCallArgs[tr.ToolCallID]
+			delete(toolCallArgs, tr.ToolCallID)
+			toolCallArgsMu.Unlock()
+
+			// Notify tool execution finished
+			if cb.OnToolExecution != nil {
+				cb.OnToolExecution(tr.ToolCallID, tr.ToolName, args, false)
 			}
 
-			// Apply message-level cache control for Anthropic models.
-			result.Messages = applyCacheControlToMessages(result.Messages)
-
-			return stepCtx, result, nil
-		}
-
-		// Wire OnRetry callback if provided.
-		if cb.OnRetry != nil {
-			streamCall.OnRetry = func(err *fantasy.ProviderError, _ time.Duration) {
-				// Use the retry number from the error if available; Fantasy
-				// doesn't pass a counter directly, so we approximate with a
-				// counter incremented on each call.
-				cb.OnRetry(0, err)
+			if cb.OnToolResult != nil {
+				// Extract result text and error status
+				resultText, isError := extractToolResultText(tr)
+				cb.OnToolResult(tr.ToolCallID, tr.ToolName, args, resultText, tr.ClientMetadata, isError)
 			}
-		}
 
-		result, err := a.fantasyAgent.Stream(ctx, streamCall)
-		if err != nil {
-			// On cancellation (or any error), return a partial result
-			// containing messages from completed steps so the caller can
-			// persist tool calls and results that finished before the
-			// cancellation. The original input messages are included so
-			// the caller sees the full conversation up to the point of
-			// cancellation.
-			if len(completedStepMessages) > 0 {
-				partialMessages := make([]fantasy.Message, 0, len(messages)+len(completedStepMessages))
-				partialMessages = append(partialMessages, messages...)
-				partialMessages = append(partialMessages, completedStepMessages...)
-				return &GenerateWithLoopResult{
-					ConversationMessages:  partialMessages,
-					PersistedMessageCount: persistedCount,
-				}, err
+			return nil
+		},
+
+		// Step callbacks for content that accompanies tool calls
+		OnStepFinish: func(step fantasy.StepResult) error {
+			// Accumulate messages from completed steps so they can be
+			// persisted even if a later step is cancelled.
+			completedStepMessages = append(completedStepMessages, step.Messages...)
+
+			// Persist step messages incrementally so progress is saved
+			// as it happens rather than only at the end of the turn.
+			if cb.OnStepMessages != nil && len(step.Messages) > 0 {
+				cb.OnStepMessages(step.Messages)
+				persistedCount += len(step.Messages)
 			}
-			return nil, err
-		}
 
-		// Fire the response callback so callers (e.g. the TUI) can reset
-		// streaming state. This must fire even when the response text is
-		// empty (e.g. reasoning-only responses) so the UI properly resets
-		// the stream component and avoids duplicate content on the next
-		// flush.
-		if cb.OnResponse != nil {
-			cb.OnResponse(result.Response.Content.Text())
-		}
-
-		r := convertAgentResult(result, messages)
-		r.PersistedMessageCount = persistedCount
-		return r, nil
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Check if step has text content alongside tool calls
+			text := step.Content.Text()
+			toolCalls := step.Content.ToolCalls()
+			if text != "" && len(toolCalls) > 0 && cb.OnToolCallContent != nil {
+				cb.OnToolCallContent(text)
+			}
+			// Emit step usage for real-time cost tracking
+			if cb.OnStepUsage != nil {
+				cb.OnStepUsage(step.Usage.InputTokens, step.Usage.OutputTokens,
+					step.Usage.CacheReadTokens, step.Usage.CacheCreationTokens)
+			}
+			// Emit unified step finish event
+			if cb.OnStepFinish != nil {
+				cb.OnStepFinish(stepCounter, len(toolCalls) > 0, string(step.FinishReason), step.Usage)
+			}
+			return nil
+		},
 	}
 
+	// Always wire up PrepareStep. It serves three purposes:
+	//   1. Re-read the live tool set each step so runtime AddTools/
+	//      RemoveTools (and MCP server changes) take effect at the next
+	//      LLM step of the *current* turn, as documented. The entire
+	//      multi-step loop runs inside a single fantasy Stream call that
+	//      otherwise captures the tool snapshot taken when Stream began;
+	//      populating PrepareStepResult.Tools makes fantasy re-read tools
+	//      per step instead.
+	//   2. Steering: drain queued steer messages.
+	//   3. The OnPrepareStep hook.
+	// Steering drains its channel first, then OnPrepareStep hooks run
+	// against the (possibly already steered) messages.
+	steerCh := steerChFromContext(ctx)
+	onConsumed := steerConsumedFromContext(ctx)
+	hasSteering := steerCh != nil
+	hasPrepareStepHook := cb.OnPrepareStep != nil
+
+	streamCall.PrepareStep = func(
+		stepCtx context.Context,
+		opts fantasy.PrepareStepFunctionOptions,
+	) (context.Context, fantasy.PrepareStepResult, error) {
+		result := fantasy.PrepareStepResult{
+			Model:    opts.Model,
+			Messages: opts.Messages,
+			// Re-read the live tool set so mid-turn tool changes are
+			// honored. composeAllTools matches the composition baked
+			// into the fantasy agent, so in the steady state this is
+			// identical to the snapshot fantasy would have used.
+			Tools: a.composeAllTools(),
+		}
+
+		// Phase 1: Drain steering channel (if present).
+		if hasSteering {
+			var steered []SteerMessage
+			for {
+				select {
+				case msg := <-steerCh:
+					steered = append(steered, msg)
+				default:
+					goto done
+				}
+			}
+		done:
+			if len(steered) > 0 {
+				for _, sm := range steered {
+					result.Messages = append(result.Messages,
+						fantasy.NewUserMessage(sm.Text, sm.Files...))
+				}
+				if onConsumed != nil {
+					onConsumed(len(steered))
+				}
+			}
+		}
+
+		// Phase 2: Run OnPrepareStep hook (if registered).
+		if hasPrepareStepHook {
+			if update := cb.OnPrepareStep(opts.StepNumber, result.Messages); update != nil {
+				if update.Messages != nil {
+					result.Messages = update.Messages
+				}
+				if update.ToolChoice != nil {
+					result.ToolChoice = update.ToolChoice
+				}
+			}
+		}
+
+		// Apply message-level cache control for Anthropic models.
+		result.Messages = applyCacheControlToMessages(result.Messages)
+
+		return stepCtx, result, nil
+	}
+
+	// Wire OnRetry callback if provided.
+	if cb.OnRetry != nil {
+		streamCall.OnRetry = func(err *fantasy.ProviderError, _ time.Duration) {
+			// Use the retry number from the error if available; Fantasy
+			// doesn't pass a counter directly, so we approximate with a
+			// counter incremented on each call.
+			cb.OnRetry(0, err)
+		}
+	}
+
+	result, err := a.fantasyAgent.Stream(ctx, streamCall)
+	if err != nil {
+		// On cancellation (or any error), return a partial result
+		// containing messages from completed steps so the caller can
+		// persist tool calls and results that finished before the
+		// cancellation. The original input messages are included so
+		// the caller sees the full conversation up to the point of
+		// cancellation.
+		if len(completedStepMessages) > 0 {
+			partialMessages := make([]fantasy.Message, 0, len(messages)+len(completedStepMessages))
+			partialMessages = append(partialMessages, messages...)
+			partialMessages = append(partialMessages, completedStepMessages...)
+			return &GenerateWithLoopResult{
+				ConversationMessages:  partialMessages,
+				PersistedMessageCount: persistedCount,
+			}, err
+		}
+		return nil, err
+	}
+
+	// Fire the response callback so callers (e.g. the TUI) can reset
+	// streaming state. This must fire even when the response text is
+	// empty (e.g. reasoning-only responses) so the UI properly resets
+	// the stream component and avoids duplicate content on the next
+	// flush.
+	if cb.OnResponse != nil {
+		cb.OnResponse(result.Response.Content.Text())
+	}
+
+	r := convertAgentResult(result, messages)
+	r.PersistedMessageCount = persistedCount
+	return r, nil
+}
+
+// generateSimple runs the agent loop through the non-streaming call. It is
+// used only when streaming is disabled and no streaming-only callbacks are
+// set; OnResponse is still honoured so callers can reset UI state.
+func (a *Agent) generateSimple(ctx context.Context, cb GenerateCallbacks, messages []fantasy.Message,
+	prompt string, files []fantasy.FilePart, history []fantasy.Message,
+) (*GenerateWithLoopResult, error) {
 	// Non-streaming path with no callbacks — use the simpler Generate call.
 	result, err := a.fantasyAgent.Generate(ctx, fantasy.AgentCall{
 		Prompt:   prompt,
@@ -1049,12 +1128,12 @@ func splitPromptAndHistory(messages []fantasy.Message) (string, []fantasy.FilePa
 	}
 
 	// Walk backwards to find the last user message
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == fantasy.MessageRoleUser {
+	for i, message := range slices.Backward(messages) {
+		if message.Role == fantasy.MessageRoleUser {
 			// Extract text and file parts from the user message
 			var prompt string
 			var files []fantasy.FilePart
-			for _, part := range messages[i].Content {
+			for _, part := range message.Content {
 				switch p := part.(type) {
 				case fantasy.TextPart:
 					if prompt == "" {
@@ -1215,8 +1294,12 @@ func (a *Agent) GetMCPToolNames() []string {
 	return names
 }
 
-// GetExtensionToolCount returns the number of tools registered by extensions.
-func (a *Agent) GetExtensionToolCount() int {
+// GetExtraToolCount returns the number of extra tools on the agent — that is,
+// every tool that is neither a core tool nor an MCP tool. The bucket mixes
+// extension-registered tools, the built-in activate_skill tool and tools
+// supplied by SDK callers, so it must not be reported as an extension count.
+// Ask the extension runner for that (see Kit.GetExtensionToolCount).
+func (a *Agent) GetExtraToolCount() int {
 	a.toolsMu.RLock()
 	defer a.toolsMu.RUnlock()
 	return len(a.extraTools)
@@ -1337,7 +1420,7 @@ func (a *Agent) GetMCPPrompts() []tools.MCPPrompt {
 // This is a lazy call — the server is contacted each time.
 func (a *Agent) GetMCPPrompt(ctx context.Context, serverName, promptName string, args map[string]string) (*tools.MCPPromptResult, error) {
 	if a.toolManager == nil {
-		return nil, fmt.Errorf("no MCP servers configured")
+		return nil, ErrNoMCPServers
 	}
 	return a.toolManager.GetPrompt(ctx, serverName, promptName, args)
 }
@@ -1353,7 +1436,7 @@ func (a *Agent) GetMCPResources() []tools.MCPResource {
 // ReadMCPResource reads a specific resource from an MCP server by URI.
 func (a *Agent) ReadMCPResource(ctx context.Context, serverName, uri string) (*tools.MCPResourceContent, error) {
 	if a.toolManager == nil {
-		return nil, fmt.Errorf("no MCP servers configured")
+		return nil, ErrNoMCPServers
 	}
 	return a.toolManager.ReadResource(ctx, serverName, uri)
 }
@@ -1361,7 +1444,7 @@ func (a *Agent) ReadMCPResource(ctx context.Context, serverName, uri string) (*t
 // SubscribeMCPResource subscribes to change notifications for a resource.
 func (a *Agent) SubscribeMCPResource(ctx context.Context, serverName, uri string) error {
 	if a.toolManager == nil {
-		return fmt.Errorf("no MCP servers configured")
+		return ErrNoMCPServers
 	}
 	return a.toolManager.SubscribeResource(ctx, serverName, uri)
 }
@@ -1369,7 +1452,7 @@ func (a *Agent) SubscribeMCPResource(ctx context.Context, serverName, uri string
 // UnsubscribeMCPResource cancels change notifications for a resource.
 func (a *Agent) UnsubscribeMCPResource(ctx context.Context, serverName, uri string) error {
 	if a.toolManager == nil {
-		return fmt.Errorf("no MCP servers configured")
+		return ErrNoMCPServers
 	}
 	return a.toolManager.UnsubscribeResource(ctx, serverName, uri)
 }
@@ -1399,6 +1482,7 @@ func (a *Agent) SetModel(ctx context.Context, config *models.ProviderConfig) err
 	a.providerOptions = providerResult.ProviderOptions
 	a.skipMaxOutputTokens = providerResult.SkipMaxOutputTokens
 	a.modelConfig = config
+	a.providerErr = nil
 
 	// Update system prompt when the config carries one (from per-model
 	// settings or the global config). This allows model-specific system
@@ -1425,6 +1509,13 @@ func (a *Agent) GetModel() fantasy.LanguageModel {
 	return a.model
 }
 
+// ProviderError returns the error that prevented the LLM provider from being
+// created when the agent was started with AllowMissingCredentials. It is nil
+// when the provider is usable. A successful SetModel clears it.
+func (a *Agent) ProviderError() error {
+	return a.providerErr
+}
+
 // SetSystemPrompt updates the agent's system prompt and rebuilds the underlying
 // fantasy agent so subsequent turns use the new prompt. Safe to call while the
 // agent is idle; if invoked during an in-flight turn the new prompt takes
@@ -1434,13 +1525,6 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	defer a.promptMu.Unlock()
 	a.systemPrompt = prompt
 	a.rebuildFantasyAgent()
-}
-
-// GetSystemPrompt returns the agent's current system prompt.
-func (a *Agent) GetSystemPrompt() string {
-	a.promptMu.Lock()
-	defer a.promptMu.Unlock()
-	return a.systemPrompt
 }
 
 // GetMaxTokens returns the effective max output tokens the agent currently

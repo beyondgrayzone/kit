@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/fantasy"
 	kit "github.com/mark3labs/kit/pkg/kit"
 
@@ -824,7 +823,7 @@ func TestHandleTurnEnd_NonLengthIgnored(t *testing.T) {
 	}
 	for _, ev := range suspiciousCases {
 		var called bool
-		app.handleTurnEnd(ev, func(m tea.Msg) {
+		app.handleTurnEnd(ev, func(m Event) {
 			called = true
 		})
 		if !called {

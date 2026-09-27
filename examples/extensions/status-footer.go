@@ -171,17 +171,22 @@ func savePrefs() error {
 
 // dispWidth measures rendered columns. Emoji and CJK occupy two cells, so
 // counting runes (let alone bytes) would under-measure and reintroduce wrap.
+//
+// YAEGI: the ranges are joined with "||" into a single case expression. A
+// comma-separated case list in a tagless switch is a trap — Yaegi evaluates
+// only the FIRST expression and silently ignores the rest, which made this
+// function count every CJK and hangul rune as one column.
 func dispWidth(s string) int {
 	w := 0
 	for _, r := range s {
 		switch {
-		case r >= 0x1F300 && r <= 0x1FAFF, // emoji & pictographs
-			r >= 0x2600 && r <= 0x27BF, // misc symbols/dingbats
-			r >= 0x1100 && r <= 0x115F, // hangul jamo
-			r >= 0x2E80 && r <= 0xA4CF, // CJK
-			r >= 0xAC00 && r <= 0xD7A3, // hangul syllables
-			r >= 0xF900 && r <= 0xFAFF,
-			r >= 0xFF00 && r <= 0xFF60:
+		case (r >= 0x1F300 && r <= 0x1FAFF) || // emoji & pictographs
+			(r >= 0x2600 && r <= 0x27BF) || // misc symbols/dingbats
+			(r >= 0x1100 && r <= 0x115F) || // hangul jamo
+			(r >= 0x2E80 && r <= 0xA4CF) || // CJK
+			(r >= 0xAC00 && r <= 0xD7A3) || // hangul syllables
+			(r >= 0xF900 && r <= 0xFAFF) ||
+			(r >= 0xFF00 && r <= 0xFF60):
 			w += 2
 		default:
 			w++
@@ -362,7 +367,7 @@ func renderLocked(ctx ext.Context) {
 		return
 	}
 	if !enabled {
-		ctx.RemoveFooter()
+		ctx.RemoveFooter("status-footer:footer")
 		return
 	}
 	// Live read: this runs from a ticker goroutine too, which captured ctx
@@ -372,6 +377,7 @@ func renderLocked(ctx ext.Context) {
 		width = 80 // non-interactive or size not yet known
 	}
 	ctx.SetFooter(ext.HeaderFooterConfig{
+		ID:      "status-footer:footer",
 		Content: ext.WidgetContent{Text: assemble(buildFields(ctx), width)},
 		Style:   ext.WidgetStyle{NoBorder: true},
 	})
@@ -483,7 +489,7 @@ func Init(api ext.API) {
 		defer mu.Unlock()
 		live = false
 		tickerGen++
-		ctx.RemoveFooter()
+		ctx.RemoveFooter("status-footer:footer")
 	})
 
 	api.RegisterCommand(ext.CommandDef{

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -156,10 +157,6 @@ type MCPToolManager struct {
 	// mutates the tool list. The agent layer uses this to trigger a rebuild
 	// so the LLM sees the updated tools.
 	onToolsChanged func()
-
-	// onResourcesChanged, if non-nil, is called when a subscribed resource
-	// is updated by the server.
-	onResourcesChanged func()
 }
 
 // toolMapping stores the mapping between prefixed tool names and their original details
@@ -233,13 +230,6 @@ func (m *MCPToolManager) SetOnToolsChanged(cb func()) {
 // Subsequent calls replace the previous configuration wholesale.
 func (m *MCPToolManager) SetTaskConfig(cfg MCPTaskConfig) {
 	m.taskCfg = cfg
-}
-
-// TaskConfig returns the manager's current task-augmented tools/call
-// configuration. The zero value means: defer to per-server config and
-// auto-detected capability, with no progress callback and default polling.
-func (m *MCPToolManager) TaskConfig() MCPTaskConfig {
-	return m.taskCfg
 }
 
 // AddServer connects to a new MCP server at runtime and loads its tools.
@@ -446,7 +436,9 @@ func (m *MCPToolManager) LoadTools(ctx context.Context, cfg *config.Config) erro
 	for r := range results {
 		if r.err != nil {
 			loadErrors = append(loadErrors, fmt.Sprintf("server %s: %v", r.name, r.err))
-			fmt.Printf("Warning: Failed to load MCP server '%s': %v\n", r.name, r.err)
+			// stderr: stdout is reserved for the response payload in
+			// --quiet / --json mode.
+			fmt.Fprintf(os.Stderr, "Warning: Failed to load MCP server '%s': %v\n", r.name, r.err)
 		}
 	}
 
@@ -647,8 +639,8 @@ func (m *MCPToolManager) ExecuteTool(ctx context.Context, prefixedName, inputJSO
 	// behaviour.
 	if !useTask {
 		callRequest := mcp.CallToolRequest{
-			Request: mcp.Request{Method: "tools/call"},
-			Params:  callParams,
+			Method: "tools/call",
+			Params: callParams,
 		}
 		var result *mcp.CallToolResult
 		err := m.withOAuthRetry(ctx, mapping.serverName, mapping.originalName, func() error {
@@ -670,8 +662,8 @@ func (m *MCPToolManager) ExecuteTool(ctx context.Context, prefixedName, inputJSO
 		// Older client implementations — fall back to the synchronous shape.
 		callParams.Task = nil
 		callRequest := mcp.CallToolRequest{
-			Request: mcp.Request{Method: "tools/call"},
-			Params:  callParams,
+			Method: "tools/call",
+			Params: callParams,
 		}
 		result, callErr := conn.client.CallTool(ctx, callRequest)
 		if callErr != nil {
@@ -772,10 +764,23 @@ func (m *MCPToolManager) resolveTaskMode(name string, cfg config.MCPServerConfig
 	return ParseTaskMode(cfg.TasksMode)
 }
 
+// ErrTasksListUnsupported reports that a server will not answer tasks/list.
+//
+// MCP protocol version 2026-07-28 removed tasks/list, so a server that speaks
+// that version (or later) answers METHOD_NOT_FOUND. Older servers that simply
+// never advertised the tasks capability answer the same way. Callers that
+// treat task listing as optional should test for this with errors.Is and fall
+// back to tracking task IDs returned by ExecuteTool.
+var ErrTasksListUnsupported = errors.New("server does not support tasks/list")
+
 // ListServerTasks queries tasks/list on the named server and returns the
-// active and recent tasks the server is willing to disclose. Errors are
-// returned untouched (callers commonly ignore METHOD_NOT_FOUND when the
-// server didn't advertise tasks/list capability).
+// active and recent tasks the server is willing to disclose.
+//
+// Returns an error wrapping [ErrTasksListUnsupported] when the server answers
+// METHOD_NOT_FOUND. Because tasks/list was removed in protocol version
+// 2026-07-28, this is the expected outcome for current servers rather than a
+// malfunction. Other errors (transport failures, unknown server) are returned
+// as-is.
 func (m *MCPToolManager) ListServerTasks(ctx context.Context, serverName string) ([]MCPTaskInfo, error) {
 	c, err := m.taskClient(serverName)
 	if err != nil {
@@ -783,6 +788,9 @@ func (m *MCPToolManager) ListServerTasks(ctx context.Context, serverName string)
 	}
 	res, err := c.ListTasks(ctx, mcp.ListTasksRequest{})
 	if err != nil {
+		if errors.Is(err, mcp.ErrMethodNotFound) {
+			return nil, fmt.Errorf("tasks/list on %s: %w", serverName, ErrTasksListUnsupported)
+		}
 		return nil, fmt.Errorf("tasks/list on %s: %w", serverName, err)
 	}
 	out := make([]MCPTaskInfo, 0, len(res.Tasks))
@@ -819,18 +827,29 @@ func (m *MCPToolManager) CancelServerTask(ctx context.Context, serverName, taskI
 	return taskFromMCP(serverName, res.Task), nil
 }
 
+// serverClient returns the MCP client for a named server. It centralises the
+// two guard conditions every per-server RPC (prompts, resources, tasks,
+// subscriptions) must check: the manager has a connection pool, and the pool
+// currently holds a connection for serverName.
+func (m *MCPToolManager) serverClient(serverName string) (client.MCPClient, error) {
+	if m.connectionPool == nil {
+		return nil, fmt.Errorf("no connection pool available")
+	}
+	mcpClient, ok := m.connectionPool.GetClients()[serverName]
+	if !ok {
+		return nil, fmt.Errorf("MCP server %q not found", serverName)
+	}
+	return mcpClient, nil
+}
+
 // taskClient returns the *client.Client for a server. Tasks endpoints are
 // not part of the upstream MCPClient interface so callers must work with
 // the concrete client. Returns an error when the connection is missing
 // or backed by a non-standard client type.
 func (m *MCPToolManager) taskClient(serverName string) (*client.Client, error) {
-	if m.connectionPool == nil {
-		return nil, fmt.Errorf("no connection pool available")
-	}
-	clients := m.connectionPool.GetClients()
-	raw, ok := clients[serverName]
-	if !ok {
-		return nil, fmt.Errorf("MCP server %q not loaded", serverName)
+	raw, err := m.serverClient(serverName)
+	if err != nil {
+		return nil, err
 	}
 	c, ok := raw.(*client.Client)
 	if !ok {
@@ -859,14 +878,9 @@ func (m *MCPToolManager) GetPrompts() []MCPPrompt {
 // name on that server, and args are the template arguments to substitute.
 // This call is lazy — it contacts the MCP server on each invocation.
 func (m *MCPToolManager) GetPrompt(ctx context.Context, serverName, promptName string, args map[string]string) (*MCPPromptResult, error) {
-	if m.connectionPool == nil {
-		return nil, fmt.Errorf("no connection pool available")
-	}
-
-	clients := m.connectionPool.GetClients()
-	mcpClient, ok := clients[serverName]
-	if !ok {
-		return nil, fmt.Errorf("MCP server %q not found", serverName)
+	mcpClient, err := m.serverClient(serverName)
+	if err != nil {
+		return nil, err
 	}
 
 	req := mcp.GetPromptRequest{}
@@ -1082,23 +1096,12 @@ func (m *MCPToolManager) GetResources() []MCPResource {
 	return result
 }
 
-// SetOnResourcesChanged sets the callback invoked when a subscribed resource
-// changes. Used by the UI layer to refresh autocomplete or re-read content.
-func (m *MCPToolManager) SetOnResourcesChanged(cb func()) {
-	m.onResourcesChanged = cb
-}
-
 // ReadResource reads a specific resource from an MCP server by URI.
 // Returns the resource content (text or binary blob).
 func (m *MCPToolManager) ReadResource(ctx context.Context, serverName, uri string) (*MCPResourceContent, error) {
-	if m.connectionPool == nil {
-		return nil, fmt.Errorf("no connection pool available")
-	}
-
-	clients := m.connectionPool.GetClients()
-	mcpClient, ok := clients[serverName]
-	if !ok {
-		return nil, fmt.Errorf("MCP server %q not found", serverName)
+	mcpClient, err := m.serverClient(serverName)
+	if err != nil {
+		return nil, err
 	}
 
 	req := mcp.ReadResourceRequest{}
@@ -1164,17 +1167,10 @@ func (m *MCPToolManager) ReadResource(ctx context.Context, serverName, uri strin
 }
 
 // SubscribeResource subscribes to change notifications for a resource.
-// When the resource changes on the server, onResourcesChanged is called
-// and the resource list is refreshed automatically.
 func (m *MCPToolManager) SubscribeResource(ctx context.Context, serverName, uri string) error {
-	if m.connectionPool == nil {
-		return fmt.Errorf("no connection pool available")
-	}
-
-	clients := m.connectionPool.GetClients()
-	mcpClient, ok := clients[serverName]
-	if !ok {
-		return fmt.Errorf("MCP server %q not found", serverName)
+	mcpClient, err := m.serverClient(serverName)
+	if err != nil {
+		return err
 	}
 
 	req := mcp.SubscribeRequest{}
@@ -1193,14 +1189,9 @@ func (m *MCPToolManager) SubscribeResource(ctx context.Context, serverName, uri 
 
 // UnsubscribeResource cancels change notifications for a resource.
 func (m *MCPToolManager) UnsubscribeResource(ctx context.Context, serverName, uri string) error {
-	if m.connectionPool == nil {
-		return fmt.Errorf("no connection pool available")
-	}
-
-	clients := m.connectionPool.GetClients()
-	mcpClient, ok := clients[serverName]
-	if !ok {
-		return fmt.Errorf("MCP server %q not found", serverName)
+	mcpClient, err := m.serverClient(serverName)
+	if err != nil {
+		return err
 	}
 
 	req := mcp.UnsubscribeRequest{}
@@ -1215,51 +1206,6 @@ func (m *MCPToolManager) UnsubscribeResource(ctx context.Context, serverName, ur
 	m.mu.Unlock()
 
 	return nil
-}
-
-// RefreshServerResources re-fetches resources from a specific server.
-// Called when a resource change notification is received.
-func (m *MCPToolManager) RefreshServerResources(ctx context.Context, serverName string) {
-	if m.connectionPool == nil {
-		return
-	}
-
-	clients := m.connectionPool.GetClients()
-	mcpClient, ok := clients[serverName]
-	if !ok {
-		return
-	}
-
-	listResult, err := mcpClient.ListResources(ctx, mcp.ListResourcesRequest{})
-	if err != nil {
-		return
-	}
-
-	var newResources []MCPResource
-	for _, r := range listResult.Resources {
-		newResources = append(newResources, MCPResource{
-			URI:         r.URI,
-			Name:        r.Name,
-			Description: r.Description,
-			MIMEType:    r.MIMEType,
-			ServerName:  serverName,
-		})
-	}
-
-	m.mu.Lock()
-	// Remove old resources from this server, add new ones.
-	filtered := make([]MCPResource, 0, len(m.resources))
-	for _, r := range m.resources {
-		if r.ServerName != serverName {
-			filtered = append(filtered, r)
-		}
-	}
-	m.resources = append(filtered, newResources...)
-	m.mu.Unlock()
-
-	if m.onResourcesChanged != nil {
-		m.onResourcesChanged()
-	}
 }
 
 // GetLoadedServerNames returns the names of all successfully loaded MCP servers.

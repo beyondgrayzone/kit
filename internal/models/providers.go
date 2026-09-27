@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,52 +53,59 @@ const (
 	copilotGitHubAPIVersion    = "2026-01-09"
 )
 
-// resolveModelAlias resolves model aliases to their full names using the registry
+// modelAliases maps convenience shorthands to concrete model IDs.
+//
+// An alias only applies when its target exists for the provider being
+// resolved (see resolveModelAlias), so a target missing from one provider's
+// catalog is harmless for the others. Entries whose target is no longer
+// published by *any* provider in the models.dev catalog are pruned: they can
+// never resolve, and keeping them implies a shorthand that does not work.
+// TestModelAliasTargetsExist guards against this drift.
+var modelAliases = map[string]string{
+	// Anthropic aliases
+	"claude-opus-latest":     "claude-opus-4-6",
+	"claude-sonnet-latest":   "claude-sonnet-4-6",
+	"claude-haiku-latest":    "claude-haiku-4-5",
+	"claude-4-opus-latest":   "claude-opus-4-6",
+	"claude-4-sonnet-latest": "claude-sonnet-4-6",
+	"claude-4-haiku-latest":  "claude-haiku-4-5",
+	// Anthropic retired these, but aggregator providers still publish them,
+	// so the aliases remain useful when addressing those providers.
+	"claude-3-5-haiku-latest":  "claude-3-5-haiku-20241022",
+	"claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
+
+	// OpenAI aliases
+	"gpt-5-latest":      "gpt-5.4",
+	"gpt-5-chat-latest": "gpt-5.4",
+	"gpt-4-latest":      "gpt-4o",
+	"gpt-4":             "gpt-4o",
+	"gpt-3.5":           "gpt-3.5-turbo",
+	"gpt-3.5-latest":    "gpt-3.5-turbo",
+	"o1-latest":         "o1",
+	"o3-latest":         "o3",
+	"o4-latest":         "o4-mini",
+
+	// Google Gemini aliases
+	"gemini-pro-latest": "gemini-2.5-pro",
+	"gemini-flash":      "gemini-2.5-flash",
+	"gemini-pro":        "gemini-2.5-pro",
+	"gemini-2-flash":    "gemini-2.0-flash",
+	"gemini-2-pro":      "gemini-2.5-pro",
+}
+
+// resolveModelAlias resolves model aliases to their full names using the
+// registry. The alias is honoured only when the target is available for the
+// given provider; otherwise the original name is returned untouched so the
+// caller can surface a normal "unknown model" error.
 func resolveModelAlias(provider, modelName string) string {
-	registry := GetGlobalRegistry()
-
-	aliasMap := map[string]string{
-		// Anthropic aliases
-		"claude-opus-latest":       "claude-opus-4-6",
-		"claude-sonnet-latest":     "claude-sonnet-4-6",
-		"claude-haiku-latest":      "claude-haiku-4-5",
-		"claude-4-opus-latest":     "claude-opus-4-6",
-		"claude-4-sonnet-latest":   "claude-sonnet-4-6",
-		"claude-4-haiku-latest":    "claude-haiku-4-5",
-		"claude-3-5-haiku-latest":  "claude-3-5-haiku-20241022",
-		"claude-3-5-sonnet-latest": "claude-3-5-sonnet-20241022",
-		"claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
-		"claude-3-opus-latest":     "claude-3-opus-20240229",
-
-		// OpenAI aliases
-		"gpt-5-latest":      "gpt-5.4",
-		"gpt-5-chat-latest": "gpt-5.4",
-		"gpt-4-latest":      "gpt-4o",
-		"gpt-4":             "gpt-4o",
-		"gpt-3.5":           "gpt-3.5-turbo",
-		"gpt-3.5-latest":    "gpt-3.5-turbo",
-		"o1-latest":         "o1",
-		"o3-latest":         "o3",
-		"o4-latest":         "o4-mini",
-		"codex-latest":      "codex-mini-latest",
-
-		// Google Gemini aliases
-		"gemini-pro-latest": "gemini-2.5-pro",
-		"gemini-flash":      "gemini-2.5-flash",
-		"gemini-pro":        "gemini-2.5-pro",
-		"gemini-2-flash":    "gemini-2.0-flash",
-		"gemini-2-pro":      "gemini-2.5-pro",
-		"gemini-1.5-flash":  "gemini-1.5-flash",
-		"gemini-1.5-pro":    "gemini-1.5-pro",
+	resolved, exists := modelAliases[modelName]
+	if !exists {
+		return modelName
 	}
-
-	if resolved, exists := aliasMap[modelName]; exists {
-		if registry.LookupModel(provider, resolved) != nil {
-			return resolved
-		}
+	if GetGlobalRegistry().LookupModel(provider, resolved) == nil {
+		return modelName
 	}
-
-	return modelName
+	return resolved
 }
 
 // ThinkingLevel controls extended thinking / reasoning budget for supported models.
@@ -201,6 +209,15 @@ type ProviderConfig struct {
 	// must be closed when done. When nil, the raw reader is consumed directly
 	// with no progress UI.
 	ProgressReaderFunc func(io.Reader) io.ReadCloser
+
+	// SessionIDFunc, when set, returns the identifier of the active
+	// conversation session. It is called per HTTP request (not at provider
+	// creation), so a session that starts or changes after the provider is
+	// built is reflected immediately. Currently used to send the
+	// x-opencode-session header to the opencode / opencode-go providers,
+	// which use it for request routing and prompt caching. When nil, or when
+	// it returns "", a stable per-process fallback ID is sent instead.
+	SessionIDFunc func() string
 }
 
 // ProviderResult contains the result of provider creation.
@@ -338,7 +355,7 @@ func CreateProvider(ctx context.Context, config *ProviderConfig) (*ProviderResul
 	case "ollama":
 		result, createErr = createOllamaProvider(ctx, config, modelName)
 	case "azure", "azure-cognitive-services":
-		result, createErr = createAzureProvider(ctx, config, modelName)
+		result, createErr = createAzureProvider(ctx, config, provider, modelName)
 	case "google-vertex-anthropic":
 		result, createErr = createVertexAnthropicProvider(ctx, config, modelName)
 	case "google-vertex":
@@ -519,17 +536,23 @@ func autoRouteProvider(ctx context.Context, config *ProviderConfig, provider, mo
 }
 
 // resolveAutoRouteAPIKey looks up the API key for an auto-routed provider,
-// returning a uniform error message when none can be resolved.
+// returning a MissingCredentialsError when none can be resolved.
 func resolveAutoRouteAPIKey(config *ProviderConfig, info *ProviderInfo) (string, error) {
-	apiKey := resolveAPIKey(config.ProviderAPIKey, info.Env)
+	apiKey := resolveAPIKey(config.ProviderAPIKey, info.ID, info.Env)
 	if apiKey == "" {
-		if len(info.Env) == 0 {
-			return "", fmt.Errorf("%s API key not provided. Use --provider-api-key, or declare apiKeyEnv for this provider in the `providers` config section", info.Name)
-		}
-		return "", fmt.Errorf("%s API key not provided. Use --provider-api-key or set %s",
-			info.Name, strings.Join(info.Env, " / "))
+		return "", missingKeyError(info.ID, info.Name, info.Env)
 	}
 	return apiKey, nil
+}
+
+// missingKeyError builds the typed error every "no API key" path returns so
+// callers can recognise the condition with auth.IsMissingCredentials.
+func missingKeyError(providerID, providerName string, envVars []string) error {
+	return &auth.MissingCredentialsError{
+		Provider:     providerID,
+		ProviderName: providerName,
+		EnvVars:      envVars,
+	}
 }
 
 // wrapProviderErr produces the uniform "failed to create X provider/model: %w"
@@ -579,14 +602,16 @@ func withDefaultHeaders(client *http.Client, headers map[string]string) *http.Cl
 }
 
 // autoRouteHTTPClient builds the HTTP client for an auto-routed provider,
-// combining TLS verification config with the provider's default headers.
+// combining TLS verification config with the provider's default headers and
+// provider-specific dynamic headers (e.g. the opencode session header).
 // Returns nil when no customization is needed (callers use the SDK default).
 func autoRouteHTTPClient(config *ProviderConfig, info *ProviderInfo) *http.Client {
 	var client *http.Client
 	if config.TLSSkipVerify {
 		client = createHTTPClientWithTLSConfig(true)
 	}
-	return withDefaultHeaders(client, info.Headers)
+	client = withDefaultHeaders(client, info.Headers)
+	return withOpencodeSessionHeader(client, config, info)
 }
 
 // createAutoRoutedOpenAICompatProvider creates an openaicompat provider using
@@ -741,6 +766,7 @@ func createAutoRoutedGoogleProvider(ctx context.Context, config *ProviderConfig,
 		httpClient = createHTTPClientWithTLSConfig(true)
 	}
 	httpClient = withDefaultHeaders(httpClient, info.Headers)
+	httpClient = withOpencodeSessionHeader(httpClient, config, info)
 	if httpClient != nil {
 		opts = append(opts, google.WithHTTPClient(httpClient))
 	}
@@ -817,11 +843,17 @@ func (t *geminiProxyTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return t.base.RoundTrip(req)
 }
 
-// resolveAPIKey returns the first non-empty API key from the explicit key
-// or the environment variables.
-func resolveAPIKey(explicitKey string, envVars []string) string {
+// resolveAPIKey returns the first non-empty API key, in priority order:
+// the explicit key (--provider-api-key), a key stored in the credentials
+// file for providerID, then the environment variables.
+func resolveAPIKey(explicitKey, providerID string, envVars []string) string {
 	if explicitKey != "" {
 		return explicitKey
+	}
+	if providerID != "" {
+		if stored := auth.LookupStoredAPIKey(providerID); stored != "" {
+			return stored
+		}
 	}
 	for _, envVar := range envVars {
 		if v := os.Getenv(envVar); v != "" {
@@ -937,52 +969,133 @@ func thinkingLevelToReasoningEffort(level ThinkingLevel) *openai.ReasoningEffort
 	}
 }
 
-// IsValidThinkingLevelForModel checks if a thinking level is valid for the given
-// model. Some OpenAI models like gpt-5.4 don't support "minimal" and require
-// "none" instead.
-func IsValidThinkingLevelForModel(level ThinkingLevel, modelName string) bool {
+// catalogReasoningLevel maps a Kit ThinkingLevel onto the effort name used by
+// the models.dev catalog. ThinkingOff has no catalog equivalent: it means "do
+// not ask for reasoning at all" rather than an effort setting.
+func catalogReasoningLevel(level ThinkingLevel) (string, bool) {
+	switch level {
+	case ThinkingNone, ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh:
+		return string(level), true
+	default:
+		return "", false
+	}
+}
+
+// SupportedThinkingLevels returns the thinking levels the given model accepts,
+// in the order ThinkingLevels reports them.
+//
+// The list is derived from the catalog's reasoning metadata. When the catalog
+// has nothing usable for the model — an unknown model, or one that takes a
+// reasoning toggle or raw token budget rather than named levels — every level
+// is returned, since there is no evidence any of them is unsupported.
+//
+// ThinkingOff is always included: it means "don't ask for reasoning", which
+// every model honours.
+func SupportedThinkingLevels(provider, modelName string) []ThinkingLevel {
+	all := ThinkingLevels()
+	info := GetGlobalRegistry().LookupModel(provider, modelName)
+	if info == nil || !info.ReasoningIsGraded {
+		return all
+	}
+	out := make([]ThinkingLevel, 0, len(all))
+	for _, l := range all {
+		if IsValidThinkingLevelForModel(l, provider, modelName) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// IsValidThinkingLevelForModel reports whether a thinking level is valid for
+// the given provider/model.
+//
+// The answer comes from the model's published reasoning metadata: OpenAI's
+// gpt-5.x line accepts "none" but not "minimal", the o-series accepts neither,
+// and Anthropic's budget-based models accept any level. Models the catalog
+// says nothing about are permitted every level, so a model missing from the
+// catalog is never blocked on the strength of absent data.
+//
+// Pass an empty provider when it isn't known; the model is then looked up
+// across every provider and accepted if any of them grades it as supported.
+func IsValidThinkingLevelForModel(level ThinkingLevel, provider, modelName string) bool {
+	// "off" disables reasoning rather than selecting an effort, so it is
+	// always available.
 	if level == ThinkingOff {
 		return true
 	}
-
-	// Check if this is an OpenAI model that doesn't support "minimal"
-	// gpt-5.4 and newer gpt-5.x models use "none" instead of "minimal"
-	if level == ThinkingMinimal {
-		if strings.Contains(modelName, "gpt-5.4") ||
-			strings.Contains(modelName, "gpt-5-pro") ||
-			strings.Contains(modelName, "gpt-5-chat") {
-			return false
-		}
+	catalogLevel, ok := catalogReasoningLevel(level)
+	if !ok {
+		return true
 	}
 
-	// Check if this is an OpenAI model that doesn't support "none"
-	// Older gpt-5 models only support "minimal", not "none"
-	if level == ThinkingNone {
-		if strings.Contains(modelName, "gpt-5") &&
-			!strings.Contains(modelName, "gpt-5.4") &&
-			!strings.Contains(modelName, "gpt-5-pro") &&
-			!strings.Contains(modelName, "gpt-5-chat") {
-			// Older gpt-5 models might not support "none"
-			// They only added "none" support in newer versions
-			return false
+	if provider != "" {
+		info := GetGlobalRegistry().LookupModel(provider, modelName)
+		if info == nil {
+			return true
 		}
+		return info.SupportsReasoningLevel(catalogLevel)
 	}
 
-	// All other levels are generally valid for reasoning models
-	return true
+	// No provider given: accept the level when any provider publishing this
+	// model accepts it. Being permissive here keeps the fallback advisory —
+	// the alternative would reject a level the user's actual provider allows.
+	registry := GetGlobalRegistry()
+	found := false
+	for _, p := range registry.GetSupportedProviders() {
+		info := registry.LookupModel(p, modelName)
+		if info == nil {
+			continue
+		}
+		found = true
+		if info.SupportsReasoningLevel(catalogLevel) {
+			return true
+		}
+	}
+	return !found
 }
 
 // SuggestThinkingLevelFallback returns a recommended fallback level when the
-// requested level is not valid for the model. Returns ThinkingOff if no
-// suitable fallback exists.
-func SuggestThinkingLevelFallback(level ThinkingLevel, modelName string) ThinkingLevel {
-	if level == ThinkingMinimal && !IsValidThinkingLevelForModel(level, modelName) {
-		// For models that don't support "minimal", suggest "none" (~same token budget)
-		return ThinkingNone
+// requested level is not valid for the model.
+//
+// It prefers the nearest supported level of similar cost: "minimal" and
+// "none" substitute for each other, and otherwise the closest supported level
+// on the effort scale is chosen. Returns ThinkingOff when the model supports
+// no level at all.
+func SuggestThinkingLevelFallback(level ThinkingLevel, provider, modelName string) ThinkingLevel {
+	if IsValidThinkingLevelForModel(level, provider, modelName) {
+		return level
 	}
-	if level == ThinkingNone && !IsValidThinkingLevelForModel(level, modelName) {
-		// For models that don't support "none", suggest "minimal" (~same token budget)
-		return ThinkingMinimal
+
+	supported := SupportedThinkingLevels(provider, modelName)
+	isSupported := func(l ThinkingLevel) bool { return slices.Contains(supported, l) }
+
+	// "minimal" and "none" denote about the same (near-zero) budget, so they
+	// are each other's first choice.
+	switch level {
+	case ThinkingMinimal:
+		if isSupported(ThinkingNone) {
+			return ThinkingNone
+		}
+	case ThinkingNone:
+		if isSupported(ThinkingMinimal) {
+			return ThinkingMinimal
+		}
+	}
+
+	// Otherwise walk outward along the effort scale for the nearest supported
+	// level, preferring the lower one on a tie so a fallback never silently
+	// costs more than what was asked for.
+	scale := ThinkingLevels()
+	idx := slices.Index(scale, level)
+	if idx >= 0 {
+		for d := 1; d < len(scale); d++ {
+			if i := idx - d; i >= 0 && isSupported(scale[i]) && scale[i] != ThinkingOff {
+				return scale[i]
+			}
+			if i := idx + d; i < len(scale) && isSupported(scale[i]) {
+				return scale[i]
+			}
+		}
 	}
 	return ThinkingOff
 }
@@ -1144,7 +1257,12 @@ func createOpenAIProvider(ctx context.Context, config *ProviderConfig, modelName
 	}
 
 	if apiKey == "" {
-		return nil, fmt.Errorf("OpenAI API key not provided. Use 'kit auth login openai', --provider-api-key flag, or OPENAI_API_KEY environment variable")
+		return nil, &auth.MissingCredentialsError{
+			Provider:     "openai",
+			ProviderName: "OpenAI",
+			EnvVars:      []string{"OPENAI_API_KEY"},
+			Hint:         "ChatGPT Plus/Pro users can run 'kit auth login openai' instead",
+		}
 	}
 
 	if os.Getenv("DEBUG") != "" || os.Getenv("KIT_DEBUG") != "" {
@@ -1204,6 +1322,13 @@ func createCopilotProvider(ctx context.Context, config *ProviderConfig, modelNam
 
 	token, err := cm.GetValidCopilotAccessTokenContext(ctx)
 	if err != nil {
+		if has, _ := cm.HasCopilotCredentials(); !has {
+			return nil, &auth.MissingCredentialsError{
+				Provider:     "copilot",
+				ProviderName: "GitHub Copilot",
+				Hint:         "GitHub Copilot uses device login: run 'kit auth login copilot'",
+			}
+		}
 		return nil, fmt.Errorf("GitHub Copilot credentials not available. Use 'kit auth login copilot': %w", err)
 	}
 
@@ -1240,7 +1365,12 @@ func createCopilotProvider(ctx context.Context, config *ProviderConfig, modelNam
 		return nil, fmt.Errorf("failed to create GitHub Copilot model: %w", err)
 	}
 
-	providerOpts := buildOpenAIProviderOptions(config, modelName)
+	// Attach Responses options only for models routed to the Responses API;
+	// chat-completions models reject *openai.ResponsesProviderOptions.
+	var providerOpts fantasy.ProviderOptions
+	if copilotUsesResponsesAPI(modelName) {
+		providerOpts = buildOpenAIProviderOptions(config, modelName)
+	}
 
 	return &ProviderResult{Model: model, ProviderOptions: providerOpts}, nil
 }
@@ -1274,6 +1404,11 @@ func createOpenAICodexProvider(ctx context.Context, config *ProviderConfig, mode
 	opts = append(opts, openai.WithAPIKey(token))
 	opts = append(opts, openai.WithBaseURL(baseURL))
 	opts = append(opts, openai.WithUseResponsesAPI())
+	// The Codex backend speaks only the Responses API, and
+	// buildCodexProviderOptions always attaches ResponsesProviderOptions.
+	// Force the Responses wire for every model so unknown model IDs do
+	// not fall back to the chat-completions model and reject the options.
+	opts = append(opts, openai.WithResponsesAPIFunc(func(string) bool { return true }))
 	opts = append(opts, openai.WithHTTPClient(httpClient))
 
 	provider, err := openai.New(opts...)
@@ -1462,14 +1597,10 @@ func (t *copilotTransport) cachedToken(ctx context.Context) string {
 }
 
 func createGoogleProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
-	apiKey := firstNonEmpty(
-		config.ProviderAPIKey,
-		os.Getenv("GOOGLE_API_KEY"),
-		os.Getenv("GEMINI_API_KEY"),
-		os.Getenv("GOOGLE_GENERATIVE_AI_API_KEY"),
-	)
+	googleEnv := []string{"GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"}
+	apiKey := resolveAPIKey(config.ProviderAPIKey, "google", googleEnv)
 	if apiKey == "" {
-		return nil, fmt.Errorf("google API key not provided, use --provider-api-key flag or GOOGLE_API_KEY/GEMINI_API_KEY/GOOGLE_GENERATIVE_AI_API_KEY environment variable")
+		return nil, missingKeyError("google", "Google", googleEnv)
 	}
 
 	var opts []google.Option
@@ -1488,13 +1619,13 @@ func createGoogleProvider(ctx context.Context, config *ProviderConfig, modelName
 	return &ProviderResult{Model: model}, nil
 }
 
-func createAzureProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
-	apiKey := config.ProviderAPIKey
+// createAzureProvider builds the Azure OpenAI provider. providerID is the
+// registry ID the user selected ("azure" or "azure-cognitive-services") so a
+// key stored under either ID is found; both share the same env fallback.
+func createAzureProvider(ctx context.Context, config *ProviderConfig, providerID, modelName string) (*ProviderResult, error) {
+	apiKey := resolveAPIKey(config.ProviderAPIKey, providerID, []string{"AZURE_OPENAI_API_KEY"})
 	if apiKey == "" {
-		apiKey = os.Getenv("AZURE_OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("azure OpenAI API key not provided, use --provider-api-key flag or AZURE_OPENAI_API_KEY environment variable")
+		return nil, missingKeyError(providerID, "Azure OpenAI", []string{"AZURE_OPENAI_API_KEY"})
 	}
 
 	baseURL := config.ProviderURL
@@ -1527,12 +1658,9 @@ func createAzureProvider(ctx context.Context, config *ProviderConfig, modelName 
 }
 
 func createOpenRouterProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
-	apiKey := config.ProviderAPIKey
+	apiKey := resolveAPIKey(config.ProviderAPIKey, "openrouter", []string{"OPENROUTER_API_KEY"})
 	if apiKey == "" {
-		apiKey = os.Getenv("OPENROUTER_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("OpenRouter API key not provided. Use --provider-api-key flag or OPENROUTER_API_KEY environment variable")
+		return nil, missingKeyError("openrouter", "OpenRouter", []string{"OPENROUTER_API_KEY"})
 	}
 
 	var opts []openrouter.Option
@@ -1569,12 +1697,9 @@ func createBedrockProvider(ctx context.Context, config *ProviderConfig, modelNam
 }
 
 func createVercelProvider(ctx context.Context, config *ProviderConfig, modelName string) (*ProviderResult, error) {
-	apiKey := config.ProviderAPIKey
+	apiKey := resolveAPIKey(config.ProviderAPIKey, "vercel", []string{"VERCEL_API_KEY"})
 	if apiKey == "" {
-		apiKey = os.Getenv("VERCEL_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("vercel API key not provided, use --provider-api-key flag or VERCEL_API_KEY environment variable")
+		return nil, missingKeyError("vercel", "Vercel", []string{"VERCEL_API_KEY"})
 	}
 
 	var opts []vercel.Option
@@ -1616,7 +1741,7 @@ func createCustomProvider(ctx context.Context, config *ProviderConfig, modelName
 		apiKey = modelInfo.APIKey
 	}
 	if apiKey == "" {
-		apiKey = os.Getenv("CUSTOM_API_KEY")
+		apiKey = resolveAPIKey("", "custom", []string{"CUSTOM_API_KEY"})
 	}
 	if apiKey == "" {
 		// Many local/custom endpoints don't require a key; use a placeholder.

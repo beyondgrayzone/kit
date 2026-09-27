@@ -1,0 +1,323 @@
+---
+title: Remote Sessions
+description: Run Kit in detachable sessions — on this machine, or on another over an end-to-end encrypted iroh connection.
+---
+
+# Remote Sessions
+
+Kit can run as a daemon that hosts **detachable sessions**: a session keeps
+running when you close the terminal, and you can reattach to it later,
+switch between several like tmux, or share one with someone else. The
+daemon can be on this machine or on another.
+
+For sessions on this machine, no setup and no pairing is needed — skip to
+[Sessions on this machine](#sessions-on-this-machine):
+
+```bash
+kit attach
+```
+
+The rest of this page covers **remote** sessions. All work — the agent,
+tools, extensions, sessions — happens on the daemon host; your local
+terminal just renders it. The transport is [iroh](https://iroh.computer):
+a direct, end-to-end encrypted QUIC connection that holes through NATs and
+falls back to relays.
+
+Access is **pairing-based**. A client pairs with the host once — with a
+one-time code and an explicit accept/reject on the host's terminal — and
+from then on reconnects by name with its own signing key. For normal
+reconnects no code is needed, and the host can revoke any client at any
+time. (If the host's daemon identity file is deleted, its endpoint id
+rotates and every client pairs again.)
+
+```bash
+# On the host: start the daemon
+kit daemon
+
+# On the host: open a pairing window (shows a one-time code)
+kit daemon pair
+
+# On the client: pair (the host terminal asks you to accept)
+kit remote --pair A1B2C3D4
+Save this host as [workstation]: homelab
+
+# On the client: connect — no code needed, ever again
+kit remote --host homelab
+```
+
+On connection the daemon reports its **live sessions**; when any exist, an
+in-client picker lets you attach to one (the session's screen repaints
+exactly where it left off) or start a new one — a fresh child shows the
+working-directory picker (starting in the daemon user's home directory).
+The session behaves exactly like a local one: extensions, widgets, tool
+rendering, and session persistence all run on the daemon host.
+
+## Requirements
+
+- Both machines run a recent `kit` build. The iroh transport is part of
+  the single `kit` binary — no extra components.
+- Outbound internet access for iroh discovery and, when a direct path cannot
+  be punched, the n0 relay fleet.
+
+## Commands
+
+| Command | Side | Purpose |
+|---------|------|---------|
+| `kit daemon` | host | Host sessions for paired clients |
+| `kit daemon pair` | host | Open a 10-minute pairing window; confirm requests on this terminal |
+| `kit daemon pair --list` | host | List paired clients with fingerprints |
+| `kit daemon pair --revoke <fp>` | host | Revoke a paired client |
+| `kit daemon status` | host | Endpoint, paired clients, active sessions |
+| `kit remote --pair <code>` | client | Pair with a host and save it under a name |
+| `kit remote --host <name>` | client | Connect to a paired host |
+| `kit remote --list` | client | List saved hosts |
+| `kit remote --forget <name>` | client | Forget a saved host |
+| `kit attach` | either | Pick a session on this machine **or any paired host** (starts a local daemon if needed) |
+| `kit attach --host <name>` | client | Attach on a paired host, with session switching |
+| `kit attach --all` | client | Pick across every paired host **without** starting a local daemon first |
+| `kit ls` | either | List live sessions (`--all` includes paired hosts) |
+
+## Sessions on this machine
+
+`kit attach` gives you the same detachable sessions without any pairing:
+it talks to a daemon on this machine over a Unix socket in
+`$XDG_RUNTIME_DIR/kit/`, and starts one if none is running. The socket is
+`0600` inside a `0700` directory and every connection's peer uid is
+checked, so only your own processes can reach it.
+
+The picker it opens is **not** limited to this machine: it lists the local
+daemon's sessions followed by those on every paired host, each group under
+its host name. Plain `kit attach` is therefore the one command that shows
+everything you can attach to, wherever it is running — you only need
+`--host` to go straight to a particular machine.
+
+That means `kit attach` queries your paired hosts before it can draw, so a
+host that is asleep costs the picker up to eight seconds (the same
+per-host timeout as `Ctrl+] w`, and hosts are queried in parallel, so it
+is eight seconds total rather than eight per host). `kit attach --new` and
+`kit attach <id>` skip the query, because neither one opens a picker.
+
+When nothing is live anywhere — no local sessions and no reachable remote
+ones — `kit attach` skips the picker entirely and starts a new session,
+which opens the working-directory picker.
+
+`kit attach --all` lists the same sessions, with one difference: it draws
+the picker *before* connecting anywhere, so choosing a remote session does
+not start a local daemon you were not going to use. Plain `kit attach`
+dials the local daemon first — starting one if none is running — because
+that is where it looks for sessions before asking anyone else.
+
+## Sessions and daemon restarts
+
+A session survives a **client** disconnect, but not a restart of the
+**daemon**. The session's terminal is owned by the daemon process, so
+stopping the daemon stops its sessions — reattaching to a session from a
+previous daemon is not possible, because the terminal it was rendering to
+no longer exists.
+
+Kit makes that boundary predictable rather than leaving it to chance:
+
+- On `SIGINT`/`SIGTERM` — including `systemctl --user stop kit` — the
+  daemon ends each session with `SIGTERM` first, so kit can save its
+  conversation before exiting. The generated unit sets `KillMode=mixed`
+  so systemd signals the daemon rather than every session at once.
+- On a hard crash (`SIGKILL`, a panic, the OOM killer) the kernel kills
+  each session child immediately, through the parent-death signal armed
+  when it was spawned. The iroh endpoint dies with the daemon process
+  itself, so a crashed daemon can never leave anything serving its
+  endpoint behind.
+- On the next start, the daemon sweeps any session recorded by a previous
+  run that is somehow still alive, and clears its scratch files.
+
+A session is only ever signalled when the daemon can **prove** it owns
+it: the process is checked against a marker inherited from the daemon
+that spawned it. A process that cannot be identified is left alone, so
+one daemon can never disturb another's sessions, and a recycled pid can
+never be mistaken for a session.
+
+## Session keys
+
+Inside an attached session, `Ctrl+]` is the multiplexer prefix:
+
+| Chord | Action |
+|-------|--------|
+| `Ctrl+] d` | Detach; the session keeps running |
+| `Ctrl+] s` | Switch to another session |
+| `Ctrl+] c` | Start a new session |
+| `Ctrl+] n` / `Ctrl+] p` | Next / previous session |
+| `Ctrl+] w` | Switch across paired hosts |
+| `Ctrl+] Ctrl+]` | Send a literal `Ctrl+]` to the session |
+
+The prefix is deliberately **not** `Ctrl+X`: that one belongs to the
+session itself (`Ctrl+X s` steers, `Ctrl+X e` opens `$EDITOR`, and so on),
+and every chord the client took would stop working over a connection. With
+a separate prefix the keymap is identical whether kit runs locally or
+through a session. `Ctrl+X d` still detaches, for compatibility.
+
+`Ctrl+] d` **detaches**: your terminal returns to the local shell and the
+session keeps running on the host — type `/quit` inside the session to end
+it for good. The parting message names the session (`kit attach 3`, or
+`kit attach --host mev 3`), so reattaching is a copy away. Detached
+sessions are listed on the next connect, so you can pick up exactly where
+you left off.
+
+`Ctrl+] w` lists every **other** daemon: the paired hosts when you are on
+this machine, and the paired hosts plus this machine when you are on a
+remote one. There is always a way back home. Hosts are queried in
+parallel, so one sleeping laptop no longer holds up the list; hosts that
+do not answer within eight seconds are dropped from it, and `kit ls --all`
+names them.
+
+Several clients can also **attach to the same session** (tmux-style shared
+view): every attached terminal mirrors the same screen, keystrokes from any
+client go into the shared session, and the PTY is resized to the smallest
+attached window. Pairing is the authorization — any paired client may list
+and attach to any session. Attach rights end where pairing ends: revoking a
+client cuts off all of its sessions.
+
+## How pairing works
+
+1. `kit daemon pair` generates a fresh one-time code and opens a bootstrap
+   endpoint for **10 minutes** (or until one client pairs).
+2. `kit remote --pair <code>` proves knowledge of the code and presents the
+   client's signing public key.
+3. The host terminal shows the request (`client fp=379d…8510`) and asks
+   **Accept? [y/N]** — the default is reject. Requests arriving while no
+   terminal can confirm (e.g. the service runs headless) are always denied.
+4. On accept, the client's public key joins the host's allowlist
+   (`~/.config/kit/daemon/authorized.json`), and the client stores the
+   host's endpoint id (`~/.config/kit/remote/hosts.json`). The code is
+   burned.
+
+The code itself never grants access: it only makes the pairing window
+reachable, and a human still has to approve. Pairing requests that fail the
+code check never reach the prompt.
+
+## How reconnection works
+
+`kit remote --host <name>` dials the stored endpoint id and signs the
+handshake with the client's private signing key; the host verifies the
+signature against its allowlist. iroh's QUIC handshake additionally
+authenticates the daemon against the stored endpoint id, so a malicious or
+poisoned endpoint cannot impersonate the host.
+
+## Clipboard images
+
+`Ctrl-V` in a remote session attaches an image from the **client
+machine's** clipboard: the client reads its own clipboard (via xclip /
+wl-paste / osascript), streams the image over the tunnel, and the daemon
+hands it to the session as a pending attachment — the same inline
+thumbnail preview and `[N image(s) attached]` indicator a local paste
+gets. Add your text and submit; `Ctrl-U` clears it.
+
+- The clipboard tools must be installed on the **client** machine; the
+  daemon host needs none.
+- `Ctrl-V` with no image on the clipboard is forwarded to the session
+  unchanged, so host-side `Ctrl-V` behavior (e.g. quoted-insert in an
+  embedded shell) is preserved.
+- The preview's rendering quality follows the same terminal detection as
+  local sessions — the daemon probes the real terminal through the
+  connection, so a kitty client gets true graphics and anything else gets
+  the half-block thumbnail. `KIT_IMAGE_PROTOCOL` works here too.
+- If the client runs inside **tmux, screen or zellij**, the session is told
+  so and renders accordingly (see [Terminal and colors](#terminal-and-colors)).
+  Without that, a multiplexer answers the graphics probe on the terminal's
+  behalf and then discards the graphics themselves, and the pasted image
+  shows as an empty box.
+- Works in kitty (which reports `Ctrl-V` through the kitty keyboard
+  protocol) and in legacy terminals alike.
+
+## Terminal and colors
+
+A session renders into **your** terminal, but the daemon that spawns it
+cannot see that terminal: between the two sits a pseudo-terminal, which
+reports no color depth and answers no background-color query. So the
+client describes its own terminal when it attaches, and the daemon starts
+the session against that description — much as `ssh` forwards `TERM`.
+
+Four things are forwarded:
+
+| Value | Source on the client | Seen by the session as |
+|-------|----------------------|------------------------|
+| `TERM` | the client's environment | `TERM` |
+| `COLORTERM` | the client's environment | `COLORTERM` |
+| Terminal background color | an OSC query the client runs before it hands over the terminal | `KIT_REMOTE_BACKGROUND` |
+| Terminal multiplexer | `TMUX` / `ZELLIJ` / `TERM` on the client | `KIT_REMOTE_MULTIPLEXER` |
+
+The background color is what decides whether a theme renders its light or
+its dark palette, so it is resolved on the client: the session's own query
+would have to cross the pseudo-terminal — and, for a remote session, the
+network — before it could draw its first frame. A terminal that does not
+answer is forwarded as `unknown`, which reads as dark and stops the
+session asking a question already known to go unanswered.
+
+This applies to **local sessions too**, not just remote ones: a daemon
+outlives the terminal that started it, and one started by systemd never
+had a terminal at all. Without the forward, a session inherits the
+daemon's environment and a 24-bit theme degrades to 256 colors. That
+degradation is not an even dimming — every color snaps to the nearest cell
+of a coarse cube, so the near-black surfaces a dark theme is built from
+land on saturated corners and the session appears in colors the theme
+never defines.
+
+A few details worth knowing:
+
+- The multiplexer is forwarded for the same reason the background color
+  is: `TMUX` and `ZELLIJ` name the pane of the process that reads them, so
+  they never cross the wire, and a session that cannot see the
+  multiplexer draws inline graphics the multiplexer throws away. The
+  daemon's own multiplexer variables are dropped along with them — a
+  daemon started from inside tmux describes a pane on the wrong machine.
+- If your terminal sets `TERM` but no `COLORTERM`, the daemon's own
+  `COLORTERM` is dropped rather than inherited — claiming a color depth
+  your terminal never advertised is the same misreport in the other
+  direction.
+- If neither side names a `TERM`, the session falls back to
+  `xterm-256color`.
+- Each session keeps the description of the client that **started** it.
+  In a [shared session](#session-keys), or after reattaching from a
+  different terminal, the palette stays the one the session was created
+  with; start a new session to pick up a new terminal's capabilities.
+- Everything on the [Themes](/themes) page works normally inside a
+  session — `/theme`, config files, and the persisted preference are all
+  read on the daemon host.
+
+## Security notes
+
+- The client's signing key lives in `~/.config/kit/remote/identity.key`
+  (0600). The host stores only public keys — there are no shared secrets.
+- Deleting the host's `~/.config/kit/daemon/identity.key` changes its
+  endpoint id; every client must pair again.
+- Revocation is immediate and one-sided: `kit daemon pair --revoke <fp>`
+  (prefix matching works; ambiguous prefixes are refused).
+- The daemon holds a per-user lock; a second instance refuses to start. See
+  `kit daemon status`.
+
+## systemd
+
+```bash
+kit daemon service install   # writes ~/.config/systemd/user/kit.service, enables + starts it
+kit daemon status            # endpoint, paired clients, active sessions
+systemctl --user status kit  # manage the service directly
+kit daemon service remove    # stop and uninstall
+```
+
+`install` captures provider credentials from your current shell
+(`*_API_KEY`, `*_TOKEN`, `PROVIDER_*`, and similar) into
+`~/.config/kit/daemon.env`, which the unit loads via `EnvironmentFile`. Edit
+that file and run `systemctl --user restart kit` when keys change. The
+service runs without a terminal, so pairing requests are denied while it is
+the only thing running — pair interactively with `kit daemon pair` (the
+allowlist is shared).
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| `another instance is already running` | A daemon (or service) already holds the lock — see `kit daemon status` |
+| `no daemon is live for this pairing code` | The pairing window expired or a client already paired; open a new one with `kit daemon pair` |
+| `the pairing request was rejected on the host` | The request reached the host and was declined; ask the host user to rerun `kit daemon pair` |
+| `the host no longer knows this machine` | The client was revoked — pair again |
+| `could not reach the daemon` | Network or relay issue; check connectivity on both sides |
+| Session dies with `API key not provided` | The daemon environment is missing provider keys — for the systemd service, edit `~/.config/kit/daemon.env` and restart |
+| Detached by accident | Just reconnect with `kit remote --host <name>`; the daemon keeps running |

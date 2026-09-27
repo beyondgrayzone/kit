@@ -8,10 +8,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"charm.land/fantasy"
 	"github.com/mark3labs/kit/extensions"
@@ -47,9 +49,20 @@ type ContextFile struct {
 // integration of MCP tools and LLM interactions into Go applications. It manages
 // agents, sessions, and model configurations.
 type Kit struct {
-	agent          *agent.Agent
-	session        SessionManager
-	modelString    string
+	agent       *agent.Agent
+	session     SessionManager
+	modelString string
+	// endpointProvider is the provider the provider-url, provider-api-key
+	// and provider-wire overrides belong to: the provider of the model that
+	// was active when those overrides were configured. A model switch to a
+	// different provider must not carry them along, or every provider would
+	// be pointed at the endpoint of the first one. Empty means no override
+	// is configured.
+	endpointProvider string
+	// shell is the effective shell of this instance, resolved from the SDK
+	// option and the configuration store at construction. Subagents built
+	// without an explicit tool set inherit it.
+	shell          []string
 	events         *eventBus
 	autoCompact    bool
 	compactionOpts *CompactionOptions
@@ -314,6 +327,15 @@ func (m *Kit) GetLoadingMessage() string {
 	return m.agent.GetLoadingMessage()
 }
 
+// ProviderError returns the error that kept the model provider from being
+// created when the instance was built with Options.AllowMissingCredentials.
+// It is nil when the provider is usable. Use IsMissingCredentialsError to
+// check whether the cause is an absent API key. A successful SetModel
+// clears it.
+func (m *Kit) ProviderError() error {
+	return m.agent.ProviderError()
+}
+
 // GetLoadedServerNames returns the names of successfully loaded MCP servers.
 // If MCP servers are still loading in the background, this returns only the
 // servers that have completed loading so far.
@@ -457,8 +479,16 @@ func (m *Kit) ListMCPServers() []MCPServerStatus {
 }
 
 // GetExtensionToolCount returns the number of tools registered by extensions.
+//
+// The count comes from the extension runner rather than the agent's extra-tool
+// list. That list is a shared bucket also holding the built-in activate_skill
+// tool, SDK-supplied Options.ExtraTools and tools added at runtime via
+// AddTools, so counting it would attribute all of those to extensions.
 func (m *Kit) GetExtensionToolCount() int {
-	return m.agent.GetExtensionToolCount()
+	if m.extRunner == nil {
+		return 0
+	}
+	return len(m.extRunner.RegisteredTools())
 }
 
 // --------------------------------------------------------------------------
@@ -750,9 +780,9 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 	if thinkingLevel != models.ThinkingOff {
 		parts := strings.SplitN(modelString, "/", 2)
 		if len(parts) == 2 {
-			modelName := parts[1]
-			if !models.IsValidThinkingLevelForModel(thinkingLevel, modelName) {
-				fallback := models.SuggestThinkingLevelFallback(thinkingLevel, modelName)
+			providerName, modelName := parts[0], parts[1]
+			if !models.IsValidThinkingLevelForModel(thinkingLevel, providerName, modelName) {
+				fallback := models.SuggestThinkingLevelFallback(thinkingLevel, providerName, modelName)
 				if fallback != models.ThinkingOff {
 					// Adjust the thinking level in the instance store so the change persists.
 					m.v.Set("thinking-level", string(fallback))
@@ -775,6 +805,18 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 		ThinkingLevel:  thinkingLevel,
 		DisableCaching: false, // Caching enabled by default, works with thinking
 		ConfigStore:    m.v,
+		SessionIDFunc:  m.GetSessionID,
+	}
+
+	// The endpoint overrides belong to one provider. A switch to a different
+	// provider must resolve that provider's own endpoint and credentials;
+	// otherwise `--provider-url http://localhost:1234/v1 --model local` and
+	// then `/model openai/gpt-x` would send openai requests, with the local
+	// key, to the local server, which then answers with the model it has.
+	if !m.endpointOverridesApply(modelString) {
+		cfg.ProviderAPIKey = ""
+		cfg.ProviderURL = ""
+		cfg.ProviderWire = ""
 	}
 
 	// Only set generation parameter pointers when the user has explicitly
@@ -834,6 +876,42 @@ func (m *Kit) SetModel(ctx context.Context, modelString string) error {
 	return nil
 }
 
+// endpointOverridesConfigured reports whether the store holds any of the
+// provider endpoint overrides: provider-url, provider-api-key, provider-wire.
+func endpointOverridesConfigured(v *viper.Viper) bool {
+	return v.GetString("provider-url") != "" ||
+		v.GetString("provider-api-key") != "" ||
+		v.GetString("provider-wire") != ""
+}
+
+// endpointProviderFor returns the provider the endpoint overrides bind to for
+// the given model, or "" when no override is configured.
+func endpointProviderFor(v *viper.Viper, modelString string) string {
+	if !endpointOverridesConfigured(v) {
+		return ""
+	}
+	provider, _, err := ParseModelString(modelString)
+	if err != nil {
+		return ""
+	}
+	return provider
+}
+
+// endpointOverridesApply reports whether the configured endpoint overrides
+// belong to the provider of modelString. With no bound provider they apply
+// unconditionally, which keeps the SDK behaviour for a store that gained the
+// overrides without a model (nothing to bind to).
+func (m *Kit) endpointOverridesApply(modelString string) bool {
+	if m.endpointProvider == "" {
+		return true
+	}
+	provider, _, err := ParseModelString(modelString)
+	if err != nil {
+		return false
+	}
+	return provider == m.endpointProvider
+}
+
 // HasCustomSystemPrompt reports whether the user explicitly configured a system
 // prompt via --system-prompt, a config file entry, or SDK Options.SystemPrompt.
 // When false, the built-in default (or a per-model override) is in use and can
@@ -881,12 +959,30 @@ func (m *Kit) composeSystemPrompt(basePrompt string) string {
 	}
 
 	// Append current date/time and working directory.
-	pb.WithSection("", fmt.Sprintf(
-		"Current date and time: %s\nCurrent working directory: %s",
-		time.Now().Format("Monday, January 2, 2006, 3:04:05 PM MST"), cwd,
-	))
+	bare := m.opts != nil && m.opts.Bare
+	pb.WithSection("", environmentSection(cwd, bare))
 
 	return pb.Build()
+}
+
+// environmentSection renders the trailing system-prompt block describing the
+// runtime environment: the current time and working directory, plus a notice
+// when bare mode suppressed project context. Both Kit.New and
+// composeSystemPrompt use it so the two paths cannot drift.
+func environmentSection(cwd string, bare bool) string {
+	s := fmt.Sprintf(
+		"Current date and time: %s\nCurrent working directory: %s",
+		time.Now().Format("Monday, January 2, 2006, 3:04:05 PM MST"), cwd,
+	)
+	// The working directory is still reported in bare mode because the file
+	// tools resolve relative paths against it. The notice stops the model
+	// treating that directory as the subject of the conversation.
+	if bare {
+		s += "\n\nNo project context was loaded (bare mode): no project" +
+			" instructions, skills or extensions are in effect. Treat the" +
+			" working directory as incidental unless the user refers to it."
+	}
+	return s
 }
 
 // GetCurrentModel returns the fully qualified "provider/model" string for the
@@ -942,9 +1038,11 @@ func (m *Kit) ReloadExtensions() error {
 		_, _ = m.extRunner.Emit(extensions.SessionShutdownEvent{})
 	}
 
-	// Re-load from disk.
+	// Re-load from disk. Bare mode is preserved across the reload so a hot
+	// reload cannot pull in directory-discovered extensions that startup
+	// deliberately skipped.
 	extraPaths := m.v.GetStringSlice("extension")
-	loaded, err := extensions.LoadExtensions(extraPaths)
+	loaded, err := extensions.LoadExtensionsScoped(extraPaths, m.opts != nil && m.opts.Bare)
 	if err != nil {
 		return fmt.Errorf("reloading extensions: %w", err)
 	}
@@ -993,6 +1091,7 @@ func (m *Kit) ExecuteCompletion(ctx context.Context, req extensions.CompleteRequ
 			ModelString:   req.Model,
 			TLSSkipVerify: m.v.GetBool("tls-skip-verify"),
 			ConfigStore:   m.v,
+			SessionIDFunc: m.GetSessionID,
 		}
 		if req.MaxTokens > 0 {
 			config.MaxTokens = req.MaxTokens
@@ -1078,13 +1177,13 @@ func (m *Kit) ExecuteCompletion(ctx context.Context, req extensions.CompleteRequ
 // and will use CLI defaults if not specified.
 //
 // Config isolation: each [New] / [NewAgent] call constructs its own isolated
-// configuration store (via viper.New internally). Options are applied to that
-// per-instance store, so two Kits constructed in the same process do NOT share
-// or clobber each other's configuration. Runtime mutators ([Kit.SetModel],
-// [Kit.SetThinkingLevel]) and config readers ([Kit.GetThinkingLevel]) operate
-// only on the owning instance. Fields left at their zero value are simply not
-// applied; they fall through to the precedence chain (env → .kit.yml →
-// per-model defaults) resolved within the instance's own store.
+// configuration store. Options are applied to that per-instance store, so two
+// Kits constructed in the same process do NOT share or clobber each other's
+// configuration. Runtime mutators ([Kit.SetModel], [Kit.SetThinkingLevel])
+// and config readers ([Kit.GetThinkingLevel]) operate only on the owning
+// instance. Fields left at their zero value are simply not applied; they fall
+// through to the precedence chain (env → .kit.yml → per-model defaults)
+// resolved within the instance's own store.
 type Options struct {
 	Model        string // Override model (e.g., "anthropic/claude-sonnet-4-5-20250929")
 	SystemPrompt string // Override system prompt
@@ -1158,9 +1257,18 @@ type Options struct {
 	// proxies), or running against self-hosted infrastructure.
 
 	// ProviderAPIKey overrides the API key used to authenticate with the
-	// model provider. "" = use the value from config or the
-	// provider-specific environment variable.
+	// model provider. "" = use the value from config, the credentials file
+	// (see SetProviderAPIKey), or the provider-specific environment variable.
 	ProviderAPIKey string
+
+	// AllowMissingCredentials lets New succeed when the configured provider
+	// has no API key or OAuth token. The instance then reports the problem
+	// through ProviderError, and every prompt fails with that error until
+	// SetModel installs a model whose provider has credentials (for
+	// example after SetProviderAPIKey stored a key). The interactive CLI
+	// uses this so users can add a key from inside the TUI. Off by default
+	// so SDK callers keep failing fast.
+	AllowMissingCredentials bool
 
 	// ProviderURL overrides the provider endpoint. "" = use the provider's
 	// default URL.
@@ -1194,14 +1302,37 @@ type Options struct {
 	// will have no tools (useful for simple chat completions).
 	DisableCoreTools bool
 
-	// BashTimeout sets the default per-call timeout (in seconds) for the bash
-	// tool, applied when the model does not specify one. Zero falls back to
-	// the "bash-timeout" config value, then the built-in default (120s).
+	// ShellTimeout sets the default per-call timeout (in seconds) for the
+	// shell tool, applied when the model does not specify one. Zero falls back
+	// to BashTimeout, then the "shell-timeout" config value, then
+	// "bash-timeout", then the built-in default (120s).
+	ShellTimeout int
+
+	// ShellMaxTimeout caps the maximum timeout (in seconds) a shell tool call
+	// may request via its timeout argument. Zero falls back to BashMaxTimeout,
+	// then the "shell-max-timeout" config value, then "bash-max-timeout", then
+	// the built-in default (600s).
+	ShellMaxTimeout int
+
+	// Shell is the shell the shell tool runs a command string through, plus
+	// its own leading arguments, e.g. []string{"bash"} or
+	// []string{"busybox", "ash"}. Nil falls back to the "shell" config value,
+	// then the built-in default ["bash"]. Set this to run on images that do
+	// not ship bash.
+	Shell []string
+
+	// BashTimeout is the name ShellTimeout had before the tool's shell became
+	// configurable.
+	//
+	// Deprecated: use ShellTimeout. Both set the same value and ShellTimeout
+	// wins when both are set.
 	BashTimeout int
 
-	// BashMaxTimeout caps the maximum timeout (in seconds) a bash tool call
-	// may request via its timeout argument. Zero falls back to the
-	// "bash-max-timeout" config value, then the built-in default (600s).
+	// BashMaxTimeout is the name ShellMaxTimeout had before the tool's shell
+	// became configurable.
+	//
+	// Deprecated: use ShellMaxTimeout. Both set the same value and
+	// ShellMaxTimeout wins when both are set.
 	BashMaxTimeout int
 
 	// Session configuration
@@ -1216,7 +1347,7 @@ type Options struct {
 	NoSkills  bool     // Disable skill loading entirely (auto-discovery and explicit)
 
 	// SkillsDisable names skills (by Name) to exclude from the model-facing
-	// catalog. Disabled skills remain available via the /skill: slash command.
+	// catalog. Disabled skills remain available via the /<name> slash command.
 	SkillsDisable []string
 
 	// SkillTrustPrompt is an optional callback invoked the first time Kit
@@ -1242,6 +1373,26 @@ type Options struct {
 	// set, the subagent tool advertises no named agents and
 	// [SubagentConfig].Agent cannot resolve.
 	NoAgents bool
+
+	// Bare disables every form of automatic context discovery, so starting
+	// Kit inside a directory does not implicitly load that directory's
+	// instructions, tooling or configuration. It suppresses:
+	//
+	//   - project context files (AGENTS.md)
+	//   - skills, from both project and user directories
+	//   - extensions, from every source: project, user and system directories
+	//   - named agent definitions
+	//   - project-local .kit.yml (see [ConfigInitOptions])
+	//
+	// Explicitly supplied values are unaffected: [Options.Skills],
+	// [Options.SystemPrompt] and extensions named via the "extension" config
+	// key (or the -e CLI flag) all still apply. Core tools remain enabled and
+	// the working directory is unchanged; combine with
+	// [Options.DisableCoreTools] to remove filesystem access as well.
+	//
+	// Subagents spawned by a bare Kit inherit Bare, so delegated work cannot
+	// reintroduce the project context the parent excluded.
+	Bare bool
 
 	// MCPConfig provides a pre-loaded MCP configuration. When set,
 	// LoadAndValidateConfig is skipped during Kit creation — avoiding
@@ -1409,6 +1560,7 @@ type CLIOptions struct {
 //
 // Behaviour based on Options:
 //   - NoSession:   in-memory tree session (no persistence)
+//   - Bare:        shared bare bucket, not tied to a working directory
 //   - Continue:    resume most recent session for SessionDir (or cwd)
 //   - SessionPath: open a specific JSONL session file
 //   - default:     create a new tree session for SessionDir (or cwd)
@@ -1420,6 +1572,14 @@ func InitTreeSession(opts *Options) (*TreeManager, error) {
 	sessionDir := opts.SessionDir
 	if sessionDir == "" {
 		sessionDir, _ = os.Getwd()
+	}
+
+	// Bare sessions are deliberately not filed under the working directory:
+	// the mode exists so the directory does not matter. One shared bucket
+	// keeps `--continue` and `--resume` working across directories. An
+	// explicit SessionPath still wins, below.
+	if opts.Bare {
+		sessionDir = session.BareSessionKey
 	}
 
 	if opts.NoSession {
@@ -1440,18 +1600,17 @@ func InitTreeSession(opts *Options) (*TreeManager, error) {
 // It loads configuration, initializes MCP servers, creates the LLM model, and
 // sets up the agent for interaction. Returns an error if initialization fails.
 //
-// Config isolation: New constructs a per-instance configuration store (via
-// viper.New internally) and applies [Options] to it. Two Kits constructed in
-// the same process are therefore fully isolated — neither overwrites the
-// other's model, thinking level, or generation parameters, and runtime
-// mutators ([Kit.SetModel], [Kit.SetThinkingLevel]) only affect the owning
-// instance. This makes subagent spawning and multi-Kit embedding safe without
-// any external synchronization.
+// Config isolation: New constructs a per-instance configuration store and
+// applies [Options] to it. Two Kits constructed in the same process are
+// therefore fully isolated — neither overwrites the other's model, thinking
+// level, or generation parameters, and runtime mutators ([Kit.SetModel],
+// [Kit.SetThinkingLevel]) only affect the owning instance. This makes subagent
+// spawning and multi-Kit embedding safe without any external synchronization.
 //
 // CLI integration: when Options.CLI is non-nil the Kit shares the
-// process-global viper store instead of allocating a fresh one, so cobra flag
-// bindings established by the CLI remain in effect. SDK callers leave
-// Options.CLI nil and always get an isolated store.
+// process-global configuration store instead of allocating a fresh one, so
+// the CLI's flag bindings remain in effect. SDK callers leave Options.CLI nil
+// and always get an isolated store.
 //
 // For an ergonomic functional-options front door, see [NewAgent].
 func New(ctx context.Context, opts *Options) (*Kit, error) {
@@ -1483,8 +1642,9 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		toolList              []string
 		maxSteps              int
 		streaming             bool
-		bashTimeout           int
-		bashMaxTimeout        int
+		shellTimeout          int
+		shellMaxTimeout       int
+		shell                 []string
 		hasCustomSystemPrompt bool
 		systemPromptSource    string
 		capturedBasePrompt    string
@@ -1503,7 +1663,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		// seeds "model", which would otherwise mask an empty store.
 		// SkipConfig bypasses .kit.yml file loading (viper defaults and env vars still apply).
 		if !opts.SkipConfig && opts.CLI == nil {
-			if err := initConfig(v, opts.ConfigFile, false); err != nil {
+			if err := initConfig(v, opts.ConfigFile, false, opts.Bare); err != nil {
 				return fmt.Errorf("failed to initialize config: %w", err)
 			}
 		}
@@ -1582,7 +1742,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		}
 
 		// Load context files (AGENTS.md) from the project root.
-		if !opts.NoContextFiles {
+		if !opts.NoContextFiles && !opts.Bare {
 			contextFiles = loadContextFiles(cwd)
 		}
 
@@ -1613,7 +1773,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			}
 
 			// Apply per-skill disable list (--skill-disable / skill-disable
-			// config key). Disabled skills stay loaded (so /skill: still
+			// config key). Disabled skills stay loaded (so /<name> still
 			// works) but are hidden from the model-facing catalog.
 			disable := opts.SkillsDisable
 			if len(disable) == 0 {
@@ -1627,7 +1787,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		// subagent tool description and resolvable via SubagentConfig.Agent.
 		// Per-file parse failures are non-fatal: usable agents still load and
 		// a warning is printed unless quiet.
-		if !opts.NoAgents && !v.GetBool("no-agents") {
+		if !opts.NoAgents && !opts.Bare && !v.GetBool("no-agents") {
 			var agErr error
 			namedAgents, agErr = LoadAgentDefinitions(cwd)
 			if agErr != nil && !opts.Quiet {
@@ -1703,10 +1863,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 			}
 
 			// Append current date/time and working directory.
-			pb.WithSection("", fmt.Sprintf(
-				"Current date and time: %s\nCurrent working directory: %s",
-				time.Now().Format("Monday, January 2, 2006, 3:04:05 PM MST"), cwd,
-			))
+			pb.WithSection("", environmentSection(cwd, opts.Bare))
 
 			v.Set("system-prompt", pb.Build())
 		}
@@ -1737,7 +1894,7 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		toolList = opts.CoreToolList
 		if toolList == nil {
 			var err error
-			toolList, err = CoreToolFilterHelper(v)
+			toolList, err = FilterCoreToolNames(v.GetStringSlice("include-core-tools"), v.GetStringSlice("exclude-core-tools"))
 			if err != nil {
 				return err
 			}
@@ -1746,14 +1903,13 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 
 		maxSteps = v.GetInt("max-steps")
 		streaming = v.GetBool("stream")
-
-		bashTimeout = opts.BashTimeout
-		if bashTimeout == 0 {
-			bashTimeout = v.GetInt("bash-timeout")
-		}
-		bashMaxTimeout = opts.BashMaxTimeout
-		if bashMaxTimeout == 0 {
-			bashMaxTimeout = v.GetInt("bash-max-timeout")
+		// Each of the two timeouts has a shell-named form and the bash-named
+		// form it had before the tool's shell became configurable; see
+		// resolveShellTimeouts for the precedence.
+		shellTimeout, shellMaxTimeout = resolveShellTimeouts(opts, v)
+		shell = opts.Shell
+		if len(shell) == 0 {
+			shell = v.GetStringSlice("shell")
 		}
 
 		return nil
@@ -1833,22 +1989,25 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 	}
 
 	setupOpts := kitsetup.AgentSetupOptions{
-		MCPConfig:         mcpConfig,
-		Quiet:             opts.Quiet,
-		CoreTools:         opts.Tools,
-		CoreToolList:      toolList,
-		ExtraTools:        extraTools,
-		NamedAgents:       namedAgentSpecs(namedAgents),
-		BashTimeout:       bashTimeout,
-		BashMaxTimeout:    bashMaxTimeout,
-		ToolWrapper:       hookToolWrapper(beforeToolCall, afterToolResult),
-		ProviderConfig:    providerConfig,
-		Debug:             debug,
-		DebugLogger:       opts.DebugLogger,
-		NoExtensions:      noExtensions,
-		MaxSteps:          maxSteps,
-		StreamingEnabled:  streaming,
-		OnMCPServerLoaded: opts.OnMCPServerLoaded,
+		MCPConfig:               mcpConfig,
+		Quiet:                   opts.Quiet,
+		CoreTools:               opts.Tools,
+		CoreToolList:            toolList,
+		ExtraTools:              extraTools,
+		NamedAgents:             namedAgentSpecs(namedAgents),
+		ShellTimeout:            shellTimeout,
+		ShellMaxTimeout:         shellMaxTimeout,
+		Shell:                   shell,
+		ToolWrapper:             hookToolWrapper(beforeToolCall, afterToolResult),
+		ProviderConfig:          providerConfig,
+		Debug:                   debug,
+		DebugLogger:             opts.DebugLogger,
+		NoExtensions:            noExtensions,
+		AllowMissingCredentials: opts.AllowMissingCredentials,
+		Bare:                    opts.Bare,
+		MaxSteps:                maxSteps,
+		StreamingEnabled:        streaming,
+		OnMCPServerLoaded:       opts.OnMCPServerLoaded,
 		MCPTaskConfig: mcpTaskOptions{
 			perServer:       opts.MCPTaskMode,
 			defaultTTL:      opts.MCPTaskTTL,
@@ -1917,6 +2076,8 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		agent:                 agentResult.Agent,
 		session:               sessionManager,
 		modelString:           modelString,
+		endpointProvider:      endpointProviderFor(v, modelString),
+		shell:                 append([]string(nil), shell...),
 		events:                newEventBus(),
 		autoCompact:           opts.AutoCompact,
 		compactionOpts:        opts.CompactionOptions,
@@ -1941,6 +2102,13 @@ func New(ctx context.Context, opts *Options) (*Kit, error) {
 		prepareStep:           prepareStep,
 		runtimeExtraTools:     append([]Tool(nil), extraTools...),
 	}
+
+	// Late-bind the session ID supplier onto the provider config. The agent
+	// (and its HTTP transport) already hold this same ProviderConfig pointer,
+	// and the transport reads SessionIDFunc per request — so binding here,
+	// after the Kit instance exists, is picked up by every subsequent LLM
+	// call (e.g. the x-opencode-session header for opencode providers).
+	providerConfig.SessionIDFunc = k.GetSessionID
 
 	// Ensure the agent's extra-tool list reflects the current extension tools
 	// plus the runtime native tools captured above.
@@ -2017,21 +2185,19 @@ func loadContextFiles(cwd string) []*ContextFile {
 // Skill command expansion
 // ---------------------------------------------------------------------------
 
-// expandSkillCommand checks whether prompt starts with "/skill:<name>" and, if
-// so, re-reads the skill file, strips its YAML frontmatter, wraps the body in
-// a <skill> block with baseDir metadata, and appends any trailing user args.
-// Returns the original text unchanged when the prefix is absent or the skill is
-// not found.
+// expandSkillCommand checks whether prompt is a user-explicit skill
+// activation of the form "/<skill-name> [args]" (the agentskills.io slash
+// convention). If the name matches a loaded skill it re-reads the skill file,
+// strips its YAML frontmatter, wraps the body in a <skill_content> block with
+// location metadata and a bundled-resource listing, and appends any trailing
+// user args. Returns the original text unchanged when the prompt is not a
+// slash command or no skill has that name.
+//
+// User-explicit activation is not subject to disable-model-invocation or the
+// SkillsDisable list: those only hide a skill from the model-facing catalog.
 func (m *Kit) expandSkillCommand(prompt string) string {
-	if !strings.HasPrefix(prompt, "/skill:") {
-		return prompt
-	}
-
-	// Parse: /skill:name [args]
-	rest := prompt[len("/skill:"):]
-	name, args, _ := strings.Cut(rest, " ")
-	name = strings.TrimSpace(name)
-	if name == "" {
+	name, args, ok := ParseSkillCommand(prompt)
+	if !ok {
 		return prompt
 	}
 
@@ -2056,28 +2222,36 @@ func (m *Kit) expandSkillCommand(prompt string) string {
 		return prompt
 	}
 
-	baseDir := filepath.Dir(loaded.Path)
-
 	var buf strings.Builder
-	fmt.Fprintf(&buf, "<skill name=%q location=%q>\n", loaded.Name, loaded.Path)
-	fmt.Fprintf(&buf, "References are relative to %s.\n", baseDir)
-	buf.WriteString(loaded.Content)
-
-	// Enumerate bundled resources (scripts/, references/, assets/) so the model
-	// knows what it can read without listing the directory itself.
-	if res := skills.FormatResources(loaded.Resources()); res != "" {
-		buf.WriteString("\n")
-		buf.WriteString(res)
-	}
-	buf.WriteString("\n</skill>")
-
-	args = strings.TrimSpace(args)
+	buf.WriteString(skills.FormatActivation(loaded))
 	if args != "" {
-		buf.WriteString("\n")
+		buf.WriteString("\n\n")
 		buf.WriteString(args)
 	}
-
 	return buf.String()
+}
+
+// ParseSkillCommand splits a user prompt of the form "/<name> [args]" into
+// its skill name and trailing args. The name ends at the first whitespace
+// character (space, tab or newline — multi-line TUI input puts the request
+// on the next line), and args is the remainder with surrounding whitespace
+// trimmed. ok is false when prompt does not start with a slash or has an
+// empty name. The caller decides whether name refers to an actual skill;
+// this only performs the syntactic split.
+func ParseSkillCommand(prompt string) (name, args string, ok bool) {
+	if !strings.HasPrefix(prompt, "/") {
+		return "", "", false
+	}
+	body := prompt[1:]
+	if idx := strings.IndexFunc(body, unicode.IsSpace); idx >= 0 {
+		name, args = body[:idx], body[idx:]
+	} else {
+		name = body
+	}
+	if name == "" {
+		return "", "", false
+	}
+	return name, strings.TrimSpace(args), true
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,6 +2276,13 @@ func loadSkills(opts *Options) ([]*skills.Skill, error) {
 	// Auto-discover from the standard scopes rooted at the session directory.
 	// Project-local skills are injected into the system prompt, so they are
 	// gated on a trust decision when a SkillTrustPrompt is configured.
+	//
+	// Bare mode stops here: only skills named explicitly on the command line
+	// (handled above) load, so no directory contributes instructions merely
+	// because Kit happens to be running inside it.
+	if opts.Bare {
+		return nil, nil
+	}
 	cwd := opts.SessionDir
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -2273,7 +2454,8 @@ type SubagentConfig struct {
 
 	// Tools overrides the tool set available to the subagent.
 	// If nil and the subagent is created via the SDK (Kit.Subagent()), the
-	// static SubagentTools() set (all core tools except "subagent") is used.
+	// default set (all core tools except "subagent", built with the
+	// parent's effective shell) is used.
 	// When spawned internally by the agent loop, the parent's active tools
 	// minus "subagent" are used instead (see GetToolsForSubagent()).
 	// Pass m.GetToolsForSubagent() explicitly to opt into inheritance from
@@ -2384,6 +2566,21 @@ func inheritProviderConfig(child *Options, v *viper.Viper) {
 	}
 }
 
+// inheritIsolationOptions copies the parent's context-isolation settings onto
+// child Options so a subagent inherits the parent's discovery boundary.
+// Without it a bare parent spawns a child that re-runs project discovery and
+// loads the AGENTS.md, skills and extensions the parent deliberately refused.
+//
+// Kept as a helper rather than an inline assignment so that any future
+// isolation field is propagated by editing one place, and so the behaviour is
+// testable without spawning a real subagent. A nil child or parent is a no-op.
+func inheritIsolationOptions(child, parent *Options) {
+	if child == nil || parent == nil {
+		return
+	}
+	child.Bare = parent.Bare
+}
+
 // toolsIncludeMCP reports whether the provided tool set already contains any
 // of the parent's loaded MCP tools (matched by prefixed name). Used to decide
 // whether a spawned subagent needs to re-load MCP servers or can rely on the
@@ -2411,6 +2608,14 @@ func toolsIncludeMCP(tools []Tool, mcpNames []string) bool {
 //
 // This is the recommended way to run subagents in the SDK — no subprocess,
 // no kit binary dependency, native Go types for results.
+// subagentDefaultTools is the tool set a subagent receives when its
+// configuration names none: every core tool except subagent, built with the
+// parent's effective shell, so that a child on an image without bash keeps
+// working.
+func (m *Kit) subagentDefaultTools() []Tool {
+	return SubagentTools(WithShell(m.shell))
+}
+
 func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult, error) {
 	if cfg.Prompt == "" {
 		return nil, fmt.Errorf("subagent prompt is required")
@@ -2499,10 +2704,11 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 		systemPrompt = "You are a helpful coding assistant. Complete the task efficiently and thoroughly."
 	}
 
-	// Default tools: everything except subagent.
+	// Default tools: everything except subagent, built with the parent's
+	// effective shell.
 	tools := cfg.Tools
 	if tools == nil {
-		tools = SubagentTools()
+		tools = m.subagentDefaultTools()
 	}
 
 	// Decide whether the child should re-load MCP servers. When the caller
@@ -2554,7 +2760,13 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// programmatic Options or runtime setters (e.g. SetThinkingLevel) would
 	// otherwise be lost.
 	inheritProviderConfig(childOpts, m.v)
-
+	// The endpoint overrides belong to the parent's bound provider. A child
+	// on a different provider resolves its own endpoint and credentials.
+	if !m.endpointOverridesApply(model) {
+		childOpts.ProviderAPIKey = ""
+		childOpts.ProviderURL = ""
+		childOpts.ProviderWire = ""
+	}
 	// A per-subagent temperature (explicit or from a named agent definition)
 	// overrides whatever the parent's config store provided.
 	if cfg.Temperature != nil {
@@ -2568,7 +2780,12 @@ func (m *Kit) Subagent(ctx context.Context, cfg SubagentConfig) (*SubagentResult
 	// polling and no progress feedback even when the parent had configured
 	// custom values.
 	inheritMCPTaskOptions(childOpts, m.opts)
-
+	// Propagate context isolation. A bare parent must not spawn a child that
+	// re-discovers the working directory: the child would load AGENTS.md,
+	// skills and extensions the parent deliberately refused, reintroducing
+	// exactly the context (and the arbitrary extension code) bare mode exists
+	// to keep out.
+	inheritIsolationOptions(childOpts, m.opts)
 	child, err := New(ctx, childOpts)
 	if err != nil {
 		return &SubagentResult{Elapsed: time.Since(start)}, fmt.Errorf("failed to create subagent: %w", err)
@@ -2709,7 +2926,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 		OnToolCall: func(toolCallID, toolName, toolArgs string) {
 			m.events.emit(ToolCallEvent{
 				ToolCallID: toolCallID, ToolName: toolName, ToolKind: toolKindFor(toolName),
-				ToolArgs: toolArgs, ParsedArgs: parseToolArgs(toolArgs),
+				ToolArgs: toolArgs, ParsedArgs: extensions.ParseToolArgs(toolArgs),
 			})
 		},
 		OnToolExecution: func(toolCallID, toolName, toolArgs string, isStarting bool) {
@@ -2722,7 +2939,7 @@ func (m *Kit) generate(ctx context.Context, messages []fantasy.Message) (*agent.
 		OnToolResult: func(toolCallID, toolName, toolArgs, resultText, metadata string, isError bool) {
 			evt := ToolResultEvent{
 				ToolCallID: toolCallID, ToolName: toolName, ToolKind: toolKindFor(toolName),
-				ToolArgs: toolArgs, ParsedArgs: parseToolArgs(toolArgs),
+				ToolArgs: toolArgs, ParsedArgs: extensions.ParseToolArgs(toolArgs),
 				Result: resultText, IsError: isError,
 			}
 			if metadata != "" {
@@ -2965,7 +3182,8 @@ func (m *Kit) persistGenerationRemainder(result *agent.GenerateWithLoopResult, s
 // promptLabel is the human-readable label emitted in TurnStartEvent.Prompt.
 // prompt is the raw user text passed to BeforeTurn hooks.
 func (m *Kit) runTurn(ctx context.Context, promptLabel string, prompt string, preMessages []fantasy.Message) (*TurnResult, error) {
-	// Expand /skill:name commands.
+	// Expand /<skill-name> commands — reads the skill file, wraps it in a
+	// <skill_content> block, and appends any trailing user args.
 	if expanded := m.expandSkillCommand(prompt); expanded != prompt {
 		prompt = expanded
 		// Replace the last user message in preMessages with the expanded text.
@@ -3315,8 +3533,8 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 
 	var restores []func()
 	restore := func() {
-		for i := len(restores) - 1; i >= 0; i-- {
-			restores[i]()
+		for _, restore := range slices.Backward(restores) {
+			restore()
 		}
 		m.promptOptsMu.Unlock()
 	}
@@ -3339,6 +3557,7 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 		prevURL := m.v.GetString("provider-url")
 		prevKeySet := m.v.IsSet("provider-api-key")
 		prevKey := m.v.GetString("provider-api-key")
+		prevEndpointProvider := m.endpointProvider
 
 		if opts.ThinkingLevel != "" {
 			m.v.Set("thinking-level", opts.ThinkingLevel)
@@ -3354,9 +3573,14 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 		if targetModel == "" {
 			targetModel = prevModel
 		}
-
+		// A per-call endpoint override is for the model of this call, so bind
+		// it to that model's provider for the duration of the call.
+		if opts.ProviderURL != "" || opts.ProviderAPIKey != "" {
+			m.endpointProvider = endpointProviderFor(m.v, targetModel)
+		}
 		if err := m.SetModel(ctx, targetModel); err != nil {
 			// Revert config keys we may have set, then unwind prior restores.
+			m.endpointProvider = prevEndpointProvider
 			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
 			restoreViperString(m.v, "provider-url", prevURL, prevURLSet)
 			restoreViperString(m.v, "provider-api-key", prevKey, prevKeySet)
@@ -3365,6 +3589,7 @@ func (m *Kit) applyPromptOptions(ctx context.Context, opts PromptOptions) (func(
 		}
 
 		restores = append(restores, func() {
+			m.endpointProvider = prevEndpointProvider
 			restoreViperString(m.v, "thinking-level", prevThinking, prevThinkingSet)
 			restoreViperString(m.v, "provider-url", prevURL, prevURLSet)
 			restoreViperString(m.v, "provider-api-key", prevKey, prevKeySet)
@@ -3509,12 +3734,28 @@ func (m *Kit) GetThinkingLevel() string {
 //
 // With message-level caching, both thinking and caching work together.
 // Caching reduces costs by 60-90% for repeated context.
+//
+// A level the active model does not accept is replaced with the nearest
+// supported one rather than rejected. Check [Kit.SupportedThinkingLevels]
+// first when the exact level matters.
 func (m *Kit) SetThinkingLevel(ctx context.Context, level string) error {
 	m.v.Set("thinking-level", level)
 	// Recreate agent with new thinking config by re-running SetModel
 	// with the same model string. SetModel rebuilds the provider and
 	// passes the updated viper config (including thinking-level).
 	return m.SetModel(ctx, m.modelString)
+}
+
+// SupportedThinkingLevels returns the reasoning levels the currently selected
+// model accepts. See [SupportedThinkingLevels] for how the list is derived.
+//
+// Returns the full vocabulary when no model is selected yet.
+func (m *Kit) SupportedThinkingLevels() []string {
+	provider, modelName, err := ParseModelString(m.modelString)
+	if err != nil {
+		return ThinkingLevels()
+	}
+	return SupportedThinkingLevels(provider, modelName)
 }
 
 // GetTools returns all tools available to the agent (core + MCP + extensions).

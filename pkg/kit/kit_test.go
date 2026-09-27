@@ -604,6 +604,8 @@ exclude-core-tools:
 	})
 	t.Run("Test whether include-core-tools works", func(t *testing.T) {
 		cfgFile := t.TempDir() + "/.kit.yml"
+		// "bash" is the earlier name of the shell tool; the config keeps it
+		// deliberately as the compatibility input.
 		txt := []byte(`include-core-tools:
    - "subagent"
    - "deadbeef"
@@ -623,7 +625,7 @@ exclude-core-tools:
 		defer func() { _ = host.Close() }()
 		tools := host.GetToolNames()
 		for _, tool := range tools {
-			if tool != "bash" && tool != "subagent" {
+			if tool != "shell" && tool != "subagent" {
 				t.Errorf("include-core-tools expected to have only 'bash' and 'subagent' tools but have %s", tool)
 			}
 		}
@@ -649,7 +651,7 @@ exclude-core-tools:
 		defer func() { _ = host.Close() }()
 		var registeredTools []string
 		for _, tool := range kit.ListAllCoreToolNames() {
-			if tool != "bash" && tool != "subagent" {
+			if tool != "shell" && tool != "subagent" {
 				registeredTools = append(registeredTools, tool)
 			}
 		}
@@ -709,7 +711,7 @@ func TestGetToolsForSubagent(t *testing.T) {
 	if !hasTool("hello") {
 		t.Errorf("`GetToolsForSubagent()` is missing the `hello` tool")
 	}
-	if !hasTool("bash") {
-		t.Errorf("`GetToolsForSubagent()` is missing the `bash` tool")
+	if !hasTool("shell") {
+		t.Errorf("`GetToolsForSubagent()` is missing the `shell` tool")
 	}
 }

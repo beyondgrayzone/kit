@@ -237,8 +237,8 @@ func TestAnimatedWidgetsDetection(t *testing.T) {
 		t.Error("a widget with RefreshHz must hold the clock open")
 	}
 
-	footer := &AppModel{getFooter: func() *WidgetData {
-		return &WidgetData{Render: render, RefreshHz: 4}
+	footer := &AppModel{getFooters: func() []WidgetData {
+		return []WidgetData{{Render: render, RefreshHz: 4}}
 	}}
 	if !footer.animatedWidgets() {
 		t.Error("an animated footer must hold the clock open")

@@ -37,7 +37,7 @@ stream: true
 | `compact` | bool | `false` | Enable compact output mode |
 | `system-prompt` | string | — | System prompt text or file path |
 | `max-steps` | int | `0` | Maximum agent steps (0 = unlimited) |
-| `thinking-level` | string | `off` | Extended thinking: off, none, minimal, low, medium, high |
+| `thinking-level` | string | `off` | Extended thinking: off, none, minimal, low, medium, high. Levels a model does not accept are substituted with the nearest supported one at runtime. |
 | `provider-api-key` | string | — | API key for the provider |
 | `provider-url` | string | — | Base URL for provider API |
 | `provider-wire` | string | — | Wire protocol for auto-routed providers: `openai`, `openai-compat`, `anthropic`, `google` (see [Provider overrides](#provider-overrides)) |
@@ -52,7 +52,7 @@ stream: true
 | `no-agents` | bool | `false` | Disable named agent discovery ([built-ins and definition files](/advanced/subagents#named-agents)) |
 | `skill` | list | — | Explicit skill files or directories to load (disables auto-discovery) |
 | `skills-dir` | string | — | Scan this directory directly for skills (overrides auto-discovery; not treated as a parent of `.agents`/`.kit`) |
-| `skill-disable` | list | — | Skill names to hide from the model catalog (still usable via `/skill:`) |
+| `skill-disable` | list | — | Skill names to hide from the model catalog (still usable via `/<name>`) |
 
 ## Environment variables
 
@@ -126,6 +126,10 @@ mcpServers:
 | `tasksMode` | string | When to augment `tools/call` with MCP task metadata: `auto` (default — only when the server advertises task support), `never`, or `always`. See [MCP tasks](#mcp-tasks-long-running-tools). |
 
 A legacy format with `transport`, `args`, and `env` fields is also supported; `headers` works in both the current and legacy formats.
+
+For a one-off server without a config file, pass `--mcp 'name=command args...'`
+or `--mcp 'name=https://...'` on the command line. See
+[CLI flags](/cli/flags#one-off-mcp-servers).
 
 ### MCP tasks (long-running tools)
 

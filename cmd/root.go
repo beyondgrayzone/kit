@@ -5,23 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
-	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	charmlog "github.com/charmbracelet/log"
 	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/app"
 	"github.com/mark3labs/kit/internal/config"
+	"github.com/mark3labs/kit/internal/daemon"
 	"github.com/mark3labs/kit/internal/models"
-	"github.com/mark3labs/kit/internal/prompts"
 	"github.com/mark3labs/kit/internal/ui"
 	"github.com/mark3labs/kit/internal/ui/commands"
-	"github.com/mark3labs/kit/internal/ui/progress"
 	"github.com/mark3labs/kit/internal/ui/termgfx"
-	"github.com/mark3labs/kit/internal/watcher"
 	kit "github.com/mark3labs/kit/pkg/kit"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -39,15 +38,12 @@ var (
 	positionalPrompt string        // set by processPositionalArgs from CLI positional args
 	positionalFiles  []ui.FilePart // binary @file parts from processPositionalArgs
 
-	// MCP resource callbacks, set in runNormalMode, consumed by runInteractiveModeBubbleTea.
-	mcpGetResources   func() []ui.FileSuggestion
-	mcpResourceReader ui.MCPResourceReader
-	quietFlag         bool
-	jsonFlag          bool
-	noExitFlag        bool
-	maxSteps          int
-	streamFlag        bool // Enable streaming output
-	autoCompactFlag   bool // Enable auto-compaction near context limit
+	quietFlag       bool
+	jsonFlag        bool
+	noExitFlag      bool
+	maxSteps        int
+	streamFlag      bool // Enable streaming output
+	autoCompactFlag bool // Enable auto-compaction near context limit
 
 	// Session management
 	sessionPath string
@@ -77,6 +73,10 @@ var (
 	includeCoreToolsFlag []string
 	excludeCoreToolsFlag []string
 	extensionPaths       []string
+	mcpFlags             []string
+
+	// Shell tool
+	shellFlag string
 
 	// Skills control
 	noSkillsFlag  bool
@@ -87,12 +87,19 @@ var (
 	// Named agents control
 	noAgentsFlag bool
 
+	// Bare mode — no automatic context discovery from any directory.
+	bareFlag bool
+
 	// TLS configuration
 	tlsSkipVerify bool
 
 	// Prompt templates
 	promptTemplatePaths []string
 	noPromptTemplates   bool
+
+	// The daemon's directory picker
+	// (--pick-dir, hidden — spawned by `kit daemon`).
+	pickDirFlag bool
 
 	// Preference restoration flags — set in RunE after cobra parses, used
 	// in runNormalMode to decide whether to apply saved preferences.
@@ -157,6 +164,13 @@ var rootCmd = &cobra.Command{
 		if f := cmd.PersistentFlags().Lookup("thinking-level"); f != nil {
 			thinkingFlagChanged = f.Changed
 		}
+		// An empty --shell is a mistake rather than a request for the default:
+		// the user asked for a shell and named none. Refusing here keeps the
+		// failure at startup instead of on the first tool call.
+		if f := cmd.PersistentFlags().Lookup("shell"); f != nil && f.Changed &&
+			strings.TrimSpace(f.Value.String()) == "" {
+			return fmt.Errorf(`--shell needs a shell, e.g. --shell /bin/dash or --shell "busybox ash"`)
+		}
 		return runKit(context.Background())
 	},
 }
@@ -174,13 +188,58 @@ func GetRootCommand(v string) *cobra.Command {
 // InitConfig, injecting the CLI-specific configFile flag and debug mode.
 // This function is automatically called by cobra before command execution.
 func InitConfig() {
-	if err := kit.InitConfig(configFile, debugMode); err != nil {
+	// Remote client flows never read local configuration: a broken local
+	// config must not block attaching to a daemon, and the client performs
+	// no local-session work that could consume it.
+	if remoteSubcommandSelected(os.Args[1:]) {
+		return
+	}
+	if err := kit.InitConfigWithOptions(kit.ConfigInitOptions{
+		ConfigFile: configFile,
+		Debug:      debugMode,
+		Bare:       bareFlag,
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 	// Rebuild the model registry now that viper has the config loaded,
 	// so customModels defined in the config file are picked up.
 	models.ReloadGlobalRegistry()
+}
+
+// remoteSubcommandSelected reports whether the invoked command line
+// selects the `kit remote` subcommand. Flag-aware: global flags (with or
+// without values) before the subcommand are skipped, so
+// `kit --config x remote --list` is recognized just like `kit remote`.
+func remoteSubcommandSelected(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "remote" {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") {
+			// Flags that take a value consume the next token unless the
+			// value is attached with '='.
+			if !strings.Contains(arg, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				isBoolean := slices.Contains(globalBoolFlags, strings.TrimLeft(arg, "-"))
+				if !isBoolean {
+					i++
+				}
+			}
+		}
+	}
+	return false
+}
+
+// globalBoolFlags lists root persistent flags that do not take a value
+// (long and short forms); used by remoteSubcommandSelected to walk the
+// argv correctly. Shorthands with values (-m, -s, -e) must NOT appear here.
+var globalBoolFlags = []string{
+	"bare", "debug", "quiet", "json", "no-exit", "no-session",
+	"continue", "resume", "auto-compact", "compact", "stream",
+	"no-extensions", "no-prompt-templates", "no-skills", "no-agents",
+	"no-core-tools", "tls-skip-verify", "pick-dir", "version",
+	"c", "r", // -c (continue), -r (resume)
 }
 
 // adaptiveOrDefault converts a config.AdaptiveColor to a resolved color.Color,
@@ -238,16 +297,37 @@ func configToUiTheme(cfg config.Theme) ui.Theme {
 	}
 }
 
-// kitBanner returns the KIT ASCII art title with KITT scanner lights.
-// Delegates to ui.KitBanner() which owns the logo rendering.
-func kitBanner() string {
-	return ui.KitBanner()
+// adoptSessionTerminalCapabilities takes the terminal background from the
+// environment the daemon prepared for a session's child.
+//
+// A session child's stdin and stdout are a PTY. A PTY answers no OSC
+// query, so probing it costs two timeouts and then reports the default,
+// and every adaptive colour in the UI is chosen from that default rather
+// than from the terminal the user is looking at. The client resolved the
+// real value before it handed its terminal over; this adopts it.
+//
+// Colour depth still comes from the environment, because the daemon has
+// already replaced TERM and COLORTERM there with the client's own.
+func adoptSessionTerminalCapabilities() {
+	bg := os.Getenv(daemon.RemoteBackgroundEnv)
+	if bg == "" {
+		return
+	}
+	ui.SetTerminalCapabilities(daemon.BackgroundIsDark(bg), colorprofile.Env(os.Environ()))
 }
 
 func init() {
+	// Registered before InitConfig: remote attachment and directory
+	// selection must not depend on (or race) local configuration loading.
+	cobra.OnInitialize(preInitDispatch)
 	cobra.OnInitialize(InitConfig)
 
-	rootCmd.Long = kitBanner() + "\n\n" + rootCmd.Long
+	// Before any theme is resolved: inside a daemon session the terminal
+	// belongs to the client, not to this process, so its capabilities come
+	// from what the daemon was told rather than from a probe of the PTY on
+	// our own fds. Resolving a theme is what triggers that probe, so this
+	// has to come first.
+	adoptSessionTerminalCapabilities()
 
 	var theme config.Theme
 	err := config.FilepathOr("theme", &theme)
@@ -292,14 +372,27 @@ func init() {
 		BoolVar(&noSessionFlag, "no-session", false, "ephemeral mode — no session persistence")
 	rootCmd.PersistentFlags().
 		BoolVar(&noExtensionsFlag, "no-extensions", false, "disable all extensions")
+	// --bare is deliberately NOT bound to viper. Every other flag can be set
+	// from a config file, but this one exists to ignore project config, so
+	// letting a project .kit.yml set it would be self-defeating.
 	rootCmd.PersistentFlags().
-		BoolVar(&noCoreToolsFlag, "no-core-tools", false, "disable all built-in core tools (bash, read, write, edit, grep, find, ls, subagent)")
+		BoolVar(&bareFlag, "bare", false, "no project context: skip AGENTS.md, skills, extensions, agents, prompt templates and project .kit.yml")
+	rootCmd.PersistentFlags().
+		BoolVar(&noCoreToolsFlag, "no-core-tools", false, "disable all built-in core tools (shell, read, write, edit, grep, find, ls, subagent)")
 	rootCmd.PersistentFlags().
 		StringSliceVar(&includeCoreToolsFlag, "include-core-tools", nil, "comma-separated list of core tools to include")
 	rootCmd.PersistentFlags().
 		StringSliceVar(&excludeCoreToolsFlag, "exclude-core-tools", nil, "comma-separated list of core tools to exclude")
+	// The shell tool runs one command string through this shell. The value is
+	// the shell plus its own leading arguments. Empty leaves the built-in
+	// default, which is bash.
+	rootCmd.PersistentFlags().
+		StringVar(&shellFlag, "shell", "", `shell the shell tool runs commands through, e.g. "/bin/dash" or "busybox ash" (default "bash")`)
 	rootCmd.PersistentFlags().
 		StringSliceVarP(&extensionPaths, "extension", "e", nil, "load additional extension file(s)")
+	// StringArray (not StringSlice) so a command line with commas stays one value.
+	rootCmd.PersistentFlags().
+		StringArrayVar(&mcpFlags, "mcp", nil, `add an MCP server for this run (repeatable): "name=command args..." for stdio or "name=https://..." for remote`)
 
 	// Skills flags
 	rootCmd.PersistentFlags().
@@ -311,7 +404,9 @@ func init() {
 	rootCmd.PersistentFlags().
 		StringVar(&skillsDir, "skills-dir", "", "scan this directory directly for skills (overrides auto-discovery)")
 	rootCmd.PersistentFlags().
-		StringSliceVar(&skillsDisable, "skill-disable", nil, "hide a skill from the model catalog by name (repeatable); still usable via /skill:")
+		StringSliceVar(&skillsDisable, "skill-disable", nil, "hide a skill from the model catalog by name (repeatable); still usable via /<name>")
+	rootCmd.Flags().
+		BoolVar(&pickDirFlag, "pick-dir", false, "choose a working directory with a picker before starting")
 
 	flags := rootCmd.PersistentFlags()
 	flags.StringVar(&providerURL, "provider-url", "", "base URL for the provider API (applies to OpenAI, Anthropic, Ollama, and Google)")
@@ -365,6 +460,7 @@ func init() {
 	_ = viper.BindPFlag("no-core-tools", rootCmd.PersistentFlags().Lookup("no-core-tools"))
 	_ = viper.BindPFlag("include-core-tools", rootCmd.PersistentFlags().Lookup("include-core-tools"))
 	_ = viper.BindPFlag("exclude-core-tools", rootCmd.PersistentFlags().Lookup("exclude-core-tools"))
+	_ = viper.BindPFlag("shell", rootCmd.PersistentFlags().Lookup("shell"))
 	_ = viper.BindPFlag("extension", rootCmd.PersistentFlags().Lookup("extension"))
 	_ = viper.BindPFlag("prompt-template", rootCmd.PersistentFlags().Lookup("prompt-template"))
 	_ = viper.BindPFlag("no-prompt-templates", rootCmd.PersistentFlags().Lookup("no-prompt-templates"))
@@ -439,6 +535,34 @@ func processPositionalArgs(args []string) {
 			positionalPrompt = strings.TrimSpace(fileContent.String()) + "\n\n" + positionalPrompt
 		}
 	}
+}
+
+// preInitDispatch handles the directory-picker entry point before any
+// configuration is loaded, so project-level configuration discovery
+// (.kit.* in the chosen directory) resolves against the chosen directory
+// instead of whatever directory kit happened to start in. The dispatcher
+// exits the process directly on cancellation or failure.
+func preInitDispatch() {
+	if !pickDirFlag {
+		return
+	}
+	home, _ := os.UserHomeDir()
+	chosen, err := ui.RunDirPicker(home)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if chosen == "" {
+		os.Exit(0) // cancelled
+	}
+	if err := os.Chdir(chosen); err != nil {
+		fmt.Fprintf(os.Stderr, "change to %s: %v\n", chosen, err)
+		os.Exit(1)
+	}
+	// Tell the hosting daemon (if any) which directory this session
+	// settled on, so it appears in the session list. A no-op when kit was
+	// not spawned by a daemon.
+	daemon.ReportSessionCwd(chosen)
 }
 
 func runKit(ctx context.Context) error {
@@ -548,35 +672,24 @@ func headerFooterProviderForUI(k *kit.Kit, getter func() []extensions.HeaderFoot
 			return nil
 		}
 		widgets := make([]ui.WidgetData, len(configs))
-		for i, c := range configs {
+		for i, cfg := range configs {
 			widgets[i] = ui.WidgetData{
-				Text:        c.Content.Text,
-				Markdown:    c.Content.Markdown,
-				Render:      c.Content.Render,
-				RefreshHz:   c.Content.RefreshHz,
-				BorderColor: c.Style.BorderColor,
-				NoBorder:    c.Style.NoBorder,
+				Text:        cfg.Content.Text,
+				Markdown:    cfg.Content.Markdown,
+				Render:      cfg.Content.Render,
+				RefreshHz:   cfg.Content.RefreshHz,
+				BorderColor: cfg.Style.BorderColor,
+				NoBorder:    cfg.Style.NoBorder,
 			}
 		}
 		return widgets
 	}
 }
 
-// headersProviderForUI returns a function that converts the extension header
-// to a []ui.WidgetData for the TUI. Returns nil if extensions are disabled,
-// which is safe — the UI treats a nil GetHeader as "no header".
+// headersProviderForUI converts extension headers to UI widgets.
 func headersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
 	return headerFooterProviderForUI(k, func() []extensions.HeaderFooterConfig {
 		return k.Extensions().GetHeaders()
-	})
-}
-
-// footersProviderForUI returns a function that converts the extension footer
-// to a []ui.WidgetData for the TUI. Returns nil if extensions are disabled,
-// which is safe — the UI treats a nil GetFooter as "no footer".
-func footersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
-	return headerFooterProviderForUI(k, func() []extensions.HeaderFooterConfig {
-		return k.Extensions().GetFooters()
 	})
 }
 
@@ -662,6 +775,13 @@ func uiVisibilityProviderForUI(k *kit.Kit) func() *ui.UIVisibility {
 			HideInputHint:      v.HideInputHint,
 		}
 	}
+}
+
+// footersProviderForUI converts extension footers to UI widgets.
+func footersProviderForUI(k *kit.Kit) func() []ui.WidgetData {
+	return headerFooterProviderForUI(k, func() []extensions.HeaderFooterConfig {
+		return k.Extensions().GetFooters()
+	})
 }
 
 // statusBarProviderForUI returns a function that fetches extension status bar
@@ -751,15 +871,24 @@ func shortcutListProviderForUI(k *kit.Kit) func() []ui.ShortcutInfo {
 	}
 }
 
-// rawInputProviderForUI returns a callback that emits a RawInput event
-// to extensions. Returns nil if extensions are disabled.
-func rawInputProviderForUI(k *kit.Kit) func(rawText string, source string) {
+// rawInputProviderForUI emits raw input to enabled extensions.
+func rawInputProviderForUI(k *kit.Kit) func(string, string) {
 	if !k.Extensions().HasExtensions() {
 		return nil
 	}
-	return func(rawText string, source string) {
+	return func(rawText, source string) {
 		k.Extensions().EmitRawInput(rawText, source)
 	}
+}
+
+// suppressChrome reports whether all decorative output (startup banners,
+// spinners, warnings, extension prints) must stay off stdout.
+//
+// --quiet prints only the final response; --json prints only the JSON
+// envelope. Both modes are consumed by pipes and scripts, so any extra
+// stdout byte breaks the caller (e.g. `kit "..." --json | jq`).
+func suppressChrome() bool {
+	return quietFlag || jsonFlag
 }
 
 // validateModeFlags rejects invalid flag combinations for the root command.
@@ -861,173 +990,50 @@ func runNormalMode(ctx context.Context) error {
 		return err
 	}
 
-	// Set up logging
-	if debugMode {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	// Update debug mode from viper
-	if viper.GetBool("debug") && !debugMode {
-		debugMode = viper.GetBool("debug")
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
+	configureDebugLogging()
 	restorePersistedPreferences()
 	applyProviderURLRouting()
 
-	// Load MCP configuration.
 	mcpConfig, err := config.LoadAndValidateConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load MCP config: %v", err)
 	}
+	if err := applyMCPFlags(mcpConfig, mcpFlags); err != nil {
+		return err
+	}
 
-	// Create spinner function for agent creation.
-	var spinnerFunc kit.SpinnerFunc
-	if !quietFlag {
-		spinnerFunc = func(fn func() error) error {
-			tempCli, tempErr := ui.NewCLI(viper.GetBool("debug"))
-			if tempErr == nil {
-				return tempCli.ShowSpinner(fn)
-			}
-			return fn()
+	// appInstancePtr is used to break the circular dependency between
+	// kit.New (which needs the OnMCPServerLoaded callback) and app.New
+	// (which is needed by the callback to send events to the TUI). The
+	// closure captures the variable; it is assigned after app.New below.
+	var appInstancePtr *app.App
+	cliAuthHandler := newCLIMCPAuthHandler()
+	kitOpts, err := buildKitOptions(mcpConfig, cliAuthHandler, func(serverName string, toolCount int, err error) {
+		if appInstancePtr != nil {
+			appInstancePtr.NotifyMCPServerLoaded(serverName, toolCount, err)
 		}
-	}
-
-	// Build Kit options from CLI flags and create the SDK instance.
-	// kit.New() handles: config → skills → agent → session → extension bridge.
-	// Note: NewCLIMCPAuthHandler binds a TCP listener on localhost. In sandbox
-	// VMs where `localhost` is not in /etc/hosts this can fail. We treat that
-	// as non-fatal (OAuth simply isn't available for remote MCP servers) and
-	// must funnel the failure through a true nil interface — assigning a typed
-	// nil *CLIMCPAuthHandler into Options.MCPAuthHandler (an interface) would
-	// produce a non-nil interface wrapping a nil pointer, which panics on the
-	// first method dispatch downstream.
-	var authHandler kit.MCPAuthHandler
-	cliAuthHandler, authErr := kit.NewCLIMCPAuthHandler()
-	if authErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to create OAuth handler: %v\n", authErr)
-		cliAuthHandler = nil
-	} else {
-		authHandler = cliAuthHandler
-	}
-
-	coreToolList, err := kit.CoreToolFilterHelper(viper.GetViper())
+	})
 	if err != nil {
 		return err
 	}
-	// appInstancePtr is used to break the circular dependency between
-	// kit.New (which needs the OnMCPServerLoaded callback) and app.New
-	// (which is needed by the callback to send events to the TUI).
-	var appInstancePtr *app.App
 
-	kitOpts := &kit.Options{
-		Quiet:            quietFlag,
-		Debug:            debugMode,
-		NoSession:        viper.GetBool("no-session"),
-		Continue:         continueFlag,
-		SessionPath:      sessionPath,
-		AutoCompact:      autoCompactFlag,
-		MCPAuthHandler:   authHandler,
-		DisableCoreTools: viper.GetBool("no-core-tools"),
-		CoreToolList:     coreToolList,
-		NoSkills:         noSkillsFlag,
-		NoAgents:         noAgentsFlag,
-		Skills:           skillsPaths,
-		SkillsDir:        skillsDir,
-		SkillsDisable:    skillsDisable,
-		SkillTrustPrompt: skillTrustPrompt(),
-		// This callback is called when each MCP server finishes loading.
-		// We use a closure that captures appInstancePtr which is set after
-		// app.New() is called below.
-		OnMCPServerLoaded: func(serverName string, toolCount int, err error) {
-			if appInstancePtr != nil {
-				appInstancePtr.NotifyMCPServerLoaded(serverName, toolCount, err)
-			}
-		},
-		CLI: &kit.CLIOptions{
-			MCPConfig:          mcpConfig,
-			ShowSpinner:        true,
-			SpinnerFunc:        spinnerFunc,
-			UseBufferedLogger:  true,
-			ProgressReaderFunc: progress.NewProgressReadCloser,
-		},
-	}
-	if resumeFlag {
-		// When --resume is combined with interactive mode, the TUI session
-		// picker will be shown at startup. For non-interactive mode, fall
-		// back to auto-selecting the most recent session.
-		if positionalPrompt != "" {
-			sessions, _ := kit.ListSessions("")
-			if len(sessions) > 0 {
-				kitOpts.SessionPath = sessions[0].Path
-			}
-		}
-		// Interactive mode: ShowSessionPicker is set below on AppModelOptions.
-	}
-
+	// kit.New() handles: config → skills → agent → session → extension bridge.
 	kitInstance, err := kit.New(ctx, kitOpts)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = kitInstance.Close() }()
 
-	// Build the "System Prompt loaded" notice shown at startup, paralleling the
-	// per-server "MCP server loaded" notifications so users can confirm that a
-	// configured prompt file was found and applied.
-	var systemPromptLoadedMsg string
-	if kitInstance.HasCustomSystemPrompt() {
-		if src := kitInstance.GetSystemPromptSource(); src != "" {
-			systemPromptLoadedMsg = "System Prompt loaded: " + src
-		}
-	}
-
-	// Extract metadata for display and app options.
+	interactive := positionalPrompt == ""
+	systemPromptLoadedMsg := systemPromptLoadedNotice(kitInstance)
 	parsedProvider, modelName, serverNames, toolNames, mcpToolCount, extensionToolCount := CollectAgentMetadata(kitInstance, mcpConfig)
 
-	// Create CLI for non-interactive mode only.
-	var cli *ui.CLI
-	if positionalPrompt != "" {
-		cli, err = SetupCLIForNonInteractive(kitInstance)
-		if err != nil {
-			return fmt.Errorf("failed to setup CLI: %v", err)
-		}
-
-		// Display buffered debug messages if any (non-interactive path only).
-		if msgs := kitInstance.GetBufferedDebugMessages(); len(msgs) > 0 && cli != nil {
-			cli.DisplayDebugMessage(strings.Join(msgs, "\n  "))
-		}
-
-		DisplayDebugConfig(cli, kitInstance, mcpConfig, parsedProvider)
-		if systemPromptLoadedMsg != "" && cli != nil {
-			cli.DisplayInfo(systemPromptLoadedMsg)
-		}
+	cli, err := setupNonInteractiveCLI(kitInstance, mcpConfig, parsedProvider, systemPromptLoadedMsg)
+	if err != nil {
+		return err
 	}
 
-	// Load existing messages from resumed/continued sessions.
-	treeSession := kitInstance.GetTreeSession()
-	var messages []kit.LLMMessage
-	if treeSession != nil {
-		messages = treeSession.GetLLMMessages()
-	}
-
-	// Create the app.App instance.
-	appOpts := BuildAppOptions(mcpConfig, modelName, serverNames, toolNames)
-	appOpts.Kit = kitInstance
-	appOpts.TreeSession = treeSession
-
-	// Create a usage tracker that is shared between the app layer (for recording
-	// usage after each step) and the TUI (for /usage display).
-	var usageTracker *ui.UsageTracker
-	if cli != nil {
-		usageTracker = cli.GetUsageTracker()
-	} else {
-		usageTracker = ui.CreateUsageTracker(viper.GetString("model"), viper.GetString("provider-api-key"))
-	}
-	if usageTracker != nil {
-		appOpts.UsageTracker = usageTracker
-	}
-
-	appInstance := app.New(appOpts, messages)
+	appInstance, usageTracker := newRunApp(kitInstance, cli, mcpConfig, modelName, serverNames, toolNames)
 	appInstancePtr = appInstance // Wire up the MCP server loaded callback.
 	defer appInstance.Close()
 
@@ -1038,259 +1044,10 @@ func runNormalMode(ctx context.Context) error {
 		}
 	}
 
-	// Buffer for extension messages during startup (printed after startup banner).
-	var startupExtensionMessages []string
-	if systemPromptLoadedMsg != "" {
-		startupExtensionMessages = append(startupExtensionMessages, systemPromptLoadedMsg)
-	}
+	startupExtensionMessages := startExtensionSession(ctx, kitInstance, appInstance, usageTracker, modelName, interactive, systemPromptLoadedMsg)
 
-	// Set up extension context and emit SessionStart.
-	if kitInstance.Extensions().HasExtensions() {
-		cwd, _ := os.Getwd()
-		// Seed the size before SessionStart so handlers can lay out during
-		// startup, ahead of the TUI's first WindowSizeMsg. Only in the
-		// interactive TUI: headless runs have no chrome to size, and
-		// terminalSize()'s 80x24 fallback would contradict the documented
-		// (0, 0) that GetTerminalSize reports outside the TUI.
-		if positionalPrompt == "" {
-			kitInstance.Extensions().SetTerminalSize(terminalSize())
-		}
-		extCtx := buildInteractiveExtensionContext(extensionContextDeps{
-			ctx:          ctx,
-			cwd:          cwd,
-			modelName:    modelName,
-			interactive:  positionalPrompt == "",
-			kitInstance:  kitInstance,
-			appInstance:  appInstance,
-			usageTracker: usageTracker,
-		})
-
-		// During startup, buffer extension messages so they appear after the banner.
-		extCtx.Print = func(text string) {
-			startupExtensionMessages = append(startupExtensionMessages, text)
-		}
-		extCtx.PrintInfo = func(text string) {
-			startupExtensionMessages = append(startupExtensionMessages, text)
-		}
-		extCtx.PrintError = func(text string) {
-			startupExtensionMessages = append(startupExtensionMessages, text)
-		}
-		kitInstance.Extensions().SetContext(extCtx)
-		if err := kitInstance.Extensions().InitStatePersistence(); err != nil {
-			log.Printf("WARN extension state init failed: %v", err)
-		}
-		kitInstance.Extensions().EmitSessionStart()
-
-		// Restore normal print functions for runtime use.
-		extCtx.Print = func(text string) { appInstance.PrintFromExtension("", text) }
-		extCtx.PrintInfo = func(text string) { appInstance.PrintFromExtension("info", text) }
-		extCtx.PrintError = func(text string) { appInstance.PrintFromExtension("error", text) }
-		kitInstance.Extensions().SetContext(extCtx)
-	}
-
-	// Convert extension commands to UI-layer type for the interactive TUI.
-	extCommands := extensionCommandsForUI(kitInstance)
-
-	// Load prompt templates from standard locations and explicit paths.
-	var promptTemplates []*prompts.PromptTemplate
-	if !noPromptTemplates {
-		homeDir, _ := os.UserHomeDir()
-		cwd, _ := os.Getwd()
-		tpls, diags, err := prompts.LoadAll(prompts.LoadOptions{
-			Cwd:             cwd,
-			HomeDir:         homeDir,
-			ExtraPaths:      promptTemplatePaths,
-			ConfigPaths:     viper.GetStringSlice("prompts"),
-			IncludeDefaults: true,
-		})
-		if err != nil {
-			log.Printf("Warning: failed to load some prompt templates: %v", err)
-		}
-		promptTemplates = tpls
-		for _, d := range diags {
-			log.Printf("Prompt template collision: /%s kept from %s, dropped from %s", d.Name, d.KeptPath, d.DroppedPath)
-		}
-	}
-
-	// Build context/skills display metadata for the startup banner.
-	var contextPaths []string
-	for _, cf := range kitInstance.GetContextFiles() {
-		contextPaths = append(contextPaths, cf.Path)
-	}
-	cwd, _ := os.Getwd()
-	var skillItems []ui.SkillItem
-	for _, s := range kitInstance.GetSkills() {
-		source := "user"
-		if strings.HasPrefix(s.Path, cwd) {
-			source = "project"
-		}
-		skillItems = append(skillItems, ui.SkillItem{
-			Name:        s.Name,
-			Path:        s.Path,
-			Source:      source,
-			Description: s.Description,
-		})
-	}
-
-	// Build extension items from the loaded extensions for the [Extensions]
-	// startup section. Each entry is a single .go file (or a subdir's main.go).
-	extensionItems := buildExtensionItems(kitInstance, cwd)
-
-	// Build prompt template and skill item provider callbacks for hot-reload.
-	// These are called by the TUI when ContentReloadEvent fires.
-	getPromptTemplates := func() []*prompts.PromptTemplate {
-		if noPromptTemplates {
-			return nil
-		}
-		homeDir, _ := os.UserHomeDir()
-		cwd, _ := os.Getwd()
-		tpls, _, err := prompts.LoadAll(prompts.LoadOptions{
-			Cwd:             cwd,
-			HomeDir:         homeDir,
-			ExtraPaths:      promptTemplatePaths,
-			ConfigPaths:     viper.GetStringSlice("prompts"),
-			IncludeDefaults: true,
-		})
-		if err != nil {
-			log.Printf("Warning: failed to reload prompt templates: %v", err)
-		}
-		return tpls
-	}
-
-	getSkillItems := func() []ui.SkillItem {
-		// Re-discover skills from disk.
-		if err := kitInstance.ReloadSkills(); err != nil {
-			log.Printf("Warning: failed to reload skills: %v", err)
-			return nil
-		}
-		cwd, _ := os.Getwd()
-		var items []ui.SkillItem
-		for _, s := range kitInstance.GetSkills() {
-			source := "user"
-			if strings.HasPrefix(s.Path, cwd) {
-				source = "project"
-			}
-			items = append(items, ui.SkillItem{
-				Name:        s.Name,
-				Path:        s.Path,
-				Source:      source,
-				Description: s.Description,
-			})
-		}
-		return items
-	}
-
-	// getExtensionItems re-collects the loaded extension list, used by the
-	// TUI after an extension hot-reload to refresh the [Extensions] row.
-	getExtensionItems := func() []ui.ExtensionItem {
-		cwd, _ := os.Getwd()
-		return buildExtensionItems(kitInstance, cwd)
-	}
-
-	// Build extension UI providers once (shared between both modes).
-	getWidgets := widgetProviderForUI(kitInstance)
-	getHeaders := headersProviderForUI(kitInstance)
-	getFooters := footersProviderForUI(kitInstance)
-	getToolRenderer := toolRendererProviderForUI(kitInstance)
-	getEditorInterceptor := editorInterceptorProviderForUI(kitInstance)
-	getUIVisibility := uiVisibilityProviderForUI(kitInstance)
-	getStatusBarEntries := statusBarProviderForUI(kitInstance)
-	emitBeforeFork := beforeForkProviderForUI(kitInstance)
-	emitBeforeSessionSwitch := beforeSessionSwitchProviderForUI(kitInstance)
-	emitRawInput := rawInputProviderForUI(kitInstance)
-	getGlobalShortcuts := globalShortcutsProviderForUI(kitInstance)
-	getShortcutList := shortcutListProviderForUI(kitInstance)
-	getExtensionCommands := func() []commands.ExtensionCommand {
-		return extensionCommandsForUI(kitInstance)
-	}
-
-	// Build dynamic tool name and MCP tool count providers. These are called
-	// by the TUI when MCPToolsReadyEvent fires to refresh the /tools list
-	// and startup info bar after background MCP tool loading completes.
-	getToolNames := func() []string {
-		return kitInstance.GetToolNames()
-	}
-	getMCPToolCount := func() int {
-		return kitInstance.GetMCPToolCount()
-	}
-
-	// Build MCP prompt provider callbacks for the TUI.
-	// Convert kit.MCPPrompt → ui.MCPPromptInfo for the UI layer.
-	convertMCPPromptsForUI := func() []ui.MCPPromptInfo {
-		prompts := kitInstance.ListMCPPrompts()
-		if len(prompts) == 0 {
-			return nil
-		}
-		result := make([]ui.MCPPromptInfo, len(prompts))
-		for i, p := range prompts {
-			args := make([]ui.MCPPromptArgInfo, len(p.Arguments))
-			for j, a := range p.Arguments {
-				args[j] = ui.MCPPromptArgInfo{
-					Name:        a.Name,
-					Description: a.Description,
-					Required:    a.Required,
-				}
-			}
-			result[i] = ui.MCPPromptInfo{
-				Name:        p.Name,
-				Description: p.Description,
-				Arguments:   args,
-				ServerName:  p.ServerName,
-			}
-		}
-		return result
-	}
-	mcpPrompts := convertMCPPromptsForUI()
-	getMCPPrompts := func() []ui.MCPPromptInfo {
-		return convertMCPPromptsForUI()
-	}
-	expandMCPPrompt := func(serverName, promptName string, args map[string]string) (*ui.MCPPromptExpandResult, error) {
-		result, err := kitInstance.GetMCPPrompt(context.Background(), serverName, promptName, args)
-		if err != nil {
-			return nil, err
-		}
-		msgs := make([]ui.MCPPromptMessageInfo, len(result.Messages))
-		for i, m := range result.Messages {
-			msgs[i] = ui.MCPPromptMessageInfo{
-				Role:      m.Role,
-				Content:   m.Content,
-				FileParts: m.FileParts,
-			}
-		}
-		return &ui.MCPPromptExpandResult{Messages: msgs}, nil
-	}
-
-	// MCP resource callbacks for @ autocomplete and submit-time resolution.
-	getMCPResources := func() []ui.FileSuggestion {
-		resources := kitInstance.ListMCPResources()
-		suggestions := make([]ui.FileSuggestion, len(resources))
-		for i, r := range resources {
-			suggestions[i] = ui.FileSuggestion{
-				RelPath:        r.Name,
-				IsMCPResource:  true,
-				MCPServerName:  r.ServerName,
-				MCPResourceURI: r.URI,
-				MCPMIMEType:    r.MIMEType,
-				Score:          100, // default score, filtered later
-			}
-		}
-		return suggestions
-	}
-	mcpResourceReaderFn := func(serverName, uri string) (string, []byte, string, bool, error) {
-		content, err := kitInstance.ReadMCPResource(context.Background(), serverName, uri)
-		if err != nil {
-			return "", nil, "", false, err
-		}
-		return content.Text, content.BlobData, content.MIMEType, content.IsBlob, nil
-	}
-
-	// Store MCP resource callbacks at package level for consumption by
-	// runInteractiveModeBubbleTea and runNonInteractiveModeApp.
-	mcpGetResources = getMCPResources
-	mcpResourceReader = mcpResourceReaderFn
-
-	// Start a goroutine that waits for background MCP tool loading to
-	// complete and notifies the TUI so it can refresh tool names and counts.
+	// Wait for background MCP tool loading to complete and notify the TUI so
+	// it can refresh tool names and counts.
 	if len(mcpConfig.MCPServers) > 0 {
 		go func() {
 			_ = kitInstance.WaitForMCPTools()
@@ -1298,188 +1055,41 @@ func runNormalMode(ctx context.Context) error {
 		}()
 	}
 
-	// Build model switching callbacks for the /model command.
-	setModelForUI := func(modelString string) error {
-		err := kitInstance.SetModel(context.Background(), modelString)
-		if err != nil {
-			return err
-		}
-		// Update the extension context's Model field so handlers see it.
-		kitInstance.Extensions().UpdateContextModel(modelString)
-		// NOTE: We do NOT call appInstance.NotifyModelChanged() here because
-		// this callback runs synchronously inside BubbleTea's Update(), and
-		// NotifyModelChanged calls prog.Send() which deadlocks. The UI layer
-		// updates m.providerName and m.modelName directly after setModel returns.
-		// Update usage tracker with new model info for correct token counting.
-		ui.UpdateUsageTrackerForModel(usageTracker, modelString, viper.GetString("provider-api-key"))
-		return nil
-	}
-	emitModelChangeForUI := func(newModel, previousModel, source string) {
-		kitInstance.Extensions().EmitModelChange(newModel, previousModel, source)
-	}
-	emitThinkingLevelChangeForUI := func(newLevel, previousLevel, source string) {
-		kitInstance.Extensions().EmitThinkingLevelChange(newLevel, previousLevel, source)
-	}
-	emitTerminalResizeForUI := func(width, height int) {
-		// Record the size first so a handler calling ctx.GetTerminalSize
-		// during this event sees the new value rather than the old one.
-		kitInstance.Extensions().SetTerminalSize(width, height)
-		kitInstance.Extensions().EmitTerminalResize(width, height)
-	}
-	emitTurnStateChangeForUI := func(state, previous string) {
-		kitInstance.Extensions().EmitTurnStateChange(state, previous)
-	}
-
-	// Build thinking level callback.
-	setThinkingLevelForUI := func(level string) error {
-		return kitInstance.SetThinkingLevel(context.Background(), level)
-	}
-
-	// Build session-switching callback. Opens a JSONL session file and
-	// replaces the active tree session on both the Kit SDK and App layer.
-	switchSessionForUI := func(path string) error {
-		ts, err := kit.OpenTreeSession(path)
-		if err != nil {
-			return fmt.Errorf("failed to open session: %w", err)
-		}
-		kitInstance.SetTreeSession(ts)
-		appInstance.SwitchTreeSession(ts)
-		return nil
-	}
-
-	// Build extension reload callback for the /reload-ext command.
-	reloadExtensionsForUI := func() error {
-		err := kitInstance.Extensions().Reload()
-		if err != nil {
-			return err
-		}
-		go appInstance.NotifyWidgetUpdate()
-		// Emit custom event so extensions can react to reload
-		kitInstance.Extensions().EmitCustomEvent("reload", "extensions reloaded via UI")
-		return nil
-	}
-
-	// Start file watcher for automatic extension hot-reload.
-	extraPaths := viper.GetStringSlice("extension")
-	watchDirs := extensions.WatchedDirs(extraPaths)
-	if len(watchDirs) > 0 {
-		extWatcher, watchErr := extensions.NewWatcher(watchDirs, func() {
-			if err := reloadExtensionsForUI(); err != nil {
-				log.Printf("auto-reload extensions failed: %v", err)
-				appInstance.PrintFromExtension("error", fmt.Sprintf("Extension auto-reload failed: %v", err))
-				return
-			}
-			appInstance.PrintFromExtension("info", "Extensions reloaded.")
-		})
-		if watchErr != nil {
-			log.Printf("extension file watcher not started: %v", watchErr)
-		} else {
-			go extWatcher.Start(ctx)
-			defer func() { _ = extWatcher.Close() }()
-		}
-	}
-
-	// Start file watchers for automatic prompt and skill hot-reload.
-	{
-		homeDir, _ := os.UserHomeDir()
-		cwd, _ := os.Getwd()
-
-		// Collect prompt template directories.
-		promptDirs := watcher.CollectDirs(
-			[]string{
-				filepath.Join(homeDir, ".kit", "prompts"),
-				prompts.GlobalDir(),
-				filepath.Join(cwd, ".kit", "prompts"),
-			},
-			append(promptTemplatePaths, viper.GetStringSlice("prompts")...),
-		)
-
-		// Collect skill directories.
-		skillDirs := watcher.CollectDirs(
-			[]string{
-				filepath.Join(homeDir, ".config", "kit", "skills"),
-				filepath.Join(cwd, ".agents", "skills"),
-				filepath.Join(cwd, ".kit", "skills"),
-			},
-			nil,
-		)
-
-		// Combine all content directories and start a single watcher.
-		allContentDirs := append(promptDirs, skillDirs...)
-		if len(allContentDirs) > 0 {
-			contentWatcher, watchErr := watcher.New(watcher.Options{
-				Dirs:       allContentDirs,
-				Extensions: []string{".md", ".txt"},
-				Label:      "prompts/skills",
-				OnReload: func() {
-					log.Printf("auto-reloading prompts and skills")
-					appInstance.NotifyContentReload()
-				},
-			})
-			if watchErr != nil {
-				log.Printf("content file watcher not started: %v", watchErr)
-			} else {
-				go contentWatcher.Start(ctx)
-				defer func() { _ = contentWatcher.Close() }()
-			}
-		}
-	}
-
-	// Bundle all the shared dependencies into a single struct that both
-	// run-mode entry points consume. This keeps the dispatch site and the
-	// function signatures readable.
+	cwd, _ := os.Getwd()
 	deps := runModeDeps{
-		appInstance:              appInstance,
-		cli:                      cli,
-		modelName:                modelName,
-		providerName:             parsedProvider,
-		loadingMessage:           kitInstance.GetLoadingMessage(),
-		serverNames:              serverNames,
-		toolNames:                toolNames,
-		mcpToolCount:             mcpToolCount,
-		extensionToolCount:       extensionToolCount,
-		usageTracker:             usageTracker,
-		extCommands:              extCommands,
-		promptTemplates:          promptTemplates,
-		contextPaths:             contextPaths,
-		skillItems:               skillItems,
-		extensionItems:           extensionItems,
-		getPromptTemplates:       getPromptTemplates,
-		getSkillItems:            getSkillItems,
-		getExtensionItems:        getExtensionItems,
-		getToolNames:             getToolNames,
-		getMCPToolCount:          getMCPToolCount,
-		mcpPrompts:               mcpPrompts,
-		getMCPPrompts:            getMCPPrompts,
-		expandMCPPrompt:          expandMCPPrompt,
-		getWidgets:               getWidgets,
-		getHeaders:               getHeaders,
-		getFooters:               getFooters,
-		getToolRenderer:          getToolRenderer,
-		getEditorInterceptor:     getEditorInterceptor,
-		getUIVisibility:          getUIVisibility,
-		getStatusBarEntries:      getStatusBarEntries,
-		emitBeforeFork:           emitBeforeFork,
-		emitBeforeSessionSwitch:  emitBeforeSessionSwitch,
-		emitRawInput:             emitRawInput,
-		getGlobalShortcuts:       getGlobalShortcuts,
-		getShortcutList:          getShortcutList,
-		getExtensionCommands:     getExtensionCommands,
-		setModel:                 setModelForUI,
-		emitModelChange:          emitModelChangeForUI,
-		emitThinkingLevelChange:  emitThinkingLevelChangeForUI,
-		emitTerminalResize:       emitTerminalResizeForUI,
-		emitTurnStateChange:      emitTurnStateChangeForUI,
-		isReasoningModel:         kitInstance.IsReasoningModel(),
-		thinkingLevel:            kitInstance.GetThinkingLevel(),
-		setThinkingLevel:         setThinkingLevelForUI,
-		switchSession:            switchSessionForUI,
-		reloadExtensions:         reloadExtensionsForUI,
-		startupExtensionMessages: startupExtensionMessages,
+		appInstance: appInstance,
+		cli:         cli,
+		snapshot: startupSnapshot{
+			modelName:                modelName,
+			providerName:             parsedProvider,
+			loadingMessage:           kitInstance.GetLoadingMessage(),
+			serverNames:              serverNames,
+			toolNames:                toolNames,
+			mcpToolCount:             mcpToolCount,
+			extensionToolCount:       extensionToolCount,
+			usageTracker:             usageTracker,
+			extCommands:              extensionCommandsForUI(kitInstance),
+			promptTemplates:          loadPromptTemplates(false),
+			contextPaths:             contextFilePaths(kitInstance),
+			bare:                     bareFlag,
+			skillItems:               collectSkillItems(kitInstance),
+			extensionItems:           buildExtensionItems(kitInstance, cwd),
+			mcpPrompts:               mcpPromptsForUI(kitInstance),
+			isReasoningModel:         kitInstance.IsReasoningModel(),
+			thinkingLevel:            kitInstance.GetThinkingLevel(),
+			startupExtensionMessages: startupExtensionMessages,
+			providerError:            kitInstance.ProviderError(),
+		},
+		providers: buildUIProviders(kitInstance),
+		actions:   buildUIActions(kitInstance, appInstance, usageTracker),
 	}
 
-	// Check if running in non-interactive mode
-	if positionalPrompt != "" {
+	stopExtensionWatcher := startExtensionWatcher(ctx, appInstance, deps.actions.reloadExtensions)
+	defer stopExtensionWatcher()
+	stopContentWatcher := startContentWatcher(ctx, appInstance)
+	defer stopContentWatcher()
+
+	if !interactive {
 		return runNonInteractiveModeApp(ctx, deps, positionalPrompt, quietFlag, jsonFlag, noExitFlag)
 	}
 
@@ -1494,7 +1104,7 @@ func runNormalMode(ctx context.Context) error {
 // runNonInteractiveModeApp executes a single prompt via the app layer and exits,
 // or transitions to the interactive BubbleTea TUI when --no-exit is set.
 //
-// In quiet mode, RunOnce is used (no intermediate output, final response only).
+// In quiet mode, RunOnceWithFiles is used (no intermediate output, final response only).
 // Otherwise, RunOnceWithDisplay streams tool calls and responses through the
 // shared CLIEventHandler — giving --prompt mode the same rich output as
 // interactive mode.
@@ -1504,22 +1114,17 @@ func runNormalMode(ctx context.Context) error {
 func runNonInteractiveModeApp(ctx context.Context, deps runModeDeps, prompt string, quiet, jsonOutput, noExit bool) error {
 	appInstance := deps.appInstance
 	cli := deps.cli
-	modelName := deps.modelName
-
+	modelName := deps.snapshot.modelName
 	ctx = kit.ContextWithSource(ctx, "non-interactive")
-	// Emit RawInput event BEFORE any processing (@file expansion,
-	// template expansion, etc.) so extensions can capture the
-	// original user input. Source is "non-interactive" since this
-	// is the CLI/quiet path (--prompt, --quiet, --json).
-	if deps.emitRawInput != nil {
-		deps.emitRawInput(prompt, "non-interactive")
+	if deps.actions.emitRawInput != nil {
+		deps.actions.emitRawInput(prompt, "non-interactive")
 	}
 
 	// Expand @file references in the prompt before sending to the agent.
 	// Text files are XML-inlined; binary files are extracted as multimodal parts.
 	var fileParts []kit.LLMFilePart
 	if cwd, err := os.Getwd(); err == nil {
-		result := ui.ProcessFileAttachments(prompt, cwd, mcpResourceReader)
+		result := ui.ProcessFileAttachments(prompt, cwd, deps.actions.readMCPResource)
 		prompt = result.ProcessedText
 		for _, fp := range result.FileParts {
 			fileParts = append(fileParts, kit.LLMFilePart{
@@ -1579,18 +1184,13 @@ func runNonInteractiveModeApp(ctx context.Context, deps runModeDeps, prompt stri
 		// interactive-only fields explicitly; deps carries everything else.
 		interactive := deps
 		interactive.cli = nil
-		interactive.startupExtensionMessages = nil
+		interactive.snapshot.startupExtensionMessages = nil
 		return runInteractiveModeBubbleTea(ctx, interactive)
 	}
 
 	return nil
 }
 
-// runModeDeps bundles the shared dependencies that runNormalMode wires up
-// once and threads to both runNonInteractiveModeApp and
-// runInteractiveModeBubbleTea. Grouping them into a single struct keeps the
-// call sites and signatures readable and makes it trivial to add a new
-// provider callback without touching every call chain.
 // terminalSize reports the current terminal dimensions, falling back to a
 // conventional 80x24 when stdout is not a TTY. Shared by the TUI and the
 // extension context so both start from the same numbers.
@@ -1600,56 +1200,6 @@ func terminalSize() (int, int) {
 		return 80, 24
 	}
 	return w, h
-}
-
-type runModeDeps struct {
-	appInstance              *app.App
-	cli                      *ui.CLI // non-interactive only
-	modelName                string
-	providerName             string
-	loadingMessage           string
-	serverNames              []string
-	toolNames                []string
-	mcpToolCount             int
-	extensionToolCount       int
-	usageTracker             *ui.UsageTracker
-	extCommands              []commands.ExtensionCommand
-	promptTemplates          []*prompts.PromptTemplate
-	contextPaths             []string
-	skillItems               []ui.SkillItem
-	extensionItems           []ui.ExtensionItem
-	getPromptTemplates       func() []*prompts.PromptTemplate
-	getSkillItems            func() []ui.SkillItem
-	getExtensionItems        func() []ui.ExtensionItem
-	getToolNames             func() []string
-	getMCPToolCount          func() int
-	mcpPrompts               []ui.MCPPromptInfo
-	getMCPPrompts            func() []ui.MCPPromptInfo
-	expandMCPPrompt          func(string, string, map[string]string) (*ui.MCPPromptExpandResult, error)
-	getWidgets               func(string) []ui.WidgetData
-	getHeaders               func() []ui.WidgetData
-	getFooters               func() []ui.WidgetData
-	getToolRenderer          func(string) *ui.ToolRendererData
-	getEditorInterceptor     func() *ui.EditorInterceptor
-	getUIVisibility          func() *ui.UIVisibility
-	getStatusBarEntries      func() []ui.StatusBarEntryData
-	emitBeforeFork           func(string, bool, string) (bool, string)
-	emitBeforeSessionSwitch  func(string, string) (bool, string)
-	getGlobalShortcuts       func() map[string]func()
-	getShortcutList          func() []ui.ShortcutInfo
-	getExtensionCommands     func() []commands.ExtensionCommand
-	setModel                 func(string) error
-	emitModelChange          func(string, string, string)
-	emitThinkingLevelChange  func(string, string, string)
-	emitTerminalResize       func(int, int)
-	emitTurnStateChange      func(string, string)
-	emitRawInput             func(string, string)
-	isReasoningModel         bool
-	thinkingLevel            string
-	setThinkingLevel         func(string) error
-	switchSession            func(string) error
-	reloadExtensions         func() error
-	startupExtensionMessages []string // interactive only
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,7 +1296,6 @@ func writeJSONError(err error) {
 // SetupCLI is not used for interactive mode; the TUI (AppModel) handles its own rendering.
 func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 	appInstance := deps.appInstance
-
 	// Redirect all log output (stdlib and charm) to a file so that log
 	// messages don't write to stderr and corrupt the TUI. Bubble Tea
 	// captures stdout for rendering; any stray stderr output from
@@ -1777,58 +1326,63 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 
 	cwd, _ := os.Getwd()
 
+	snap, prov, act := deps.snapshot, deps.providers, deps.actions
 	appModel := ui.NewAppModel(appInstance, ui.AppModelOptions{
-		ModelName:                deps.modelName,
-		ProviderName:             deps.providerName,
-		LoadingMessage:           deps.loadingMessage,
+		ModelName:                snap.modelName,
+		ProviderName:             snap.providerName,
+		LoadingMessage:           snap.loadingMessage,
 		Cwd:                      cwd,
+		Shell:                    viper.GetStringSlice("shell"),
 		Width:                    termWidth,
 		Height:                   termHeight,
-		ServerNames:              deps.serverNames,
-		ToolNames:                deps.toolNames,
-		GetToolNames:             deps.getToolNames,
-		GetMCPToolCount:          deps.getMCPToolCount,
-		MCPToolCount:             deps.mcpToolCount,
-		ExtensionToolCount:       deps.extensionToolCount,
-		UsageTracker:             deps.usageTracker,
-		ExtensionCommands:        deps.extCommands,
-		PromptTemplates:          deps.promptTemplates,
-		GetPromptTemplates:       deps.getPromptTemplates,
-		MCPPrompts:               deps.mcpPrompts,
-		GetMCPPrompts:            deps.getMCPPrompts,
-		ExpandMCPPrompt:          deps.expandMCPPrompt,
-		ContextPaths:             deps.contextPaths,
-		SkillItems:               deps.skillItems,
-		GetSkillItems:            deps.getSkillItems,
-		ExtensionItems:           deps.extensionItems,
-		GetExtensionItems:        deps.getExtensionItems,
-		StartupExtensionMessages: deps.startupExtensionMessages,
-		GetWidgets:               deps.getWidgets,
-		GetHeaders:               deps.getHeaders,
-		GetFooters:               deps.getFooters,
-		GetToolRenderer:          deps.getToolRenderer,
-		GetEditorInterceptor:     deps.getEditorInterceptor,
-		GetUIVisibility:          deps.getUIVisibility,
-		GetStatusBarEntries:      deps.getStatusBarEntries,
-		EmitBeforeFork:           deps.emitBeforeFork,
-		EmitBeforeSessionSwitch:  deps.emitBeforeSessionSwitch,
-		EmitRawInput:             deps.emitRawInput,
-		GetGlobalShortcuts:       deps.getGlobalShortcuts,
-		GetShortcutList:          deps.getShortcutList,
-		GetExtensionCommands:     deps.getExtensionCommands,
-		SetModel:                 deps.setModel,
-		EmitModelChange:          deps.emitModelChange,
-		EmitThinkingLevelChange:  deps.emitThinkingLevelChange,
-		EmitTerminalResize:       deps.emitTerminalResize,
-		EmitTurnStateChange:      deps.emitTurnStateChange,
-		ThinkingLevel:            deps.thinkingLevel,
-		IsReasoningModel:         deps.isReasoningModel,
-		SetThinkingLevel:         deps.setThinkingLevel,
-		SwitchSession:            deps.switchSession,
-		ReloadExtensions:         deps.reloadExtensions,
+		ServerNames:              snap.serverNames,
+		ToolNames:                snap.toolNames,
+		GetToolNames:             prov.getToolNames,
+		GetMCPToolCount:          prov.getMCPToolCount,
+		MCPToolCount:             snap.mcpToolCount,
+		ExtensionToolCount:       snap.extensionToolCount,
+		UsageTracker:             snap.usageTracker,
+		ExtensionCommands:        snap.extCommands,
+		PromptTemplates:          snap.promptTemplates,
+		GetPromptTemplates:       prov.getPromptTemplates,
+		MCPPrompts:               snap.mcpPrompts,
+		GetMCPPrompts:            prov.getMCPPrompts,
+		ExpandMCPPrompt:          act.expandMCPPrompt,
+		ContextPaths:             snap.contextPaths,
+		Bare:                     snap.bare,
+		SkillItems:               snap.skillItems,
+		GetSkillItems:            prov.getSkillItems,
+		ExtensionItems:           snap.extensionItems,
+		GetExtensionItems:        prov.getExtensionItems,
+		StartupExtensionMessages: snap.startupExtensionMessages,
+		GetWidgets:               prov.getWidgets,
+		GetHeaders:               prov.getHeaders,
+		GetFooters:               prov.getFooters,
+		GetToolRenderer:          prov.getToolRenderer,
+		GetEditorInterceptor:     prov.getEditorInterceptor,
+		GetUIVisibility:          prov.getUIVisibility,
+		GetStatusBarEntries:      prov.getStatusBarEntries,
+		EmitBeforeFork:           act.emitBeforeFork,
+		EmitRawInput:             act.emitRawInput,
+		EmitBeforeSessionSwitch:  act.emitBeforeSessionSwitch,
+		GetGlobalShortcuts:       prov.getGlobalShortcuts,
+		GetShortcutList:          prov.getShortcutList,
+		GetExtensionCommands:     prov.getExtensionCommands,
+		SetModel:                 act.setModel,
+		ProviderError:            snap.providerError,
+		SaveProviderAPIKey:       act.saveProviderAPIKey,
+		EmitModelChange:          act.emitModelChange,
+		EmitThinkingLevelChange:  act.emitThinkingLevelChange,
+		EmitTerminalResize:       act.emitTerminalResize,
+		EmitTurnStateChange:      act.emitTurnStateChange,
+		ThinkingLevel:            snap.thinkingLevel,
+		IsReasoningModel:         snap.isReasoningModel,
+		SetThinkingLevel:         act.setThinkingLevel,
+		SwitchSession:            act.switchSession,
+		ReloadExtensions:         act.reloadExtensions,
 		ShowSessionPicker:        resumeFlag,
-		GetMCPResources:          mcpGetResources,
-		MCPResourceReader:        mcpResourceReader,
+		GetMCPResources:          prov.getMCPResources,
+		MCPResourceReader:        act.readMCPResource,
 	})
 
 	// Resolve terminal capabilities (background, colour profile) now, before

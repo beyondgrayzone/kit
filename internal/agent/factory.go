@@ -37,6 +37,9 @@ type AgentCreationOptions struct {
 	SpinnerFunc SpinnerFunc // Function to show spinner (provided by caller)
 	// DebugLogger is an optional logger for debugging MCP communications
 	DebugLogger tools.DebugLogger // Optional debug logger
+	// AllowMissingCredentials lets creation succeed when the provider has
+	// no credentials; see AgentConfig.AllowMissingCredentials.
+	AllowMissingCredentials bool
 	// AuthHandler handles OAuth authorization for remote MCP servers
 	AuthHandler tools.MCPAuthHandler
 	// TokenStoreFactory, if non-nil, creates a custom token store for each
@@ -57,12 +60,15 @@ type AgentCreationOptions struct {
 	// NamedAgents lists discovered named agent definitions to advertise in
 	// the subagent tool description.
 	NamedAgents []core.NamedAgentSpec
-	// BashTimeout sets the default per-call timeout (seconds) for the bash
+	// ShellTimeout sets the default per-call timeout (seconds) for the shell
 	// tool. Zero uses the built-in default (120s).
-	BashTimeout int
-	// BashMaxTimeout caps the maximum timeout (seconds) a bash tool call may
+	ShellTimeout int
+	// ShellMaxTimeout caps the maximum timeout (seconds) a shell tool call may
 	// request. Zero uses the built-in default (600s).
-	BashMaxTimeout int
+	ShellMaxTimeout int
+	// Shell is the argument vector prefix the shell tool runs a command
+	// string through. Empty uses the built-in default ["bash"].
+	Shell []string
 	// OnMCPServerLoaded, if non-nil, is called when each MCP server finishes
 	// loading (successfully or with error). Called from the background goroutine.
 	OnMCPServerLoaded func(serverName string, toolCount int, err error)
@@ -75,23 +81,25 @@ type AgentCreationOptions struct {
 // Returns the created agent or an error if creation fails.
 func CreateAgent(ctx context.Context, opts *AgentCreationOptions) (*Agent, error) {
 	agentConfig := &AgentConfig{
-		ModelConfig:       opts.ModelConfig,
-		MCPConfig:         opts.MCPConfig,
-		SystemPrompt:      opts.SystemPrompt,
-		MaxSteps:          opts.MaxSteps,
-		StreamingEnabled:  opts.StreamingEnabled,
-		DebugLogger:       opts.DebugLogger,
-		AuthHandler:       opts.AuthHandler,
-		TokenStoreFactory: opts.TokenStoreFactory,
-		CoreTools:         opts.CoreTools,
-		CoreToolList:      opts.CoreToolList,
-		ToolWrapper:       opts.ToolWrapper,
-		ExtraTools:        opts.ExtraTools,
-		NamedAgents:       opts.NamedAgents,
-		BashTimeout:       opts.BashTimeout,
-		BashMaxTimeout:    opts.BashMaxTimeout,
-		OnMCPServerLoaded: opts.OnMCPServerLoaded,
-		MCPTaskConfig:     opts.MCPTaskConfig,
+		ModelConfig:             opts.ModelConfig,
+		MCPConfig:               opts.MCPConfig,
+		SystemPrompt:            opts.SystemPrompt,
+		MaxSteps:                opts.MaxSteps,
+		StreamingEnabled:        opts.StreamingEnabled,
+		DebugLogger:             opts.DebugLogger,
+		AllowMissingCredentials: opts.AllowMissingCredentials,
+		AuthHandler:             opts.AuthHandler,
+		TokenStoreFactory:       opts.TokenStoreFactory,
+		CoreTools:               opts.CoreTools,
+		CoreToolList:            opts.CoreToolList,
+		ToolWrapper:             opts.ToolWrapper,
+		ExtraTools:              opts.ExtraTools,
+		NamedAgents:             opts.NamedAgents,
+		ShellTimeout:            opts.ShellTimeout,
+		ShellMaxTimeout:         opts.ShellMaxTimeout,
+		Shell:                   opts.Shell,
+		OnMCPServerLoaded:       opts.OnMCPServerLoaded,
+		MCPTaskConfig:           opts.MCPTaskConfig,
 	}
 
 	var agent *Agent

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/mark3labs/kit/internal/app"
+	"github.com/mark3labs/kit/internal/auth"
 	"github.com/mark3labs/kit/internal/core"
 	"github.com/mark3labs/kit/internal/message"
 	"github.com/mark3labs/kit/internal/models"
@@ -62,6 +64,15 @@ const (
 
 	// stateModelSelector means the /model selector overlay is active.
 	stateModelSelector
+
+	// stateThinkingLevelSelector means the /thinking selector overlay is active.
+	stateThinkingLevelSelector
+
+	// stateThemeSelector means the /theme selector overlay is active.
+	stateThemeSelector
+
+	// stateProviderConnect means the /connect provider/key dialog is active.
+	stateProviderConnect
 
 	// stateSessionSelector means the /resume session picker is active.
 	stateSessionSelector
@@ -395,6 +406,10 @@ type AppModelOptions struct {
 	// If empty, @file features are disabled.
 	Cwd string
 
+	// Shell is the shell the ! and !! commands run through: the shell plus
+	// its own leading arguments. Empty means the built-in default, bash.
+	Shell []string
+
 	// Width is the initial terminal width in columns.
 	Width int
 
@@ -451,6 +466,11 @@ type AppModelOptions struct {
 	// ContextPaths lists absolute paths of loaded context files (e.g.
 	// AGENTS.md). Displayed in the [Context] startup section.
 	ContextPaths []string
+
+	// Bare reports that Kit started with no automatic context discovery.
+	// The splash says so, so an absent AGENTS.md or skill list reads as a
+	// deliberate choice rather than a failure to load.
+	Bare bool
 
 	// SkillItems lists loaded skills for the [Skills] startup section.
 	SkillItems []SkillItem
@@ -550,6 +570,17 @@ type AppModelOptions struct {
 	// Returns an error if the model string is invalid or the provider cannot
 	// be created. May be nil if model switching is not supported.
 	SetModel func(modelString string) error
+
+	// ProviderError is the error that kept the model provider from being
+	// created at startup (typically a missing API key). When non-nil the
+	// TUI greets the user with a notice, refuses to send prompts, and
+	// clears the error once /connect or /model installs a working provider.
+	ProviderError error
+
+	// SaveProviderAPIKey stores an API key for a provider (backs /connect).
+	// May be nil, in which case /connect reports that key storage is
+	// unavailable.
+	SaveProviderAPIKey func(providerID, key string) error
 
 	// EmitModelChange fires the OnModelChange extension event after a
 	// successful model switch. Parameters are (newModel, previousModel, source).
@@ -764,7 +795,9 @@ type AppModel struct {
 	// contextPaths and skillItems are used by AddStartupMessageToScrollList for the
 	// [Context] and [Skills] sections.
 	contextPaths []string
-	skillItems   []SkillItem
+	// bare reports that no automatic context discovery ran.
+	bare       bool
+	skillItems []SkillItem
 
 	// splashItem is the scrollback item holding the startup splash, retained
 	// while the logo animation is running so each frame can be painted into
@@ -872,6 +905,16 @@ type AppModel struct {
 	// May be nil if model switching is not supported.
 	setModel func(modelString string) error
 
+	// providerError is non-nil while the active model has no usable
+	// provider (no API key). See AppModelOptions.ProviderError.
+	providerError error
+
+	// saveProviderAPIKey stores a provider API key. Wired from cmd/root.go.
+	saveProviderAPIKey func(providerID, key string) error
+
+	// providerConnect is the /connect dialog, active in stateProviderConnect.
+	providerConnect *ProviderConnectComponent
+
 	// emitModelChange fires the OnModelChange extension event. May be nil.
 	emitModelChange func(newModel, previousModel, source string)
 
@@ -891,6 +934,13 @@ type AppModel struct {
 
 	// modelSelector is the model selection overlay, active in stateModelSelector.
 	modelSelector *ModelSelectorComponent
+
+	// thinkingLevelSelector is the reasoning-effort picker, active in
+	// stateThinkingLevelSelector.
+	thinkingLevelSelector *ThinkingLevelSelectorComponent
+
+	// themeSelector is the color-theme picker, active in stateThemeSelector.
+	themeSelector *ThemeSelectorComponent
 
 	// sessionSelector is the session picker overlay, active in stateSessionSelector.
 	sessionSelector *SessionSelectorComponent
@@ -946,7 +996,8 @@ type AppModel struct {
 	navNotice string
 
 	// cwd is the working directory for @file path resolution.
-	cwd string
+	cwd   string
+	shell []string // shell for the ! and !! commands; empty means bash
 
 	// gitBranch is the current git branch name, resolved once when cwd is
 	// set. Empty when the working directory is not a git repository. Shown
@@ -1033,6 +1084,16 @@ type AppModel struct {
 	// gfxContentHash is a hash of the last rendered frame, used to notice that
 	// the screen was repainted.
 	gfxContentHash uint64
+
+	// gfxPlaced holds the id of every image that the last computed placement
+	// left painted on the screen.
+	//
+	// A directly-placed image is not part of the view, so redrawing the cells
+	// underneath does not remove it: an image whose message has scrolled out of
+	// the viewport, or that a modal now covers, has to be told to go. Comparing
+	// this set against the images the current frame draws is how the ones that
+	// vanished are found.
+	gfxPlaced map[uint32]struct{}
 
 	// pendingGotoBottom requests a GotoBottom() after the next layout
 	// recalculation. Set when loading a session so that scrolling to the
@@ -1126,6 +1187,7 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 		getMCPToolCount: opts.GetMCPToolCount,
 		usageTracker:    opts.UsageTracker,
 		cwd:             opts.Cwd,
+		shell:           opts.Shell,
 		width:           width,
 		height:          height,
 	}
@@ -1149,6 +1211,8 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	m.getShortcutList = opts.GetShortcutList
 	m.getExtensionCommands = opts.GetExtensionCommands
 	m.setModel = opts.SetModel
+	m.providerError = opts.ProviderError
+	m.saveProviderAPIKey = opts.SaveProviderAPIKey
 	m.emitModelChange = opts.EmitModelChange
 	m.emitThinkingLevelChange = opts.EmitThinkingLevelChange
 	m.emitTerminalResize = opts.EmitTerminalResize
@@ -1156,8 +1220,6 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	m.extEvents = newExtEventDispatcher()
 	m.thinkingLevel = opts.ThinkingLevel
 
-	// Initialize the theme list function for command completion.
-	commands.ListThemesFunc = style.ListThemes
 	m.thinkingVisible = true // default to showing thinking blocks
 	m.isReasoningModel = opts.IsReasoningModel
 	m.setThinkingLevel = opts.SetThinkingLevel
@@ -1166,6 +1228,7 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 
 	// Store context/skills metadata and tool counts for startup display.
 	m.contextPaths = opts.ContextPaths
+	m.bare = opts.Bare
 	m.skillItems = opts.SkillItems
 	m.getSkillItems = opts.GetSkillItems
 	m.extensionItems = opts.ExtensionItems
@@ -1226,18 +1289,14 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 		}
 	}
 
-	// Merge skills into autocomplete as /skill:<name> commands. Skills accept
-	// optional trailing args, so HasArgs is true — Enter populates the input
-	// with "/skill:name " rather than auto-submitting.
+	// Merge skills into autocomplete as /<name> commands (the agentskills.io
+	// user-explicit activation convention). Skills accept optional trailing
+	// args, so HasArgs is true — Enter populates the input with "/name "
+	// rather than auto-submitting. A skill whose name is already taken by a
+	// built-in command, extension command or prompt template is shadowed at
+	// dispatch time, so it is left out of the popup and logged.
 	if ic, ok := m.input.(*InputComponent); ok && len(opts.SkillItems) > 0 {
-		for _, s := range opts.SkillItems {
-			ic.commands = append(ic.commands, commands.SlashCommand{
-				Name:        "/skill:" + s.Name,
-				Description: formatSkillDescription(s),
-				Category:    "Skills",
-				HasArgs:     true,
-			})
-		}
+		ic.commands = appendSkillCommands(ic.commands, opts.SkillItems)
 	}
 
 	// Merge MCP prompts into autocomplete as /<server>:<prompt> commands.
@@ -1280,8 +1339,10 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 
 // Init implements tea.Model. Initialises child components.
 func (m *AppModel) Init() tea.Cmd {
-	// Add startup info to ScrollList so it's visible in alt screen mode
-	m.AddStartupMessageToScrollList()
+	// Keep actionable startup notices, but do not show the startup splash.
+	if !m.uiVis().HideStartupMessage {
+		m.addStartupMessages()
+	}
 
 	// m.input is always set by NewAppModel; its Init starts the textarea cursor blink.
 	// m.stream.Init() always returns nil, so there is nothing to batch.
@@ -1303,9 +1364,35 @@ func (m *AppModel) uiVis() UIVisibility {
 	return UIVisibility{}
 }
 
+// addStartupMessages appends actionable notices that were produced before the
+// TUI started. The startup splash is intentionally kept out of the initial view.
+func (m *AppModel) addStartupMessages() {
+	// No credentials for the configured provider: greet the user with the
+	// fix instead of failing at startup.
+	if m.providerError != nil {
+		notice := m.providerErrorNotice()
+		now := time.Now()
+		m.messages = append(m.messages, NewThemedMessageItem(generateMessageID(), "system", notice, func() string {
+			return m.renderer.RenderSystemMessage(notice, now).Content
+		}))
+	}
+
+	// Add extension startup messages if any. These are ordinary system
+	// notices and are rendered as such — appending the raw string would put
+	// unstyled, unwrapped text at column 0.
+	for _, extMsg := range m.startupExtensionMessages {
+		now := time.Now()
+		m.messages = append(m.messages, NewThemedMessageItem(generateMessageID(), "system", extMsg, func() string {
+			return m.renderer.RenderSystemMessage(extMsg, now).Content
+		}))
+	}
+
+	m.refreshContent()
+}
+
 // AddStartupMessageToScrollList adds the logo and startup info as the first
-// messages in the ScrollList. This is the only place startup information is
-// rendered — nothing is printed to stdout.
+// messages in the ScrollList. This is used by tests and callers that explicitly
+// request the legacy startup splash.
 func (m *AppModel) AddStartupMessageToScrollList() {
 	if m.uiVis().HideStartupMessage {
 		return
@@ -1336,8 +1423,11 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 		pairs = append(pairs, [2]string{"status", m.loadingMessage})
 	}
 
-	// Context — loaded AGENTS.md files.
-	if len(m.contextPaths) > 0 {
+	// Context — loaded AGENTS.md files. Bare mode reports itself instead, so
+	// the absence of context below is legible as intent.
+	if m.bare {
+		pairs = append(pairs, [2]string{"context", "bare — no project context"})
+	} else if len(m.contextPaths) > 0 {
 		contextStr := tildeHome(m.contextPaths[0])
 		if len(m.contextPaths) > 1 {
 			contextStr += fmt.Sprintf(" +%d more", len(m.contextPaths)-1)
@@ -1403,23 +1493,7 @@ func (m *AppModel) AddStartupMessageToScrollList() {
 	m.splashItem = item
 	m.messages = append(m.messages, item)
 
-	// Add extension startup messages if any. These are ordinary system
-	// notices and are rendered as such — appending the raw string would put
-	// unstyled, unwrapped text at column 0.
-	for _, extMsg := range m.startupExtensionMessages {
-		now := time.Now()
-		m.messages = append(m.messages, NewThemedMessageItem(generateMessageID(), "system", extMsg, func() string {
-			return m.renderer.RenderSystemMessage(extMsg, now).Content
-		}))
-	}
-
-	// The splash carries its own trailing gap, which is what separates the
-	// startup banner from the conversation. A blank line is enough to break
-	// the two apart, and it does not add a heavy horizontal element to an
-	// otherwise quiet screen.
-
-	// Refresh ScrollList once with all startup messages
-	m.refreshContent()
+	m.addStartupMessages()
 }
 
 // --------------------------------------------------------------------------
@@ -1753,6 +1827,57 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateInput
 		return m, nil
 
+	// ── Thinking-level selector events ──────────────────────────────────
+	case ThinkingLevelSelectedMsg:
+		m.thinkingLevelSelector = nil
+		m.state = stateInput
+		m.applyThinkingLevel(models.ParseThinkingLevel(msg.Level))
+		return m, tea.Batch(cmds...)
+
+	case ThinkingLevelSelectorCancelledMsg:
+		m.thinkingLevelSelector = nil
+		m.state = stateInput
+		return m, nil
+
+	// ── Theme selector events ───────────────────────────────────────────────
+	case ThemeSelectedMsg:
+		m.themeSelector = nil
+		m.state = stateInput
+		m.applyTheme(msg.Name)
+		return m, tea.Batch(cmds...)
+
+	case ThemeSelectorCancelledMsg:
+		m.themeSelector = nil
+		m.state = stateInput
+		return m, nil
+
+	// ── Provider connect (/connect) events ─────────────────────────────────
+	case ProviderKeySubmittedMsg:
+		if err := m.storeProviderKey(msg.ProviderID, msg.Key); err != nil {
+			// Keep the dialog open on the key step so the user can fix it.
+			if m.providerConnect != nil {
+				m.providerConnect.SetError(err.Error())
+			}
+			return m, nil
+		}
+		m.providerConnect = nil
+		m.state = stateInput
+		m.afterProviderKeySaved(msg.ProviderID, msg.ProviderName)
+		return m, tea.Batch(cmds...)
+
+	case ProviderConnectOAuthMsg:
+		m.providerConnect = nil
+		m.state = stateInput
+		m.printSystemMessage(fmt.Sprintf(
+			"%s uses device login instead of an API key. Quit and run:\n\n  kit auth login copilot",
+			msg.ProviderName))
+		return m, tea.Batch(cmds...)
+
+	case ProviderConnectCancelledMsg:
+		m.providerConnect = nil
+		m.state = stateInput
+		return m, nil
+
 	// ── Session selector events ──────────────────────────────────────────────
 	case SessionSelectedMsg:
 		m.sessionSelector = nil
@@ -2027,6 +2152,30 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stateModelSelector && m.modelSelector != nil {
 			updated, cmd := m.modelSelector.Update(msg)
 			m.modelSelector = updated.(*ModelSelectorComponent)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// Route to thinking-level selector when active.
+		if m.state == stateThinkingLevelSelector && m.thinkingLevelSelector != nil {
+			updated, cmd := m.thinkingLevelSelector.Update(msg)
+			m.thinkingLevelSelector = updated.(*ThinkingLevelSelectorComponent)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// Route to theme selector when active.
+		if m.state == stateThemeSelector && m.themeSelector != nil {
+			updated, cmd := m.themeSelector.Update(msg)
+			m.themeSelector = updated.(*ThemeSelectorComponent)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// Route to the /connect dialog when active.
+		if m.state == stateProviderConnect && m.providerConnect != nil {
+			updated, cmd := m.providerConnect.Update(msg)
+			m.providerConnect = updated.(*ProviderConnectComponent)
 			cmds = append(cmds, cmd)
 			return m, tea.Batch(cmds...)
 		}
@@ -2375,6 +2524,17 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			msg.Text = expanded
 		}
 
+		// No usable provider: do not send the prompt, tell the user how to
+		// fix it (mirrors opencode's "Connect a provider to send prompts").
+		if m.providerError != nil {
+			m.printSystemMessage(m.providerErrorNotice())
+			if ic, ok := m.input.(*InputComponent); ok {
+				ic.textarea.SetValue(msg.Text)
+				ic.textarea.CursorEnd()
+			}
+			return m, tea.Batch(cmds...)
+		}
+
 		// Regular prompt — forward to the app layer.
 		// Preprocess @file references: text files are XML-inlined, binary files
 		// (images, audio, etc.) are extracted as multimodal parts. The display
@@ -2453,24 +2613,46 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Async transcript image preview ───────────────────────────────────────
 	case imagePreviewReadyMsg:
-		if msg.block != "" {
-			// Static: the block is decoded pixel data, not a styled text
-			// block. Repainting it would mean re-decoding the image, and
-			// only its background tint comes from the theme.
-			item := NewStyledMessageItem(generateMessageID(), "user", "", msg.block)
-			m.insertMessageAfter(msg.anchorID, item)
+		// Each preview becomes its own item, chained after the one before it so
+		// several images attached to one message keep their order.
+		//
+		// Static: the block is decoded pixel data, not a styled text block.
+		// Repainting it would mean re-decoding the image, and only its
+		// background tint comes from the theme.
+		anchor := msg.anchorID
+		placed := false
+		for _, preview := range msg.previews {
+			if preview.cells == "" {
+				continue
+			}
+			item := NewStyledMessageItem(generateMessageID(), "user", "", preview.cells)
+			if preview.image != nil {
+				item = item.WithDirectImage(*preview.image)
+				placed = true
+			}
+			m.insertMessageAfter(anchor, item)
+			anchor = item.ID()
+		}
+		if anchor != msg.anchorID {
 			m.refreshContent()
 			m.layoutDirty = true
-			if msg.transmit != "" {
-				// The image data cannot travel inside the view text. The
-				// placeholder cells just inserted into the transcript display
-				// it as soon as it lands.
-				//
-				// It is deliberately never deleted: the message stays in the
-				// scrollback for the rest of the session, and freeing the data
-				// would blank the preview the next time it scrolls into view.
-				cmds = append(cmds, tea.Raw(msg.transmit))
-			}
+		}
+		if msg.transmit != "" {
+			// The image data cannot travel inside the view text. Placeholder
+			// cells just inserted into the transcript display it as soon as it
+			// lands; a directly-placed image is drawn separately, below.
+			//
+			// It is deliberately never deleted: the message stays in the
+			// scrollback for the rest of the session, and freeing the data
+			// would blank the preview the next time it scrolls into view.
+			cmds = append(cmds, tea.Raw(msg.transmit))
+		}
+		if placed {
+			// A directly-placed image is drawn by View, which can only work out
+			// where it goes once this frame has been laid out. Nothing else
+			// would arrive to trigger that write, so ask for one more Update
+			// after the coming View.
+			cmds = append(cmds, gfxNudgeCmd())
 		}
 
 	// ── Shell command (! / !!) ───────────────────────────────────────────────
@@ -2565,8 +2747,10 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// rendered when the ToolResultEvent arrives.
 		m.flushStreamContent()
 
-		// For bash commands, extract and store the command for the streaming output header.
-		if msg.ToolName == "bash" {
+		// For shell commands, extract and store the command for the streaming
+		// output header. The earlier tool name is accepted too, so a replayed
+		// session keeps its header.
+		if msg.ToolName == core.ShellToolName || msg.ToolName == core.LegacyShellToolName {
 			var args struct {
 				Command string `json:"command"`
 			}
@@ -3165,6 +3349,16 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layoutDirty = true
 
 	default:
+		// The /connect key input owns paste and cursor-blink messages while
+		// it is open; the composer must not receive a pasted API key.
+		if m.state == stateProviderConnect && m.providerConnect != nil {
+			updated, cmd := m.providerConnect.Update(msg)
+			m.providerConnect = updated.(*ProviderConnectComponent)
+			cmds = append(cmds, cmd)
+			if _, isPaste := msg.(tea.PasteMsg); isPaste {
+				return m, tea.Batch(cmds...)
+			}
+		}
 		// Pass unrecognised messages to all children.
 		if m.input != nil {
 			updated, cmd := m.input.Update(msg)
@@ -3257,7 +3451,12 @@ func (m *AppModel) View() tea.View {
 	// Only include the scrollback region when it has content. When idle the
 	// scrollback renders "" which JoinVertical would pad to a full-width blank
 	// line, inflating the view unnecessarily.
+	//
+	// Its index is kept because a directly-placed transcript image is located
+	// relative to the top of this section.
+	scrollPartIndex := -1
 	if scrollbackView != "" {
+		scrollPartIndex = len(parts)
 		parts = append(parts, scrollbackView)
 	}
 
@@ -3342,7 +3541,7 @@ func (m *AppModel) View() tea.View {
 	// Record where directly-placed images landed. This must happen with the
 	// assembled parts in hand: the absolute screen row of a preview is only
 	// knowable once everything above and below it has been measured.
-	m.gfxPlacement = m.computeGfxPlacement(parts, inputPartIndex)
+	m.gfxPlacement = m.computeGfxPlacement(parts, inputPartIndex, scrollPartIndex)
 
 	// Composite every modal surface over the layout at the cell level, so
 	// the conversation stays visible around each one. Ordering is z-order:
@@ -3359,6 +3558,21 @@ func (m *AppModel) View() tea.View {
 	// Model selector.
 	if m.state == stateModelSelector && m.modelSelector != nil {
 		finalContent = compositeCentered(finalContent, m.modelSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Thinking-level selector.
+	if m.state == stateThinkingLevelSelector && m.thinkingLevelSelector != nil {
+		finalContent = compositeCentered(finalContent, m.thinkingLevelSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Theme selector.
+	if m.state == stateThemeSelector && m.themeSelector != nil {
+		finalContent = compositeCentered(finalContent, m.themeSelector.RenderOverlay(), m.width, m.height)
+	}
+
+	// Provider connect dialog (/connect).
+	if m.state == stateProviderConnect && m.providerConnect != nil {
+		finalContent = compositeCentered(finalContent, m.providerConnect.RenderOverlay(), m.width, m.height)
 	}
 
 	// Tree selector (/tree).
@@ -3988,14 +4202,14 @@ func truncateMessageForBlock(msg string, maxLines, width int) string {
 // Print helpers — add content to ScrollList
 // --------------------------------------------------------------------------
 
-// imagePreviewReadyMsg carries an asynchronously rendered transcript image
-// preview block back to the Update loop, where it is inserted into the
+// imagePreviewReadyMsg carries asynchronously rendered transcript image
+// previews back to the Update loop, where they are inserted into the
 // ScrollList directly after the originating user message (identified by
 // anchorID). Inserting by anchor — rather than appending — keeps the preview
 // next to its message even when the agent's streamed reply has already been
 // appended while the thumbnail was being decoded off the event loop.
 type imagePreviewReadyMsg struct {
-	block    string
+	previews []transcriptPreview
 	anchorID string
 
 	// transmit carries image data that must reach the terminal outside the
@@ -4004,23 +4218,38 @@ type imagePreviewReadyMsg struct {
 	transmit string
 }
 
+// transcriptPreview is one rendered thumbnail on its way into the scrollback.
+//
+// Each preview becomes its own scrollback item. One item per image is what
+// makes a directly-placed picture locatable: the item's rows are the image's
+// rows, so the model can work out where the picture goes from the item's
+// position alone, with no arithmetic about what else shares the block.
+type transcriptPreview struct {
+	// cells is the text inserted into the transcript: half-block art,
+	// placeholder cells, or the blank block that reserves the area a directly
+	// placed image is painted over.
+	cells string
+
+	// image is the transmitted image when it must be placed over the screen,
+	// and nil when the cells draw themselves.
+	image *imagepreview.Thumbnail
+}
+
 // transcriptPreviewCmd returns a tea.Cmd that renders thumbnail previews for
 // the given clipboard images off the Bubble Tea event loop (decode + resample
-// must not block Update). The rendered block is delivered via
-// imagePreviewReadyMsg, tagged with anchorID so the consumer can place it
+// must not block Update). The rendered previews are delivered via
+// imagePreviewReadyMsg, tagged with anchorID so the consumer can place them
 // directly after the originating user message. Returns nil when there is
 // nothing to render or no room for a preview; an empty result (terminal lacks
 // color support) yields a nil message that Bubble Tea ignores.
 //
-// Unicode placeholders are used when the terminal supports them, because a
-// transcript preview lives in the scrollback: the ScrollList scrolls and clips
-// its items, and placeholder cells are text, so the image scrolls and clips
-// with the message it belongs to.
-//
-// Direct placement deliberately is not used here even where the composer uses
-// it. A directly placed image is painted at a fixed screen position and would
-// neither scroll with the transcript nor vanish when its message scrolls away,
-// so those terminals keep half blocks for transcript previews.
+// A transcript preview uses whichever graphics mode the terminal supports, so
+// a submitted image looks the same as it did in the composer. Where
+// placeholder cells survive, the image travels as text and scrolls and clips
+// with its message for free. Where they do not — zellij strips the combining
+// marks they are built from — the image is painted over the screen instead,
+// and the model re-places it against the transcript on every frame, clipping
+// it to the rows the viewport still shows. See computeGfxPlacement.
 func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorID string) tea.Cmd {
 	if len(images) == 0 {
 		return nil
@@ -4034,33 +4263,47 @@ func (m *AppModel) transcriptPreviewCmd(images []uicore.ImageAttachment, anchorI
 	}
 	bg := style.GetTheme().Background
 	imgs := images
-	usePlaceholders := termgfx.PreviewMode() == termgfx.ModePlaceholder
+	mode := termgfx.PreviewMode()
 	caps := termgfx.Current()
 	return func() tea.Msg {
 		pad := lipgloss.NewStyle().PaddingLeft(style.ContentOffset)
-		var blocks []string
+		var previews []transcriptPreview
 		var transmit strings.Builder
 		for _, img := range imgs {
-			if usePlaceholders {
-				kt, err := imagepreview.RenderKitty(img.Data, cols, thumbMaxRows, caps.CellWidth, caps.CellHeight)
-				if err == nil && kt.Cells != "" {
-					transmit.WriteString(kt.Transmit)
-					blocks = append(blocks, pad.Render(kt.Cells))
-					continue
+			var (
+				kt  imagepreview.Thumbnail
+				err error
+			)
+			switch mode {
+			case termgfx.ModePlaceholder:
+				kt, err = imagepreview.RenderKitty(img.Data, cols, thumbMaxRows, caps.CellWidth, caps.CellHeight)
+			case termgfx.ModeDirect:
+				kt, err = imagepreview.RenderKittyDirect(img.Data, cols, thumbMaxRows, caps.CellWidth, caps.CellHeight)
+			}
+			if err == nil && kt.Cells != "" {
+				transmit.WriteString(kt.Transmit)
+				preview := transcriptPreview{cells: pad.Render(kt.Cells)}
+				if kt.NeedsPlacement {
+					thumb := kt
+					preview.image = &thumb
 				}
+				previews = append(previews, preview)
+				continue
+			}
+			if err != nil {
 				log.Debug("kitty transcript preview failed, using half blocks", "error", err)
 			}
 			thumb, err := imagepreview.Render(img.Data, img.MediaType, cols, thumbMaxRows, bg)
 			if err != nil || thumb == "" {
 				continue
 			}
-			blocks = append(blocks, pad.Render(thumb))
+			previews = append(previews, transcriptPreview{cells: pad.Render(thumb)})
 		}
-		if len(blocks) == 0 {
+		if len(previews) == 0 {
 			return nil
 		}
 		return imagePreviewReadyMsg{
-			block:    strings.Join(blocks, "\n"),
+			previews: previews,
 			anchorID: anchorID,
 			transmit: transmit.String(),
 		}
@@ -4289,6 +4532,8 @@ func (m *AppModel) handleSlashCommand(sc *commands.SlashCommand, args string) te
 		m.printResetUsage()
 	case "/model":
 		return m.handleModelCommand(args)
+	case "/connect":
+		return m.handleConnectCommand(args)
 	case "/theme":
 		return m.handleThemeCommand(args)
 	case "/thinking":
@@ -4637,16 +4882,39 @@ func (m *AppModel) refreshSkillItems() {
 				kept = append(kept, sc)
 			}
 		}
-		for _, s := range newItems {
-			kept = append(kept, commands.SlashCommand{
-				Name:        "/skill:" + s.Name,
-				Description: formatSkillDescription(s),
-				Category:    "Skills",
-				HasArgs:     true,
-			})
-		}
-		ic.commands = kept
+		ic.commands = appendSkillCommands(kept, newItems)
 	}
+}
+
+// appendSkillCommands appends one "/<name>" autocomplete entry per skill to
+// cmds and returns the result. Skills whose slash name collides with an
+// existing entry (built-in, extension, MCP prompt or prompt template) are
+// skipped, because dispatch would never reach them; the collision is logged
+// so the author can rename one side.
+func appendSkillCommands(cmds []commands.SlashCommand, items []SkillItem) []commands.SlashCommand {
+	taken := make(map[string]string, len(cmds))
+	for _, sc := range cmds {
+		taken[sc.Name] = sc.Category
+		for _, a := range sc.Aliases {
+			taken[a] = sc.Category
+		}
+	}
+	for _, s := range items {
+		name := "/" + s.Name
+		if cat, dup := taken[name]; dup {
+			log.Warn("skill shadowed by existing slash command",
+				"skill", s.Name, "path", s.Path, "shadowed_by", cat)
+			continue
+		}
+		taken[name] = "Skills"
+		cmds = append(cmds, commands.SlashCommand{
+			Name:        name,
+			Description: formatSkillDescription(s),
+			Category:    "Skills",
+			HasArgs:     true,
+		})
+	}
+	return cmds
 }
 
 // refreshExtensionItems reloads extension items from the provider callback
@@ -4659,17 +4927,20 @@ func (m *AppModel) refreshExtensionItems() {
 	m.extensionItems = m.getExtensionItems()
 }
 
-// formatSkillDescription returns the autocomplete description for a skill,
-// prefixed with [project] or [user] so users can tell colliding names apart.
+// formatSkillDescription returns the autocomplete description for a skill.
+// Project-local skills are tagged so the user can see where a skill came
+// from; user-level skills (the common case) are shown without a prefix. Name
+// collisions are already resolved at load time (project wins), so a bare
+// name is never ambiguous.
 func formatSkillDescription(s SkillItem) string {
-	prefix := "[user]"
+	desc := s.Description
 	if s.Source == "project" {
-		prefix = "[project]"
+		if desc == "" {
+			return "(project)"
+		}
+		return "(project) " + desc
 	}
-	if s.Description == "" {
-		return prefix
-	}
-	return prefix + " " + s.Description
+	return desc
 }
 
 // refreshMCPPrompts reloads MCP prompts from the provider callback and
@@ -4765,7 +5036,7 @@ func (m *AppModel) printHelpMessage() {
 	if len(m.skillItems) > 0 {
 		var skillHelp strings.Builder
 		skillHelp.WriteString("**Skills:**\n")
-		skillHelp.WriteString("- `/skill:<name> [args]`: Load a skill into context and run with optional args\n")
+		skillHelp.WriteString("- `/<name> [args]`: Load a skill into context and run with optional args\n")
 		skillHelp.WriteString("  Available skills: ")
 		for i, si := range m.skillItems {
 			if i > 0 {
@@ -5459,10 +5730,10 @@ func (m *AppModel) switchModel(modelString string) {
 	// Some models (e.g., OpenAI gpt-5.4) don't support "minimal" and require "none".
 	if m.thinkingLevel != "" && m.thinkingLevel != "off" {
 		if parts := strings.SplitN(modelString, "/", 2); len(parts) == 2 {
-			modelName := parts[1]
+			providerName, modelName := parts[0], parts[1]
 			currentLevel := models.ParseThinkingLevel(m.thinkingLevel)
-			if !models.IsValidThinkingLevelForModel(currentLevel, modelName) {
-				fallback := models.SuggestThinkingLevelFallback(currentLevel, modelName)
+			if !models.IsValidThinkingLevelForModel(currentLevel, providerName, modelName) {
+				fallback := models.SuggestThinkingLevelFallback(currentLevel, providerName, modelName)
 				if fallback != models.ThinkingOff {
 					m.printSystemMessage(fmt.Sprintf(
 						"Note: Model %s doesn't support '%s' thinking level. Adjusted to '%s'.",
@@ -5489,6 +5760,9 @@ func (m *AppModel) switchModel(modelString string) {
 		m.printSystemMessage(fmt.Sprintf("Failed to switch model: %v", err))
 		return
 	}
+
+	// A working provider is installed now.
+	m.providerError = nil
 
 	// Update display state directly (cannot use prog.Send from Update).
 	if parts := strings.SplitN(modelString, "/", 2); len(parts) == 2 {
@@ -5551,46 +5825,134 @@ func (m *AppModel) notifyThinkingLevel(newLevel, previousLevel, source string) {
 }
 
 // --------------------------------------------------------------------------
+// Provider connect (/connect) command handler
+// --------------------------------------------------------------------------
+
+// handleConnectCommand opens the provider picker. With an argument
+// ("/connect groq") the key input opens for that provider directly.
+func (m *AppModel) handleConnectCommand(args string) tea.Cmd {
+	if m.saveProviderAPIKey == nil {
+		m.printSystemMessage("Storing API keys is not available in this session.")
+		return nil
+	}
+	m.providerConnect = NewProviderConnect(strings.TrimSpace(args), m.width, m.height)
+	m.state = stateProviderConnect
+	return m.providerConnect.Init()
+}
+
+// storeProviderKey persists the key through the wired callback.
+func (m *AppModel) storeProviderKey(providerID, key string) error {
+	if m.saveProviderAPIKey == nil {
+		return fmt.Errorf("storing API keys is not available in this session")
+	}
+	return m.saveProviderAPIKey(providerID, key)
+}
+
+// afterProviderKeySaved reports the save and, when the key belongs to the
+// active model's provider and that provider was unusable, rebuilds the
+// provider in place so the user can start chatting without a /model round
+// trip.
+func (m *AppModel) afterProviderKeySaved(providerID, providerName string) {
+	path := tildeHome(credentialsPathOrDefault())
+	m.printSystemMessage(fmt.Sprintf("Saved %s API key to %s", providerName, path))
+
+	if m.providerError == nil {
+		m.printSystemMessage(fmt.Sprintf("Use /model to pick a %s model.", providerName))
+		return
+	}
+	if !sameProviderID(providerID, m.providerName) {
+		m.printSystemMessage(fmt.Sprintf(
+			"The active model still uses %s, which has no key. Use /model to switch to a %s model, or /connect %s.",
+			m.providerName, providerName, m.providerName))
+		return
+	}
+	if m.setModel == nil {
+		return
+	}
+	current := m.providerName + "/" + m.modelName
+	if err := m.setModel(current); err != nil {
+		m.printSystemMessage(fmt.Sprintf("Key saved, but %s could not be started: %v", current, err))
+		return
+	}
+	m.providerError = nil
+	m.printSystemMessage(fmt.Sprintf("Connected. %s is ready — type a message to start.", current))
+}
+
+// sameProviderID compares provider IDs while treating the known aliases
+// (copilot/github-copilot, gemini/google) as equal.
+func sameProviderID(a, b string) bool {
+	norm := func(s string) string {
+		switch strings.ToLower(s) {
+		case "github-copilot":
+			return "copilot"
+		case "gemini":
+			return "google"
+		default:
+			return strings.ToLower(s)
+		}
+	}
+	return norm(a) == norm(b)
+}
+
+// providerErrorNotice builds the user-facing text for a missing provider
+// credential: what is missing, and the two ways to fix it.
+func (m *AppModel) providerErrorNotice() string {
+	if m.providerError == nil {
+		return ""
+	}
+	model := m.providerName + "/" + m.modelName
+	if mc := auth.AsMissingCredentials(m.providerError); mc != nil {
+		name := mc.ProviderName
+		if name == "" {
+			name = mc.Provider
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "No API key is set for %s, so the model %s cannot be used yet.\n\n", name, model)
+		if mc.Provider == "copilot" || mc.Provider == "github-copilot" {
+			b.WriteString("GitHub Copilot uses device login: quit and run `kit auth login copilot`.")
+			return b.String()
+		}
+		fmt.Fprintf(&b, "  • Run /connect to add a key for %s (saved to %s)\n", name, tildeHome(credentialsPathOrDefault()))
+		if len(mc.EnvVars) > 0 {
+			fmt.Fprintf(&b, "  • Or set %s in your environment and restart\n", strings.Join(mc.EnvVars, " or "))
+		}
+		b.WriteString("  • Or run /model to pick a model from a provider that has a key")
+		if mc.Hint != "" {
+			b.WriteString("\n\n" + mc.Hint)
+		}
+		return b.String()
+	}
+	return fmt.Sprintf("The model %s is not available: %v\n\nRun /connect to add an API key or /model to switch models.", model, m.providerError)
+}
+
+// --------------------------------------------------------------------------
 // Theme command handler
 // --------------------------------------------------------------------------
 
 // handleThemeCommand switches the active color theme. With no arguments it
-// lists available themes and highlights the active one. With a name argument
+// opens a modal picker (matching /model and /thinking). With a name argument
 // (e.g. "/theme catppuccin") it switches immediately.
 func (m *AppModel) handleThemeCommand(args string) tea.Cmd {
 	if args == "" {
-		// List available themes.
-		names := style.ListThemes()
-		active := style.ActiveThemeName()
-
-		var lines []string
-		lines = append(lines, "Available themes:")
-		for _, name := range names {
-			if name == active {
-				lines = append(lines, fmt.Sprintf("  * %s (active)", name))
-			} else {
-				lines = append(lines, fmt.Sprintf("    %s", name))
-			}
-		}
-		lines = append(lines, "")
-		lines = append(lines, fmt.Sprintf("User themes:    %s", style.UserThemesDir()))
-		if pdir := style.ProjectThemesDir(); pdir != "" {
-			lines = append(lines, fmt.Sprintf("Project themes: %s", pdir))
-		} else {
-			lines = append(lines, "Project themes: .kit/themes/ (not found)")
-		}
-		m.printSystemMessage(strings.Join(lines, "\n"))
+		m.themeSelector = NewThemeSelector(style.ActiveThemeName(), m.width, m.height)
+		m.state = stateThemeSelector
 		return nil
 	}
 
-	if err := style.ApplyTheme(args); err != nil {
-		m.printSystemMessage(fmt.Sprintf("Theme error: %v", err))
-		return nil
-	}
-
-	m.refreshTheme()
-	m.printSystemMessage(fmt.Sprintf("Switched to theme: %s", args))
+	m.applyTheme(args)
 	return nil
+}
+
+// applyTheme commits a theme change and prints a confirmation. Shared by the
+// /theme <name> command path and the modal selector so both routes surface
+// the same message and repaint the same components.
+func (m *AppModel) applyTheme(name string) {
+	if err := style.ApplyTheme(name); err != nil {
+		m.printSystemMessage(fmt.Sprintf("Theme error: %v", err))
+		return
+	}
+	m.refreshTheme()
+	m.printSystemMessage(fmt.Sprintf("Switched to theme: %s", name))
 }
 
 // refreshTheme repaints everything that holds theme-derived styling after the
@@ -5630,18 +5992,10 @@ func (m *AppModel) handleThinkingCommand(args string) tea.Cmd {
 	}
 
 	if args == "" {
-		// Show current level with descriptions.
-		var lines []string
-		levels := models.ThinkingLevels()
-		for _, l := range levels {
-			marker := "  "
-			if string(l) == m.thinkingLevel {
-				marker = "▸ "
-			}
-			lines = append(lines, fmt.Sprintf("%s%s — %s", marker, l, models.ThinkingLevelDescription(l)))
-		}
-		header := fmt.Sprintf("Current thinking level: %s\n\nAvailable levels:", m.thinkingLevel)
-		m.printSystemMessage(header + "\n" + strings.Join(lines, "\n"))
+		// Match /model behaviour: open a modal picker directly, no space required.
+		m.thinkingLevelSelector = NewThinkingLevelSelector(
+			m.providerName, m.modelName, m.thinkingLevel, m.width, m.height)
+		m.state = stateThinkingLevelSelector
 		return nil
 	}
 
@@ -5652,7 +6006,31 @@ func (m *AppModel) handleThinkingCommand(args string) tea.Cmd {
 		return nil
 	}
 
+	// Levels the active model does not accept are substituted rather than
+	// sent, since the provider would reject the request outright.
+	if !models.IsValidThinkingLevelForModel(level, m.providerName, m.modelName) {
+		fallback := models.SuggestThinkingLevelFallback(level, m.providerName, m.modelName)
+		if fallback == models.ThinkingOff && level != models.ThinkingOff {
+			m.printSystemMessage(fmt.Sprintf(
+				"Model %s does not support the '%s' thinking level.", m.modelName, level))
+			return nil
+		}
+		m.printSystemMessage(fmt.Sprintf(
+			"Note: Model %s doesn't support '%s' thinking level. Using '%s' instead.",
+			m.modelName, level, fallback))
+		level = fallback
+	}
+
 	// Apply the change.
+	m.applyThinkingLevel(level)
+	return nil
+}
+
+// applyThinkingLevel commits a thinking-level change: it persists the value,
+// invokes the provider callback, emits the extension event, and prints a
+// confirmation. Shared by the /thinking <level> command path and the modal
+// selector so both routes surface the same message and fire the same events.
+func (m *AppModel) applyThinkingLevel(level models.ThinkingLevel) {
 	previousLevel := m.thinkingLevel
 	m.thinkingLevel = string(level)
 	if m.setThinkingLevel != nil {
@@ -5669,7 +6047,6 @@ func (m *AppModel) handleThinkingCommand(args string) tea.Cmd {
 	// Persist thinking level for next launch.
 	go func() { _ = prefs.SaveThinkingLevelPreference(string(level)) }()
 	m.printSystemMessage(fmt.Sprintf("Thinking level set to: %s — %s", level, models.ThinkingLevelDescription(level)))
-	return nil
 }
 
 // --------------------------------------------------------------------------
@@ -5927,8 +6304,8 @@ func (m *AppModel) handleCopyCommand() tea.Cmd {
 		text string
 		role string
 	)
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		switch msg := m.messages[i].(type) {
+	for _, v := range slices.Backward(m.messages) {
+		switch msg := v.(type) {
 		case *TextMessageItem:
 			if msg.role == "user" || msg.role == "assistant" {
 				text = msg.content
@@ -6695,29 +7072,41 @@ func (m *AppModel) executeShellCommand(msg uicore.ShellCommandMsg) tea.Cmd {
 	command := msg.Command
 	excludeFromContext := msg.ExcludeFromContext
 	cwd := m.cwd
+	shell := m.shell
 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), shellCommandTimeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, "bash", "-c", command)
+		// The same construction the shell tool uses, so ! and !! run through
+		// the configured shell rather than through a hardcoded bash.
+		cmdArgs, shellPath, err := core.ShellCommandArgs(shell, command)
+		if err != nil {
+			return uicore.ShellCommandResultMsg{
+				Command:            command,
+				Output:             fmt.Sprintf("invalid shell configuration: %v", err),
+				ExitCode:           -1,
+				Err:                err,
+				ExcludeFromContext: excludeFromContext,
+			}
+		}
+		cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 		if cwd != "" {
 			cmd.Dir = cwd
 		}
 
-		// Ensure SHELL is set to bash so child processes (e.g. tmux) use bash
-		// rather than the user's login shell (which may be nushell, fish, etc.).
-		bashPath, _ := exec.LookPath("bash")
-		if bashPath == "" {
-			bashPath = "/bin/bash"
+		// Point SHELL at the configured shell so child processes (e.g. tmux)
+		// use it rather than the user's login shell (which may be nushell,
+		// fish, etc.). A launcher vector leaves SHELL inherited.
+		if shellPath != "" {
+			cmd.Env = append(os.Environ(), "SHELL="+shellPath)
 		}
-		cmd.Env = append(os.Environ(), "SHELL="+bashPath)
 
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 
-		err := cmd.Run()
+		err = cmd.Run()
 
 		exitCode := 0
 		if err != nil {
@@ -6879,17 +7268,75 @@ func (m *AppModel) handleShellCommandResult(msg uicore.ShellCommandResultMsg) te
 }
 
 // computeGfxPlacement returns the escape sequence that redraws every
-// directly-placed preview image at its current position, or "" when there is
-// nothing to place.
+// directly-placed image at its current position, or "" when there is nothing
+// to draw and nothing to take away.
 //
 // Direct placements are needed by terminals that carry the Kitty graphics
 // protocol but not its Unicode placeholder encoding, where an image is painted
 // over the screen at the cursor instead of travelling with the view text. That
-// makes the image's position a property of the finished layout, which is why
+// makes an image's position a property of the finished layout, which is why
 // this runs from View with the assembled parts in hand.
 //
-// parts are the stacked layout sections and inputPartIndex is the position of
-// the input section within them.
+// parts are the stacked layout sections; inputPartIndex is the position of the
+// input section within them and scrollPartIndex that of the transcript, or -1
+// when the transcript is not on screen.
+//
+// Images that were painted by the previous frame and are not painted by this
+// one are deleted here. A placement outlives the cells it covers, so a preview
+// whose message has scrolled away, or which a modal now covers, has to be told
+// to go; everything still on screen drops its own earlier placement as part of
+// being drawn again.
+func (m *AppModel) computeGfxPlacement(parts []string, inputPartIndex, scrollPartIndex int) string {
+	placements := m.composerPlacements(parts, inputPartIndex)
+	placements = append(placements, m.transcriptPlacements(parts, scrollPartIndex)...)
+
+	var draw strings.Builder
+	drawn := make(map[uint32]struct{}, len(placements))
+	for _, p := range placements {
+		if p.row < 1 || p.row > m.height {
+			continue // scrolled out of the visible area
+		}
+		draw.WriteString(ansi.CursorPosition(p.col, p.row))
+		draw.WriteString(p.seq)
+		if p.id != 0 {
+			drawn[p.id] = struct{}{}
+		}
+	}
+
+	var drops strings.Builder
+	for id := range m.gfxPlaced {
+		if _, ok := drawn[id]; !ok {
+			drops.WriteString(imagepreview.DeletePlacements(id))
+		}
+	}
+	m.gfxPlaced = drawn
+
+	if draw.Len() == 0 {
+		// Deleting a placement does not depend on the cursor, so the sequence
+		// that only removes images needs no cursor dance around it.
+		return drops.String()
+	}
+	// Save the cursor, draw each image at its absolute row, then restore. The
+	// renderer owns the cursor; moving it without putting it back would leave
+	// the next frame drawing in the wrong place.
+	return ansi.SaveCursor + draw.String() + ansi.RestoreCursor + drops.String()
+}
+
+// gfxPlacement is one image drawn at an absolute position on the screen.
+type gfxPlacement struct {
+	// row and col are 1-based screen coordinates of the image's top-left cell.
+	row, col int
+
+	// id is the terminal's id for the image, or 0 when the caller frees the
+	// image itself and does not want its placement tracked.
+	id uint32
+
+	// seq draws the image at the cursor.
+	seq string
+}
+
+// composerPlacements locates the directly-placed preview images in the
+// composer.
 //
 // The rows are counted up from the bottom of the screen, not down from the
 // top. The composer sits at the bottom with only the status bar and an
@@ -6897,14 +7344,18 @@ func (m *AppModel) handleShellCommandResult(msg uicore.ShellCommandResultMsg) te
 // short, fixed sections. Counting downwards would instead depend on the
 // scrollback's rendered height, and any disagreement between what it was
 // allotted and what it drew would float the image away from the composer.
-func (m *AppModel) computeGfxPlacement(parts []string, inputPartIndex int) string {
+//
+// The ids are deliberately left at zero: the input component owns these images
+// and deletes them outright when the attachment goes away, so tracking their
+// placements here would only duplicate that.
+func (m *AppModel) composerPlacements(parts []string, inputPartIndex int) []gfxPlacement {
 	ic, ok := m.input.(*InputComponent)
 	if !ok || inputPartIndex < 0 || inputPartIndex >= len(parts) {
-		return ""
+		return nil
 	}
 	placements := ic.DirectPlacements()
 	if len(placements) == 0 {
-		return ""
+		return nil
 	}
 
 	// Rows occupied by everything below the input section.
@@ -6916,19 +7367,87 @@ func (m *AppModel) computeGfxPlacement(parts []string, inputPartIndex int) strin
 	// its first row is that many rows further up.
 	inputTop := m.height - below - lipgloss.Height(parts[inputPartIndex]) + 1
 
-	var b strings.Builder
-	// Save the cursor, draw each image at its absolute row, then restore. The
-	// renderer owns the cursor; moving it without putting it back would leave
-	// the next frame drawing in the wrong place.
-	b.WriteString(ansi.SaveCursor)
+	out := make([]gfxPlacement, 0, len(placements))
 	for _, p := range placements {
-		row := inputTop + p.RowOffset
-		if row < 1 || row > m.height {
-			continue // scrolled out of the visible area
-		}
-		b.WriteString(ansi.CursorPosition(p.Col+1, row))
-		b.WriteString(p.Sequence)
+		out = append(out, gfxPlacement{
+			row: inputTop + p.RowOffset,
+			col: p.Col + 1,
+			seq: p.Sequence,
+		})
 	}
-	b.WriteString(ansi.RestoreCursor)
-	return b.String()
+	return out
+}
+
+// transcriptPlacements locates the directly-placed images in the scrollback,
+// clipped to the rows the viewport currently shows.
+//
+// Unlike the composer, the transcript scrolls, so an image here is a moving
+// target: its rows are whatever the list draws for its item this frame, and
+// only the visible band of the picture may be painted. Anything more would
+// spill over the message above or the composer below, because a placed image
+// is not part of the view and nothing clips it.
+//
+// The rows are counted down from the top of the screen, which for the
+// transcript depends only on the optional header above it. Counting up would
+// depend on every section below, of which there are many.
+func (m *AppModel) transcriptPlacements(parts []string, scrollPartIndex int) []gfxPlacement {
+	if m.scrollList == nil || scrollPartIndex < 0 || scrollPartIndex >= len(parts) {
+		return nil
+	}
+	// A modal covers the transcript, and an image painted over it would be the
+	// one thing on screen that the dialog could not hide. Returning nothing
+	// takes the images off screen for as long as the modal is up; they come
+	// back on the frame that closes it.
+	if m.modalActive() {
+		return nil
+	}
+	// Nothing is placed and nothing could be: skip the walk over visible items
+	// entirely in the terminals where previews are text.
+	if len(m.gfxPlaced) == 0 && termgfx.PreviewMode() != termgfx.ModeDirect {
+		return nil
+	}
+
+	// The transcript's first screen row, 1-based.
+	top := 1
+	for i := range scrollPartIndex {
+		top += lipgloss.Height(parts[i])
+	}
+
+	var out []gfxPlacement
+	for _, vis := range m.scrollList.VisibleItems() {
+		item, ok := vis.Item.(DirectImageItem)
+		if !ok {
+			continue
+		}
+		thumb, ok := item.DirectImage()
+		if !ok {
+			continue
+		}
+
+		// Where the picture sits inside its own item. Message navigation frames
+		// the selected item, which moves its content one row down and one
+		// column right.
+		imgTop, imgCol := 0, style.ContentOffset
+		if vis.Framed {
+			imgTop, imgCol = 1, style.ContentOffset+1
+		}
+
+		// Intersect the item's drawn lines with the lines the picture occupies.
+		first := max(vis.SkipTop, imgTop)
+		last := min(vis.SkipTop+vis.Height, imgTop+thumb.Rows)
+		if last <= first {
+			continue
+		}
+		seq := thumb.PlaceRows(first-imgTop, last-first)
+		if seq == "" {
+			continue
+		}
+		out = append(out, gfxPlacement{
+			row: top + vis.Row + (first - vis.SkipTop),
+			col: imgCol + 1,
+			id:  thumb.ImageID,
+			seq: seq,
+		})
+	}
+	return out
 }

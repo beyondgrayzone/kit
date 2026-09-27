@@ -556,7 +556,7 @@ type Context struct {
 	EmitCustomEvent func(name string, data string)
 
 	// GetAllTools returns information about all tools available to the agent,
-	// including core tools (bash, read, write, etc.), MCP server tools, and
+	// including core tools (shell, read, write, etc.), MCP server tools, and
 	// extension-registered tools. Each entry includes the tool's enabled status.
 	//
 	// Example — list read-only tools:
@@ -1344,6 +1344,15 @@ func (a *API) OnReasoningDelta(handler func(ReasoningDeltaEvent, Context)) {
 
 // OnToolCall registers a handler that fires before a tool executes.
 // Return a non-nil ToolCallResult with Block=true to prevent execution.
+//
+// The event's ToolName is the tool's registered name. The command-execution
+// tool is registered as "shell"; before its shell became configurable it was
+// registered as "bash", so a handler that should run on either version of
+// KIT matches both:
+//
+//	if tc.ToolName != "shell" && tc.ToolName != "bash" { return nil }
+//
+// The bundled extension examples match both names for that reason.
 func (a *API) OnToolCall(handler func(ToolCallEvent, Context) *ToolCallResult) {
 	if a.onToolCall != nil {
 		a.onToolCall(handler)
@@ -1391,7 +1400,7 @@ func (a *API) OnToolExecutionEnd(handler func(ToolExecutionEndEvent, Context)) {
 }
 
 // OnToolOutput registers a handler for streaming tool output chunks.
-// This fires for each output line as it arrives from tools like bash,
+// This fires for each output line as it arrives from tools like the shell tool,
 // allowing extensions to observe or process output in real-time.
 func (a *API) OnToolOutput(handler func(ToolOutputEvent, Context)) {
 	if a.onToolOutput != nil {
@@ -2293,7 +2302,11 @@ type OptionDef struct {
 //	})
 type ToolRenderConfig struct {
 	// ToolName is the name of the tool this renderer applies to. Must match
-	// the tool's registered name exactly (e.g. "bash", "read", "my-tool").
+	// the tool's registered name exactly (e.g. "shell", "read", "my-tool").
+	// The one exception is the core shell tool, which is also found under
+	// the name it had before its shell became configurable, "bash". A
+	// renderer naming a tool exactly always wins over that fallback, so a
+	// custom tool of your own named "bash" keeps its own renderer.
 	ToolName string
 
 	// DisplayName, if non-empty, replaces the auto-capitalized tool name
@@ -2501,7 +2514,7 @@ type ToolExecutionEndEvent struct {
 func (e ToolExecutionEndEvent) Type() EventType { return ToolExecutionEnd }
 
 // ToolOutputEvent fires when a tool produces streaming output chunks.
-// This is primarily used for long-running tools like bash to show output
+// This is primarily used for long-running tools like the shell tool to show output
 // in real-time as it arrives, before the tool completes.
 type ToolOutputEvent struct {
 	ToolCallID string
@@ -2598,7 +2611,7 @@ type AgentEndEvent struct {
 	ToolCallCount int
 
 	// ToolNames lists the tool names invoked during this turn, in call order.
-	// Duplicates are preserved (e.g. two bash calls produce ["bash", "bash"]).
+	// Duplicates are preserved (e.g. two shell calls produce ["shell", "shell"]).
 	ToolNames []string
 
 	// LLMCallCount is the number of LLM round-trips (tool-loop iterations)
