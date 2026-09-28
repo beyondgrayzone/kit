@@ -13,7 +13,7 @@
 
 # KIT (Knowledge Inference Tool)
 
-> This is special fork to support next gen [super power](https://github.com/beyondgrayzone/ext)
+> This is special fork to support next gen [super power](https://github.com/bringyourowndeveloper/ext)
 
 A powerful, extensible AI coding agent CLI with multi-provider support, built-in tools, and a rich extension system.
 
@@ -380,11 +380,11 @@ kit -e examples/extensions/minimal.go
 
 ### Extension Capabilities
 
-**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnLLMUsage, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnThinkingLevelChange, OnTerminalResize, OnTurnStateChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
+**Lifecycle Events**: OnSessionStart, OnSessionShutdown, OnBeforeAgentStart, OnAgentStart, OnAgentEnd, OnLLMUsage, OnToolCall, OnToolCallInputStart, OnToolCallInputDelta, OnToolCallInputEnd, OnToolExecutionStart, OnToolOutput, OnToolExecutionEnd, OnToolResult, OnInput, OnMessageStart, OnMessageUpdate, OnMessageEnd, OnModelChange, OnThinkingLevelChange, OnTerminalResize, OnTurnStateChange, OnPromptStateChange, OnContextPrepare, OnBeforeFork, OnBeforeSessionSwitch, OnBeforeCompact, OnCustomEvent, OnSubagentStart, OnSubagentChunk, OnSubagentEnd
 
 `OnAgentEnd` carries per-turn aggregates (`ToolCallCount`, `ToolNames`, `LLMCallCount`, `InputTokensDelta`, `OutputTokensDelta`, `CostDelta`, `DurationMs`) so observers don't need to maintain parallel bookkeeping. `OnLLMUsage` fires after each LLM provider call with token + cost deltas attributed to that specific call/model — use it for accurate budget enforcement *between* calls instead of waiting for the turn to finish.
 
-`OnTurnStateChange` is a superset of `OnAgentStart`/`OnAgentEnd`: it also covers work that never reaches the agent loop (shell commands) and fires on every path back to idle, including cancellation and error — use it for spinners and turn timers, and `OnAgentStart`/`OnAgentEnd` when you specifically care about agent turns. `OnTerminalResize` and `OnTurnStateChange` fire in the interactive TUI only.
+`OnTurnStateChange` is a superset of `OnAgentStart`/`OnAgentEnd`: it also covers work that never reaches the agent loop (shell commands) and fires on every path back to idle, including cancellation and error — use it for spinners and turn timers, and `OnAgentStart`/`OnAgentEnd` when you specifically care about agent turns. `OnPromptStateChange` covers what turn state cannot: a modal raised by `ctx.PromptSelect`, `ctx.PromptConfirm`, or `ctx.ShowOverlay` takes the keyboard, so `OnTurnStateChange` reads **idle** while the agent is still blocked on the user. Pair the two to tell "waiting on you" from "done". `OnTerminalResize`, `OnTurnStateChange`, and `OnPromptStateChange` fire in the interactive TUI only.
 
 **Custom Components**:
 - **Tools**: Add new tools the LLM can invoke

@@ -33,6 +33,7 @@ Extensions can hook into 30 lifecycle events:
 | `OnThinkingLevelChange` | Extended-thinking effort level changed |
 | `OnTerminalResize` | Terminal resized (also fires once at startup) |
 | `OnTurnStateChange` | UI entered or left the working state |
+| `OnPromptStateChange` | An extension-raised modal opened or closed |
 | `OnContextPrepare` | Context being assembled for the model |
 | `OnBeforeFork` | Before forking a conversation branch |
 | `OnBeforeSessionSwitch` | Before switching sessions |
@@ -328,6 +329,47 @@ path back to idle, including cancellation and error.
 
 Interactive TUI only — like `OnTerminalResize`, this does not fire in headless,
 ACP, or script mode.
+
+## Prompt state
+
+```go
+api.OnPromptStateChange(func(e ext.PromptStateChangeEvent, ctx ext.Context) {
+    // e.Kind string — "prompt" or "overlay"
+    // e.PromptType string — "select", "multiselect", "confirm", "input",
+    //                      "password"; "overlay" for a dialog
+    // e.State, e.Previous string — "open" or "closed"
+})
+```
+
+Fires on both edges of a modal raised by `ctx.PromptSelect`,
+`ctx.PromptConfirm`, or `ctx.ShowOverlay`.
+
+Use it because `OnTurnStateChange` cannot answer "is the user looking at a
+question?". The modal owns the keyboard, so the turn event reports **idle**
+for as long as it is up — including the common case of a tool that blocks
+inside `ctx.PromptSelect`, where the turn is genuinely alive and waiting. A
+terminal title driven by `OnTurnStateChange` alone renders "Ready" over an
+open selection dialog.
+
+```go
+modalOpen := false
+
+api.OnPromptStateChange(func(e ext.PromptStateChangeEvent, ctx ext.Context) {
+    modalOpen = e.State == "open"
+})
+
+api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
+    switch {
+    case e.State == "idle" && !modalOpen:
+        title = "✅ KIT: Ready"
+    case modalOpen:
+        title = "⏸ KIT: Waiting for you"
+    }
+})
+```
+
+Both edges are emitted, so a handler can supersede a late `open` without a
+timer. Interactive TUI only.
 
 ## Shortcuts
 
