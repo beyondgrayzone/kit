@@ -599,6 +599,10 @@ type AppModelOptions struct {
 	// the UI enters or leaves the working state. May be nil.
 	EmitTurnStateChange func(state, previous string)
 
+	// EmitPromptStateChange fires the OnPromptStateChange extension event
+	// when an extension-raised modal takes or returns the keyboard. May be nil.
+	EmitPromptStateChange func(kind, promptType, state, previous string)
+
 	// EmitRawInput fires the OnRawInput extension event, delivering
 	// the original user input (before @file expansion etc.) to extensions.
 	// May be nil if extensions are not loaded.
@@ -928,6 +932,10 @@ type AppModel struct {
 	// emitTurnStateChange fires the OnTurnStateChange extension event. May be nil.
 	emitTurnStateChange func(state, previous string)
 
+	// emitPromptStateChange fires the OnPromptStateChange extension event. May
+	// be nil.
+	emitPromptStateChange func(kind, promptType, state, previous string)
+
 	// extEvents serializes extension event dispatch so that rapid events
 	// reach the runner in emission order. See ext_event_dispatcher.go.
 	extEvents *extEventDispatcher
@@ -977,6 +985,15 @@ type AppModel struct {
 	// preOverlayState remembers the state before the overlay took over,
 	// so the model can return to it when the overlay completes.
 	preOverlayState appState
+
+	// extensionModalKind/Type describe the extension-raised modal that
+	// currently owns the keyboard, so the close edge of
+	// OnPromptStateChange reports the same surface the open edge did. An
+	// empty kind means no extension modal is up — which includes the message
+	// inspector, because that reader reuses the overlay state without any
+	// extension having asked for it.
+	extensionModalKind string
+	extensionModalType string
 
 	// navReturnState remembers the state message navigation suspended, so
 	// exiting navigation returns to it rather than unconditionally to
@@ -1217,6 +1234,7 @@ func NewAppModel(appCtrl AppController, opts AppModelOptions) *AppModel {
 	m.emitThinkingLevelChange = opts.EmitThinkingLevelChange
 	m.emitTerminalResize = opts.EmitTerminalResize
 	m.emitTurnStateChange = opts.EmitTurnStateChange
+	m.emitPromptStateChange = opts.EmitPromptStateChange
 	m.extEvents = newExtEventDispatcher()
 	m.thinkingLevel = opts.ThinkingLevel
 
@@ -3101,6 +3119,8 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.prePromptState = m.state
 		m.state = statePrompt
+		m.extensionModalKind, m.extensionModalType = promptKind, string(promptModePassword)
+		m.notifyPromptState(promptKind, string(promptModePassword), "open")
 		// Create a custom response channel that converts PasswordPromptResponse
 		passwordResponseCh := make(chan app.PromptResponse, 1)
 		m.promptResponseCh = passwordResponseCh
@@ -3159,6 +3179,12 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.prompt != nil {
 			cmds = append(cmds, m.prompt.Init())
 		}
+		// Announced only once the overlay is known to exist. The unknown-type
+		// branch above returns before reaching here, because a prompt the user
+		// never sees is a modal that never takes the keyboard — announcing one
+		// would strand every handler waiting on a close edge.
+		m.extensionModalKind, m.extensionModalType = promptKind, msg.PromptType
+		m.notifyPromptState(promptKind, msg.PromptType, "open")
 
 	case app.OverlayRequestEvent:
 		// Extension wants to show a modal overlay dialog. Enter overlay state.
@@ -3171,6 +3197,8 @@ func (m *AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.preOverlayState = m.state
 		m.state = stateOverlay
+		m.extensionModalKind, m.extensionModalType = overlayKind, ""
+		m.notifyPromptState(overlayKind, "", "open")
 		m.overlayResponseCh = msg.ResponseCh
 
 		m.overlay = newOverlayDialog(
@@ -5814,6 +5842,40 @@ func (m *AppModel) notifyResize() {
 	m.extEvents.dispatch(func() { emit(w, h) })
 }
 
+// notifyPromptState fires the OnPromptStateChange extension event on both
+// edges of an extension-raised modal, so a handler can tell "the user must
+// answer this" apart from "the turn is over".
+//
+// The turn-state event cannot make that distinction: the modal owns m.state,
+// so the deferred working/idle comparison in update reports idle for as long
+// as it is up, even though the agent is blocked on the user's answer and no
+// AgentEnd will arrive until the modal closes. That asymmetry is the reason
+// this event exists — do not merge it into TurnStateChange, whose "idle" is
+// correct for the TUI's own purposes.
+//
+// Like every other notify*, it goes through extEvents so extension code never
+// runs on BubbleTea's event loop.
+func (m *AppModel) notifyPromptState(kind, promptType, state string) {
+	// An empty kind means the modal was not raised by an extension — the
+	// message inspector reuses stateOverlay — so no open edge was emitted for
+	// it either. A lone close edge would strand every handler that pairs the
+	// two.
+	if m.emitPromptStateChange == nil || kind == "" {
+		return
+	}
+	if promptType == "" {
+		// Overlays have no prompt type of their own. Naming them after their
+		// kind keeps the field populated for handlers that render it.
+		promptType = kind
+	}
+	emit := m.emitPromptStateChange
+	previous := "closed"
+	if state == "closed" {
+		previous = "open"
+	}
+	m.extEvents.dispatch(func() { emit(kind, promptType, state, previous) })
+}
+
 // notifyThinkingLevel fires the OnThinkingLevelChange extension event. Skips
 // no-op changes so handlers are not woken for a level that did not move.
 func (m *AppModel) notifyThinkingLevel(newLevel, previousLevel, source string) {
@@ -6870,6 +6932,15 @@ type beforeForkResultMsg struct {
 	userText string
 }
 
+// PromptStateChange "kind" values. An overlay is the ShowOverlay dialog;
+// prompt covers every PromptSelect / PromptConfirm / PromptInput / password
+// variant. The split lets a handler tell a question it must wait on from a
+// dialog it merely put on screen.
+const (
+	promptKind  = "prompt"
+	overlayKind = "overlay"
+)
+
 // updatePromptState handles all messages while the prompt overlay is active.
 // It routes keys to the prompt overlay, detects completion/cancellation, and
 // restores the previous state when done.
@@ -6955,12 +7026,17 @@ func (m *AppModel) updatePromptState(msg tea.Msg) (tea.Model, tea.Cmd) {
 // resolvePrompt sends the response through the channel, clears prompt state,
 // and restores the previous app state.
 func (m *AppModel) resolvePrompt(resp app.PromptResponse) {
+	kind, promptType := m.extensionModalKind, m.extensionModalType
 	if m.promptResponseCh != nil {
 		m.promptResponseCh <- resp
 		m.promptResponseCh = nil
 	}
 	m.prompt = nil
 	m.state = m.prePromptState
+	m.extensionModalKind, m.extensionModalType = "", ""
+	// Fired after the restore, not before, so the event describes the same
+	// world an extension would see through the live TUI state.
+	m.notifyPromptState(kind, promptType, "closed")
 }
 
 // --------------------------------------------------------------------------
@@ -7050,12 +7126,18 @@ func (m *AppModel) updateOverlayState(msg tea.Msg) (tea.Model, tea.Cmd) {
 // resolveOverlay sends the response through the channel, clears overlay state,
 // and restores the previous app state.
 func (m *AppModel) resolveOverlay(resp app.OverlayResponse) {
+	kind := m.extensionModalKind
 	if m.overlayResponseCh != nil {
 		m.overlayResponseCh <- resp
 		m.overlayResponseCh = nil
 	}
 	m.overlay = nil
 	m.state = m.preOverlayState
+	m.extensionModalKind, m.extensionModalType = "", ""
+	// kind is empty for the message inspector, which reuses this state
+	// without an extension ever having raised it; notifyPromptState is then
+	// skipped, because no matching open edge was ever emitted.
+	m.notifyPromptState(kind, "", "closed")
 }
 
 // --------------------------------------------------------------------------

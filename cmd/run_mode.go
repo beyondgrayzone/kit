@@ -11,9 +11,9 @@ import (
 	charmlog "github.com/charmbracelet/log"
 	"github.com/spf13/viper"
 
+	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/app"
 	"github.com/mark3labs/kit/internal/config"
-	"github.com/mark3labs/kit/extensions"
 	"github.com/mark3labs/kit/internal/prompts"
 	"github.com/mark3labs/kit/internal/ui"
 	"github.com/mark3labs/kit/internal/ui/commands"
@@ -100,6 +100,7 @@ type uiActions struct {
 	emitThinkingLevelChange func(string, string, string)
 	emitTerminalResize      func(int, int)
 	emitTurnStateChange     func(string, string)
+	emitPromptStateChange   func(string, string, string, string)
 	emitRawInput            func(string, string)
 	setThinkingLevel        func(string) error
 	switchSession           func(string) error
@@ -556,6 +557,10 @@ func buildUIActions(k *kit.Kit, appInstance *app.App, usageTracker *ui.UsageTrac
 			k.Extensions().EmitTerminalResize(width, height)
 		},
 		emitTurnStateChange: k.Extensions().EmitTurnStateChange,
+		// No normalization here: the UI already names an overlay's prompt
+		// type after its kind, and a second guess would mask a caller that
+		// passes a real one.
+		emitPromptStateChange: k.Extensions().EmitPromptStateChange,
 		setThinkingLevel: func(level string) error {
 			return k.SetThinkingLevel(context.Background(), level)
 		},

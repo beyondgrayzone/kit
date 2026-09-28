@@ -1375,6 +1375,7 @@ func runInteractiveModeBubbleTea(_ context.Context, deps runModeDeps) error {
 		EmitThinkingLevelChange:  act.emitThinkingLevelChange,
 		EmitTerminalResize:       act.emitTerminalResize,
 		EmitTurnStateChange:      act.emitTurnStateChange,
+		EmitPromptStateChange:    act.emitPromptStateChange,
 		ThinkingLevel:            snap.thinkingLevel,
 		IsReasoningModel:         snap.isReasoningModel,
 		SetThinkingLevel:         act.setThinkingLevel,

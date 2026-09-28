@@ -199,6 +199,7 @@ type ExtensionAPI interface {
 	EmitThinkingLevelChange(newLevel, previousLevel, source string)
 	EmitTerminalResize(width, height int)
 	EmitTurnStateChange(state, previous string)
+	EmitPromptStateChange(kind, promptType, state, previous string)
 	EmitCustomEvent(name, data string)
 	EmitBeforeFork(targetID string, isUserMsg bool, userText string) (cancelled bool, reason string)
 	EmitBeforeSessionSwitch(switchReason string) (cancelled bool, reason string)
@@ -658,6 +659,20 @@ func (e *extensionAPI) EmitTurnStateChange(state, previous string) {
 		_, _ = e.kit.extRunner.Emit(extensions.TurnStateChangeEvent{
 			State:    state,
 			Previous: previous,
+		})
+	}
+}
+
+// EmitPromptStateChange announces that a modal raised by an extension
+// (PromptSelect / PromptConfirm / ShowOverlay) has opened or closed. State is
+// "open" or "closed".
+func (e *extensionAPI) EmitPromptStateChange(kind, promptType, state, previous string) {
+	if e.kit.extRunner != nil && e.kit.extRunner.HasHandlers(extensions.PromptStateChange) {
+		_, _ = e.kit.extRunner.Emit(extensions.PromptStateChangeEvent{
+			Kind:       kind,
+			PromptType: promptType,
+			State:      state,
+			Previous:   previous,
 		})
 	}
 }

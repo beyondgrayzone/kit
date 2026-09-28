@@ -202,6 +202,13 @@ api.OnTerminalResize(func(e ext.TerminalResizeEvent, ctx ext.Context) {
 api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
     // e.State, e.Previous string — "working" or "idle"
 })
+
+// An extension-raised modal took or returned the keyboard.
+api.OnPromptStateChange(func(e ext.PromptStateChangeEvent, ctx ext.Context) {
+    // e.Kind string — "prompt" or "overlay"
+    // e.PromptType string — "select", "multiselect", "confirm", "input", "password"; "overlay"
+    // e.State, e.Previous string — "open" or "closed"
+})
 ```
 
 `OnTurnStateChange` is a **superset of `OnAgentStart`/`OnAgentEnd`**: it also
@@ -209,6 +216,14 @@ covers work that never reaches the agent loop (shell commands run with `!`) and
 fires on every path back to idle, including cancellation and error. Use it to
 drive a spinner or turn timer; use `OnAgentStart`/`OnAgentEnd` when you
 specifically care about agent turns and their token usage.
+
+`OnPromptStateChange` exists because `OnTurnStateChange` cannot answer "is the
+user looking at a question?". A modal takes the keyboard, so `OnTurnStateChange`
+reports **idle** for the whole time it is up — even when the turn is live and
+parked inside a tool blocked on `ctx.PromptSelect`. Reading the turn event
+alone makes a status line declare "done" while a selection dialog is on
+screen. Both edges fire, so `open` → user must answer, and the `closed` that
+follows is the one that precedes a genuinely finished turn.
 
 ### Context Filtering
 

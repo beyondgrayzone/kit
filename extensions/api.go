@@ -1287,7 +1287,7 @@ type PrintBlockOpts struct {
 // register typed event handlers, custom tools, and slash commands.
 type API struct {
 	// Event-specific registration functions (wired by the loader).
-	onRawInput               func(func(RawInputEvent, Context))
+	onRawInput                func(func(RawInputEvent, Context))
 	onToolCall                func(func(ToolCallEvent, Context) *ToolCallResult)
 	onToolCallInputStart      func(func(ToolCallInputStartEvent, Context))
 	onToolCallInputDelta      func(func(ToolCallInputDeltaEvent, Context))
@@ -1312,6 +1312,7 @@ type API struct {
 	onThinkingLevelChange     func(func(ThinkingLevelChangeEvent, Context))
 	onTerminalResize          func(func(TerminalResizeEvent, Context))
 	onTurnStateChange         func(func(TurnStateChangeEvent, Context))
+	onPromptStateChange       func(func(PromptStateChangeEvent, Context))
 	onContextPrepare          func(func(ContextPrepareEvent, Context) *ContextPrepareResult)
 	onBeforeFork              func(func(BeforeForkEvent, Context) *BeforeForkResult)
 	onBeforeSessionSwitch     func(func(BeforeSessionSwitchEvent, Context) *BeforeSessionSwitchResult)
@@ -1576,6 +1577,30 @@ func (a *API) OnTerminalResize(handler func(TerminalResizeEvent, Context)) {
 //	})
 func (a *API) OnTurnStateChange(handler func(TurnStateChangeEvent, Context)) {
 	a.onTurnStateChange(handler)
+}
+
+// OnPromptStateChange registers a handler that fires when an extension-raised
+// modal (PromptSelect / PromptConfirm / ShowOverlay) opens or closes.
+//
+// Use it to tell "the user has a modal and must answer" apart from "the turn
+// is over". TurnStateChange cannot: a modal takes the keyboard, so that event
+// reports "idle" while the agent is still working and blocked on the user.
+// Only PromptStateChange "closed" is followed by a genuinely finished turn.
+//
+// Example — a status line that waits instead of declaring victory:
+//
+//	api.OnPromptStateChange(func(e ext.PromptStateChangeEvent, ctx ext.Context) {
+//	    if e.State == "open" {
+//	        title = "⏸ KIT: Waiting for you"
+//	    }
+//	})
+//	api.OnTurnStateChange(func(e ext.TurnStateChangeEvent, ctx ext.Context) {
+//	    if e.State == "idle" && !modalOpen {
+//	        title = "✅ KIT: Ready"
+//	    }
+//	})
+func (a *API) OnPromptStateChange(handler func(PromptStateChangeEvent, Context)) {
+	a.onPromptStateChange(handler)
 }
 
 // OnContextPrepare registers a handler that fires after the context window is
@@ -2739,6 +2764,41 @@ type TurnStateChangeEvent struct {
 }
 
 func (e TurnStateChangeEvent) Type() EventType { return TurnStateChange }
+
+// PromptStateChangeEvent fires when a modal raised by an extension
+// (PromptSelect / PromptConfirm / ShowOverlay) opens or closes.
+//
+// State is "open" while the modal owns the keyboard and "closed" once it is
+// dismissed. This is distinct from TurnStateChange, and the distinction is the
+// whole point: a modal takes the keyboard away from the TUI, so
+// TurnStateChange reports "idle" for the duration of it even though the agent
+// turn is still live — parked inside a tool that is blocked on this very
+// prompt, with no AgentEnd in sight. An extension that reads TurnStateChange
+// alone therefore announces "done" for as long as the modal is up.
+//
+// Read the two together: PromptStateChange "open" means the user has a modal
+// to answer, and only a PromptStateChange "closed" is followed by a turn that
+// really finished. Both edges are emitted, so a consumer can supersede a stale
+// "open" without a timer.
+//
+// Interactive TUI only.
+type PromptStateChangeEvent struct {
+	// Kind is the prompt surface: "prompt" or "overlay".
+	Kind string
+	// PromptType is the prompt type: "select", "multiselect", "confirm",
+	// "input", or "password". Empty for overlays.
+	//
+	// Named PromptType rather than Type because every event already carries a
+	// Type() EventType method, and Go forbids a struct field sharing a method
+	// name.
+	PromptType string
+	// State is "open" or "closed".
+	State string
+	// Previous is the prior State ("closed" on open, "open" on close).
+	Previous string
+}
+
+func (e PromptStateChangeEvent) Type() EventType { return PromptStateChange }
 
 // ContextPrepareEvent fires after the context window is built from the session
 // tree and before the messages are sent to the LLM. Handlers can inspect the

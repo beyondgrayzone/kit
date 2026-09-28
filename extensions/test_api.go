@@ -135,6 +135,12 @@ func NewTestAPI(ext *LoadedExtension) API {
 				return nil
 			})
 		},
+		onPromptStateChange: func(h func(PromptStateChangeEvent, Context)) {
+			reg(PromptStateChange, func(e Event, c Context) Result {
+				h(e.(PromptStateChangeEvent), c)
+				return nil
+			})
+		},
 		onContextPrepare: func(h func(ContextPrepareEvent, Context) *ContextPrepareResult) {
 			reg(ContextPrepare, func(e Event, c Context) Result {
 				r := h(e.(ContextPrepareEvent), c)

@@ -89,6 +89,15 @@ const (
 	// reaches the agent loop, such as shell commands. Interactive TUI only.
 	TurnStateChange EventType = "turn_state_change"
 
+	// PromptStateChange fires when a modal raised by an extension
+	// (ctx.PromptSelect, ctx.PromptConfirm, ctx.ShowOverlay) takes and then
+	// returns the keyboard. Interactive TUI only.
+	//
+	// This exists because TurnStateChange reports "idle" the moment a modal
+	// opens, even though the agent turn is still live and parked on the user.
+	// See PromptStateChangeEvent.
+	PromptStateChange EventType = "prompt_state_change"
+
 	// ContextPrepare fires after context is built from the session tree and
 	// before the messages are sent to the LLM. Handlers can filter, reorder,
 	// or inject messages into the context window.
@@ -165,7 +174,7 @@ func AllEventTypes() []EventType {
 		MessageStart, MessageUpdate, MessageEnd,
 		SessionStart, SessionShutdown,
 		ModelChange, ContextPrepare,
-		ThinkingLevelChange, TerminalResize, TurnStateChange,
+		ThinkingLevelChange, TerminalResize, TurnStateChange, PromptStateChange,
 		BeforeFork, BeforeSessionSwitch, BeforeCompact,
 		SubagentStart, SubagentChunk, SubagentEnd,
 		StepStart, StepFinish, ReasoningStart, ReasoningDelta, Warnings, Source, Error, Retry,

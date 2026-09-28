@@ -1,5 +1,9 @@
+# Changelog (Till 0.105.1)
+- Expose ext API to better react on state changes 
+
 # Changelog (Till 0.105.0)
 - Merge local changes with upstream
+- New extension event `OnPromptStateChange` (`ext.PromptStateChangeEvent`), fired on both edges of a modal raised by `ctx.PromptSelect` / `ctx.PromptConfirm` / `ctx.ShowOverlay`. `OnTurnStateChange` reports "idle" for as long as a modal owns the keyboard, even when the agent turn is live and blocked on the user; this event makes "waiting on you" distinguishable from "done". `OnTurnStateChange` semantics are unchanged.
 
 # Changelog (Till 0.88.0)
 - Merge v0.86.0 custom changes into v0.88.0
